@@ -1,0 +1,7 @@
+[package]
+name = "slides-pptx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "PPTX load and save (native format)"
