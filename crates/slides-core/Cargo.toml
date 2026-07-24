@@ -5,3 +5,9 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "Deck model, commands, undo / redo, theme"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }

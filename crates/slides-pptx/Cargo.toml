@@ -5,3 +5,11 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "PPTX load and save (native format)"
+
+[dependencies]
+slides-core = { path = "../slides-core" }
+zip = { workspace = true }
+quick-xml = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
