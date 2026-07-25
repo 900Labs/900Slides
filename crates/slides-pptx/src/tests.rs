@@ -1,7 +1,7 @@
 //! Tests for the PPTX load/save boundary.
 
 use std::collections::HashSet;
-use std::io::Write;
+use std::io::{Read, Write};
 
 use slides_core::{Deck, EditText, ListStyle, Paragraph, Rect, Run, Shape, TextBox};
 use zip::write::{FileOptions, ZipWriter};
@@ -162,11 +162,11 @@ fn theme_xml() -> String {
       <a:lt2><a:srgbClr val="E7E6E6"/></a:lt2>
       <a:accent1><a:srgbClr val="4472C4"/></a:accent1>
       <a:accent2><a:srgbClr val="ED7D31"/></a:accent2>
-      <a:fontScheme name="Office">
-        <a:majorFont><a:latin typeface="Calibri Light"/></a:majorFont>
-        <a:minorFont><a:latin typeface="Calibri"/></a:minorFont>
-      </a:fontScheme>
     </a:clrScheme>
+    <a:fontScheme name="Office">
+      <a:majorFont><a:latin typeface="Calibri Light"/></a:majorFont>
+      <a:minorFont><a:latin typeface="Calibri"/></a:minorFont>
+    </a:fontScheme>
   </a:themeElements>
 </a:theme>"#
     )
@@ -340,4 +340,244 @@ fn deck_round_trip_serialization() {
     let json = serde_json::to_string(&deck).expect("serialize");
     let restored: Deck = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(deck, restored);
+}
+
+fn build_pptx_with_notes() -> Vec<u8> {
+    let mut buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = ZipWriter::new(&mut buf);
+        let options =
+            FileOptions::<()>::default().compression_method(zip::CompressionMethod::Deflated);
+
+        writer.start_file("[Content_Types].xml", options).unwrap();
+        writer
+            .write_all(content_types_with_notes_xml().as_bytes())
+            .unwrap();
+
+        writer.start_file("_rels/.rels", options).unwrap();
+        writer.write_all(package_rels_xml().as_bytes()).unwrap();
+
+        writer.start_file("ppt/presentation.xml", options).unwrap();
+        writer.write_all(presentation_xml().as_bytes()).unwrap();
+
+        writer
+            .start_file("ppt/_rels/presentation.xml.rels", options)
+            .unwrap();
+        writer
+            .write_all(presentation_rels_xml().as_bytes())
+            .unwrap();
+
+        writer
+            .start_file("ppt/slides/_rels/slide1.xml.rels", options)
+            .unwrap();
+        writer.write_all(slide1_rels_xml().as_bytes()).unwrap();
+
+        writer.start_file("ppt/slides/slide1.xml", options).unwrap();
+        writer.write_all(slide1_xml().as_bytes()).unwrap();
+
+        writer
+            .start_file("ppt/notesSlides/notesSlide1.xml", options)
+            .unwrap();
+        writer.write_all(notes_slide1_xml().as_bytes()).unwrap();
+
+        writer.start_file("ppt/theme/theme1.xml", options).unwrap();
+        writer.write_all(theme_xml().as_bytes()).unwrap();
+
+        writer.start_file("customXml/item1.xml", options).unwrap();
+        writer.write_all(manifest_xml().as_bytes()).unwrap();
+
+        writer.finish().unwrap();
+    }
+    buf.into_inner()
+}
+
+fn content_types_with_notes_xml() -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>
+  <Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>
+  <Override PartName="/ppt/notesSlides/notesSlide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.notesSlide+xml"/>
+  <Override PartName="/ppt/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>
+  <Override PartName="/customXml/item1.xml" ContentType="{CT_MANIFEST}"/>
+</Types>"#
+    )
+}
+
+fn slide1_rels_xml() -> String {
+    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide1.xml"/>
+</Relationships>"#
+        .to_string()
+}
+
+fn notes_slide1_xml() -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:notes xmlns:p="{P_NS}" xmlns:a="{A_NS}" xmlns:r="{R_NS}">
+  <p:cSld>
+    <p:spTree>
+      <p:nvGrpSpPr>
+        <p:cNvPr id="0" name=""/>
+        <p:cNvGrpSpPr/>
+        <p:nvPr/>
+      </p:nvGrpSpPr>
+      <p:grpSpPr/>
+      <p:sp>
+        <p:nvSpPr>
+          <p:cNvPr id="2" name="Slide Image Placeholder 1"/>
+          <p:cNvSpPr/>
+          <p:nvPr/>
+        </p:nvSpPr>
+        <p:spPr/>
+      </p:sp>
+      <p:sp>
+        <p:nvSpPr>
+          <p:cNvPr id="3" name="Notes Placeholder 2"/>
+          <p:cNvSpPr/>
+          <p:nvPr/>
+        </p:nvSpPr>
+        <p:spPr/>
+        <p:txBody>
+          <a:bodyPr/>
+          <a:lstStyle/>
+          <a:p>
+            <a:r>
+              <a:rPr/>
+              <a:t>First note</a:t>
+            </a:r>
+          </a:p>
+          <a:p>
+            <a:r>
+              <a:rPr/>
+              <a:t>Second note</a:t>
+            </a:r>
+          </a:p>
+        </p:txBody>
+      </p:sp>
+    </p:spTree>
+  </p:cSld>
+</p:notes>"#
+    )
+}
+
+#[test]
+fn load_extracts_notes() {
+    let original = build_pptx_with_notes();
+    let session = load(&original).expect("load should succeed");
+
+    assert_eq!(session.deck().slides.len(), 1);
+    assert_eq!(session.deck().slides[0].notes, "First note\nSecond note");
+}
+
+#[test]
+fn save_preserves_non_text_xml() {
+    let original = build_minimal_pptx();
+    let mut session = load(&original).expect("load should succeed");
+
+    let slide_id = "ppt/slides/slide1.xml".to_string();
+    session
+        .execute(Box::new(EditText::new(
+            slide_id.clone(),
+            0,
+            0,
+            vec![Run::new("Goodbye").bold()],
+        )))
+        .expect("edit should apply");
+
+    let saved = save(&session).expect("save should succeed");
+    let saved_slide = String::from_utf8(entry_bytes(&saved, "ppt/slides/slide1.xml")).unwrap();
+
+    assert!(
+        saved_slide.contains("Goodbye"),
+        "edited slide should contain new text"
+    );
+    assert!(
+        saved_slide.contains("<p:pic>"),
+        "non-text shape should survive the save"
+    );
+}
+
+#[test]
+fn save_clears_dirty_and_updates_original_bytes() {
+    let original = build_minimal_pptx();
+    let mut session = load(&original).expect("load should succeed");
+
+    let slide_id = "ppt/slides/slide1.xml".to_string();
+    session
+        .execute(Box::new(EditText::new(
+            slide_id.clone(),
+            0,
+            0,
+            vec![Run::new("First edit")],
+        )))
+        .expect("edit should apply");
+    assert!(!session.dirty_slides().is_empty());
+
+    let first_save = save(&session).expect("first save should succeed");
+    session.commit_save(first_save.clone());
+    assert!(session.dirty_slides().is_empty());
+
+    session
+        .execute(Box::new(EditText::new(
+            slide_id.clone(),
+            0,
+            0,
+            vec![Run::new("Second edit")],
+        )))
+        .expect("second edit should apply");
+
+    let second_save = save(&session).expect("second save should succeed");
+    let second_slide =
+        String::from_utf8(entry_bytes(&second_save, "ppt/slides/slide1.xml")).unwrap();
+    eprintln!("second_slide={second_slide}");
+    assert!(
+        second_slide.contains("Second edit"),
+        "second edit should appear in the saved slide"
+    );
+    assert!(
+        !second_slide.contains("First edit"),
+        "first edit should be replaced by the second edit"
+    );
+}
+
+#[test]
+fn blank_theme_font_scheme_is_outside_color_scheme() {
+    let bytes = crate::create_blank_pptx();
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let mut file = archive.by_name("ppt/theme/theme1.xml").unwrap();
+    let mut xml = String::new();
+    file.read_to_string(&mut xml).unwrap();
+
+    let clr_close = xml
+        .find("</a:clrScheme>")
+        .expect("clrScheme close tag should exist");
+    let font_open = xml
+        .find("<a:fontScheme")
+        .expect("fontScheme open tag should exist");
+    assert!(
+        clr_close < font_open,
+        "fontScheme must not be nested inside clrScheme"
+    );
+
+    let session = load(crate::create_blank_pptx().as_slice()).expect("load should succeed");
+    assert_eq!(session.deck().theme.heading_font, "Calibri Light");
+    assert_eq!(session.deck().theme.body_font, "Calibri");
+}
+
+#[test]
+fn load_extracts_passthrough_frame() {
+    let original = build_minimal_pptx();
+    let session = load(&original).expect("load should succeed");
+
+    match &session.deck().slides[0].shapes[1] {
+        Shape::Passthrough(obj) => {
+            // The fixture picture does not have an xfrm, so the frame is None.
+            assert!(obj.frame.is_none());
+        }
+        _ => panic!("second shape should be passthrough"),
+    }
 }

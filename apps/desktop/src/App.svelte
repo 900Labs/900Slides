@@ -7,11 +7,11 @@
   import RecoveryPrompt from './RecoveryPrompt.svelte'
   import type {
     DeckSnapshot,
+    ParagraphDto,
     RecoverySnapshot,
-    RunDto,
     SlideSnapshot,
     WarningDto,
-  } from './lib/types'
+  } from './lib/types'}
 
   /** True if this window is the presenter view. */
   const isPresenter = window.location.hash === '#/presenter'
@@ -89,18 +89,16 @@
     await invoke('start_presenter')
   }
 
-  /** Sends a text edit command to Rust and re-renders from the snapshot. */
+  /** Sends a text-box edit command to Rust and re-renders from the snapshot. */
   async function handleTextEdit(detail: {
     slideId: string
     shapeIndex: number
-    paragraphIndex: number
-    runs: RunDto[]
+    paragraphs: ParagraphDto[]
   }): Promise<void> {
-    deck = await invoke<DeckSnapshot>('edit_text', {
+    deck = await invoke<DeckSnapshot>('edit_text_box', {
       slide_id: detail.slideId,
       shape_index: detail.shapeIndex,
-      paragraph_index: detail.paragraphIndex,
-      runs: detail.runs,
+      paragraphs: detail.paragraphs,
     })
   }
 
@@ -177,7 +175,7 @@
           <SlideCanvas
             slide={activeSlide}
             background={deck.theme.background}
-            onEdit={handleTextEdit}
+            onEditTextBox={handleTextEdit}
           />
         {:else}
           <div class="empty-canvas">Open or create a deck to start editing.</div>

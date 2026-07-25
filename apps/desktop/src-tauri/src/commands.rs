@@ -46,7 +46,7 @@ impl AppState {
     /// Creates a new application state with the default recovery directory.
     pub fn new() -> Self {
         let dir = dirs::data_dir()
-            .unwrap_or_else(PathBuf::new)
+            .unwrap_or_default()
             .join("900Slides")
             .join("recovery");
         fs::create_dir_all(&dir).ok();
@@ -65,7 +65,7 @@ impl AppState {
 }
 
 /// Snapshot of a deck sent to the frontend after every command.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeckSnapshot {
     /// Stable deck identifier.
@@ -81,7 +81,7 @@ pub struct DeckSnapshot {
 }
 
 /// Snapshot of a theme for the frontend.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThemeSnapshot {
     /// Background color.
@@ -95,7 +95,7 @@ pub struct ThemeSnapshot {
 }
 
 /// RGBA color sent to the frontend.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ColorDto {
     /// Red channel.
@@ -109,7 +109,7 @@ pub struct ColorDto {
 }
 
 /// Snapshot of a single slide.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SlideSnapshot {
     /// Stable slide identifier.
@@ -121,7 +121,7 @@ pub struct SlideSnapshot {
 }
 
 /// Snapshot of a shape for the frontend.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum ShapeSnapshot {
     /// An editable text box.
@@ -131,7 +131,7 @@ pub enum ShapeSnapshot {
 }
 
 /// Snapshot of a text box shape.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TextBoxSnapshot {
     /// Bounding rectangle in EMU.
@@ -141,7 +141,7 @@ pub struct TextBoxSnapshot {
 }
 
 /// Bounding rectangle in EMU.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RectDto {
     /// Horizontal position, in EMU.
@@ -155,7 +155,7 @@ pub struct RectDto {
 }
 
 /// Snapshot of an opaque passthrough shape.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PassthroughSnapshot {
     /// Identifier from the source object.
@@ -164,10 +164,12 @@ pub struct PassthroughSnapshot {
     pub label: String,
     /// Source part path.
     pub source_part: String,
+    /// Bounding rectangle in EMU, if it could be parsed.
+    pub frame: Option<RectDto>,
 }
 
 /// Paragraph data transfer object.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ParagraphDto {
     /// Inline text runs.
@@ -177,7 +179,7 @@ pub struct ParagraphDto {
 }
 
 /// Inline text run data transfer object.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunDto {
     /// Text content.
@@ -191,7 +193,7 @@ pub struct RunDto {
 }
 
 /// Loss ledger warning data transfer object.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WarningDto {
     /// Identifier of the affected slide.
@@ -201,7 +203,7 @@ pub struct WarningDto {
 }
 
 /// State returned to the presenter window.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PresenterState {
     /// Current slide snapshot.
@@ -217,7 +219,7 @@ pub struct PresenterState {
 }
 
 /// Recovery snapshot metadata returned to the frontend.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecoverySnapshot {
     /// Recovery file identifier (filename including `.pptx`).
@@ -273,9 +275,10 @@ pub fn open_deck(path: String, state: State<'_, AppState>) -> Result<DeckSnapsho
 /// Saves the current deck to the given path.
 #[tauri::command]
 pub fn save_deck(path: String, state: State<'_, AppState>) -> Result<(), String> {
-    let guard = state.session.lock().map_err(|e| e.to_string())?;
-    let session = guard.as_ref().ok_or("no deck is open")?;
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
     let bytes = slides_pptx::save(session).map_err(|e| e.to_string())?;
+    session.commit_save(bytes.clone());
     let deck_id = session.deck().id.clone();
     drop(guard);
     fs::write(&path, bytes).map_err(|e| e.to_string())?;
@@ -308,6 +311,31 @@ pub fn edit_text(
         shape_index,
         paragraph_index,
         core_runs,
+    ));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = deck_to_dto(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Replaces all paragraphs in a text box and returns the updated deck snapshot.
+#[tauri::command]
+pub fn edit_text_box(
+    slide_id: String,
+    shape_index: usize,
+    paragraphs: Vec<ParagraphDto>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let core_paragraphs: Vec<slides_core::Paragraph> =
+        paragraphs.iter().map(paragraph_from_dto).collect();
+    let command = Box::new(slides_core::EditTextBox::new(
+        slide_id,
+        shape_index,
+        core_paragraphs,
     ));
     session.execute(command).map_err(|e| e.to_string())?;
     let snapshot = deck_to_dto(session.deck());
@@ -440,7 +468,7 @@ pub fn restore_recovery(
 ) -> Result<DeckSnapshot, String> {
     let path = {
         let tracker = state.recovery.lock().map_err(|e| e.to_string())?;
-        tracker.dir.join(&id)
+        sanitize_recovery_id(&tracker.dir, &id)?
     };
     let bytes = fs::read(&path).map_err(|e| e.to_string())?;
     let session = slides_pptx::load(&bytes).map_err(|e| e.to_string())?;
@@ -467,15 +495,19 @@ pub fn restore_recovery(
 pub fn discard_recovery(id: String, state: State<'_, AppState>) -> Result<(), String> {
     let path = {
         let tracker = state.recovery.lock().map_err(|e| e.to_string())?;
-        tracker.dir.join(&id)
+        sanitize_recovery_id(&tracker.dir, &id)?
     };
     fs::remove_file(&path).map_err(|e| e.to_string())?;
     Ok(())
 }
 
-fn presenter_state_at(state: &State<'_, AppState>) -> Result<PresenterState, String> {    let guard = state.session.lock().map_err(|e| e.to_string())?;
+fn presenter_state_at(state: &AppState) -> Result<PresenterState, String> {
+    let guard = state.session.lock().map_err(|e| e.to_string())?;
     let session = guard.as_ref().ok_or("no deck is open")?;
     let slides = &session.deck().slides;
+    if slides.is_empty() {
+        return Err("deck has no slides".to_string());
+    }
     let mut idx = *state.presenter_index.lock().map_err(|e| e.to_string())?;
     if idx >= slides.len() {
         idx = 0;
@@ -493,39 +525,66 @@ fn presenter_state_at(state: &State<'_, AppState>) -> Result<PresenterState, Str
 }
 
 fn schedule_recovery(app: &AppHandle, state: &State<'_, AppState>) {
-    let bytes = state
-        .session
-        .lock()
-        .ok()
-        .and_then(|g| g.as_ref().and_then(|s| slides_pptx::save(s).ok()));
-    let deck_id = state
-        .session
-        .lock()
-        .ok()
-        .and_then(|g| g.as_ref().map(|s| s.deck().id.clone()));
-    if let (Some(bytes), Some(deck_id)) = (bytes, deck_id) {
-        let token = state.recovery_token.fetch_add(1, Ordering::SeqCst) + 1;
-        if let Some(mut tracker) = state.recovery.lock().ok() {
-            tracker.pending_token = token;
-            tracker.pending_bytes = Some(bytes);
-            tracker.pending_deck_id = Some(deck_id);
-        }
-        let app_handle = app.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(750));
-            if let Some(state) = app_handle.try_state::<AppState>() {
-                if let Ok(tracker) = state.recovery.lock() {
-                    if tracker.pending_token == token {
-                        if let (Some(bytes), Some(deck_id)) =
-                            (tracker.pending_bytes.as_ref(), tracker.pending_deck_id.as_ref())
-                        {
-                            let _ = write_recovery_snapshot(&tracker.dir, deck_id, bytes);
-                        }
-                    }
-                }
-            }
-        });
+    let Some(mut guard) = state.session.lock().ok() else {
+        return;
+    };
+    let Some(session) = guard.as_mut() else {
+        return;
+    };
+    let Some(bytes) = slides_pptx::save(session).ok() else {
+        return;
+    };
+    let deck_id = session.deck().id.clone();
+    drop(guard);
+
+    let token = state.recovery_token.fetch_add(1, Ordering::SeqCst) + 1;
+    if let Ok(mut tracker) = state.recovery.lock() {
+        tracker.pending_token = token;
+        tracker.pending_bytes = Some(bytes);
+        tracker.pending_deck_id = Some(deck_id);
     }
+
+    let app_handle = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(750));
+        let Some(state) = app_handle.try_state::<AppState>() else {
+            return;
+        };
+        let (bytes, deck_id, dir) = {
+            let Ok(tracker) = state.recovery.lock() else {
+                return;
+            };
+            if tracker.pending_token != token {
+                return;
+            }
+            (
+                tracker.pending_bytes.clone(),
+                tracker.pending_deck_id.clone(),
+                tracker.dir.clone(),
+            )
+        };
+        if let (Some(bytes), Some(deck_id)) = (bytes, deck_id) {
+            let _ = write_recovery_snapshot(&dir, &deck_id, &bytes);
+        }
+    });
+}
+
+fn sanitize_recovery_id(dir: &Path, id: &str) -> Result<PathBuf, String> {
+    if id.is_empty() {
+        return Err("recovery id is empty".to_string());
+    }
+    if id.contains('/') || id.contains('\\') || id.starts_with('.') || id.contains('\0') {
+        return Err("recovery id contains invalid characters".to_string());
+    }
+
+    let canonical_dir = dir.canonicalize().map_err(|e| e.to_string())?;
+    let joined = dir.join(id);
+    let canonical_joined = joined.canonicalize().unwrap_or_else(|_| joined.clone());
+
+    if !canonical_joined.starts_with(&canonical_dir) {
+        return Err("recovery id escapes recovery directory".to_string());
+    }
+    Ok(canonical_joined)
 }
 
 fn write_recovery_snapshot(dir: &Path, deck_id: &str, bytes: &[u8]) -> Result<(), String> {
@@ -556,14 +615,12 @@ fn write_recovery_snapshot(dir: &Path, deck_id: &str, bytes: &[u8]) -> Result<()
 fn retire_recovery(state: &State<'_, AppState>, deck_id: &str) {
     if let Ok(tracker) = state.recovery.lock() {
         if let Ok(entries) = fs::read_dir(&tracker.dir) {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    let path = entry.path();
-                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                        if let Some(pos) = stem.rfind('_') {
-                            if &stem[..pos] == deck_id {
-                                fs::remove_file(&path).ok();
-                            }
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    if let Some(pos) = stem.rfind('_') {
+                        if &stem[..pos] == deck_id {
+                            fs::remove_file(&path).ok();
                         }
                     }
                 }
@@ -618,6 +675,7 @@ fn shape_to_dto(shape: &slides_core::Shape) -> ShapeSnapshot {
             id: obj.id.clone(),
             label: obj.label.clone(),
             source_part: obj.source_part.clone(),
+            frame: obj.frame.map(rect_to_dto),
         }),
     }
 }
@@ -660,9 +718,57 @@ fn run_from_dto(run: &RunDto) -> slides_core::Run {
     }
 }
 
+fn paragraph_from_dto(dto: &ParagraphDto) -> slides_core::Paragraph {
+    slides_core::Paragraph {
+        runs: dto.runs.iter().map(run_from_dto).collect(),
+        list_style: match dto.list_style.as_str() {
+            "ordered" => slides_core::ListStyle::Ordered,
+            "unordered" => slides_core::ListStyle::Unordered,
+            _ => slides_core::ListStyle::None,
+        },
+    }
+}
+
 fn warning_to_dto(warning: &slides_pptx::LossWarning) -> WarningDto {
     WarningDto {
         slide_id: warning.slide_id.clone(),
         message: warning.message.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sanitize_recovery_id, AppState};
+    use std::fs;
+
+    #[test]
+    fn sanitize_recovery_id_rejects_path_traversal() {
+        let dir = std::env::temp_dir().join("900slides-test-sanitize");
+        fs::create_dir_all(&dir).unwrap();
+        let canonical_dir = dir.canonicalize().unwrap();
+
+        assert!(sanitize_recovery_id(&canonical_dir, "../evil").is_err());
+        assert!(sanitize_recovery_id(&canonical_dir, "./hidden").is_err());
+        assert!(sanitize_recovery_id(&canonical_dir, "a/b").is_err());
+        assert!(sanitize_recovery_id(&canonical_dir, "a\\b").is_err());
+        assert!(sanitize_recovery_id(&canonical_dir, "").is_err());
+        assert!(sanitize_recovery_id(&canonical_dir, "a\0b").is_err());
+
+        let ok = sanitize_recovery_id(&canonical_dir, "deck_123.pptx").unwrap();
+        assert_eq!(ok, canonical_dir.join("deck_123.pptx"));
+    }
+
+    #[test]
+    fn presenter_state_at_errors_on_empty_deck() {
+        let state = AppState::new();
+        let blank = slides_pptx::create_blank_pptx();
+        let mut session = slides_pptx::load(&blank).expect("load blank pptx");
+        session.deck_mut().slides.clear();
+        *state.session.lock().unwrap() = Some(session);
+
+        assert_eq!(
+            super::presenter_state_at(&state),
+            Err("deck has no slides".to_string())
+        );
     }
 }

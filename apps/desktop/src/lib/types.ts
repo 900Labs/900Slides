@@ -47,6 +47,7 @@ export interface PassthroughSnapshot {
   id: string
   label: string
   sourcePart: string
+  frame?: { x: number; y: number; width: number; height: number }
 }
 
 /** Shape snapshot union. */

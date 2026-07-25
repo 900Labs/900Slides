@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Deck model, commands, undo / redo, theme"
+description = "Deck model, commands, undo, theme"
 
 [dependencies]
 serde = { workspace = true }

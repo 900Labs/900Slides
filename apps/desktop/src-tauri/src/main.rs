@@ -13,6 +13,7 @@ fn main() {
             commands::save_deck,
             commands::get_snapshot,
             commands::edit_text,
+            commands::edit_text_box,
             commands::undo,
             commands::get_loss_ledger,
             commands::start_presenter,

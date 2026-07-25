@@ -1,20 +1,18 @@
 //! PPTX saving: regenerate only edited parts, copy everything else verbatim.
 
 use std::collections::HashSet;
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Read, Write};
 
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
-use quick_xml::Writer;
-use slides_core::{ListStyle, Paragraph, Rect, Run, Shape, Slide};
+use quick_xml::{Reader, Writer};
+use slides_core::{ListStyle, Paragraph, Run, Shape, Slide, TextBox};
 use zip::write::{FileOptions, ZipWriter};
 
 use crate::error::Result;
+use crate::load::{copy_element, SHAPE_ELEMENT_NAMES};
 use crate::package::{write_content_types, write_rels, Rel, CT_MANIFEST, REL_TYPE_MANIFEST};
 use crate::session::Session;
 
-const P_NS: &str = "http://schemas.openxmlformats.org/presentationml/2006/main";
-const A_NS: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
-const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 const MANIFEST_NS: &str = "http://900labs.github.io/900Slides/1.0";
 
 /// Serializes the current deck to a PPTX package, preserving every untouched
@@ -41,7 +39,7 @@ pub fn save(session: &Session) -> Result<Vec<u8>> {
     let mut rels_seen = false;
 
     for i in 0..archive.len() {
-        let entry = archive.by_index(i)?;
+        let mut entry = archive.by_index(i)?;
         let name = entry.name().to_string();
 
         if name == "[Content_Types].xml" {
@@ -60,7 +58,9 @@ pub fn save(session: &Session) -> Result<Vec<u8>> {
             writer.write_all(&xml)?;
             rels_seen = true;
         } else if let Some(slide) = find_slide_by_path(session, &dirty_paths, &name) {
-            let xml = write_slide_xml(slide)?;
+            let mut original_xml = String::new();
+            entry.read_to_string(&mut original_xml)?;
+            let xml = patch_slide_xml(slide, &original_xml)?;
             writer.start_file(&name, options)?;
             writer.write_all(&xml)?;
         } else {
@@ -152,103 +152,169 @@ fn write_manifest(session: &Session) -> Vec<u8> {
     out
 }
 
-fn write_slide_xml(slide: &Slide) -> Result<Vec<u8>> {
+/// Patches a single slide XML document, replacing only the paragraph content of
+/// editable text boxes and leaving every other element (pictures, transitions,
+/// timing, backgrounds, etc.) untouched.
+fn patch_slide_xml(slide: &Slide, original_xml: &str) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     {
-        let mut writer = Writer::new_with_indent(&mut out, b' ', 2);
-        writer.write_event(Event::Decl(BytesDecl::new(
-            "1.0",
-            Some("UTF-8"),
-            Some("yes"),
-        )))?;
+        let mut writer = Writer::new(&mut out);
+        let mut reader = Reader::from_str(original_xml);
+        reader.config_mut().trim_text(false);
+        let mut buf = Vec::new();
 
-        let mut sld = BytesStart::new("p:sld");
-        sld.push_attribute(("xmlns:p", P_NS));
-        sld.push_attribute(("xmlns:a", A_NS));
-        sld.push_attribute(("xmlns:r", R_NS));
-        writer.write_event(Event::Start(sld.clone()))?;
+        let mut shape_idx = 0usize;
+        let mut in_sp_tree = false;
+        let mut sp_tree_depth = 0usize;
+        let mut depth = 0usize;
 
-        writer.write_event(Event::Start(BytesStart::new("p:cSld")))?;
-        writer.write_event(Event::Start(BytesStart::new("p:bg")))?;
-        writer.write_event(Event::Start(BytesStart::new("p:bgPr")))?;
-        writer.write_event(Event::Empty(BytesStart::new("a:noFill")))?;
-        writer.write_event(Event::End(BytesEnd::new("p:bgPr")))?;
-        writer.write_event(Event::End(BytesEnd::new("p:bg")))?;
+        loop {
+            let event = reader.read_event_into(&mut buf)?;
+            match &event {
+                Event::Start(e) => {
+                    let local = qname_str(e.name());
+                    if local == "spTree" {
+                        in_sp_tree = true;
+                        sp_tree_depth = depth + 1;
+                    }
 
-        writer.write_event(Event::Start(BytesStart::new("p:spTree")))?;
-        writer.write_event(Event::Start(BytesStart::new("p:nvGrpSpPr")))?;
-        writer.write_event(Event::Empty(BytesStart::new("p:cNvPr")))?;
-        writer.write_event(Event::Empty(BytesStart::new("p:cNvGrpSpPr")))?;
-        writer.write_event(Event::Empty(BytesStart::new("p:nvPr")))?;
-        writer.write_event(Event::End(BytesEnd::new("p:nvGrpSpPr")))?;
-        writer.write_event(Event::Empty(BytesStart::new("p:grpSpPr")))?;
+                    if in_sp_tree
+                        && depth == sp_tree_depth
+                        && SHAPE_ELEMENT_NAMES.contains(&local.as_str())
+                    {
+                        let start = e.clone().into_owned();
+                        let mut captured = Vec::new();
+                        let mut capture_writer = Writer::new(&mut captured);
+                        copy_element(&mut reader, &start, &mut capture_writer, &mut buf)?;
+                        let captured_str = String::from_utf8_lossy(&captured);
 
-        for (shape_index, shape) in slide.shapes.iter().enumerate() {
-            match shape {
-                Shape::TextBox(text_box) => {
-                    write_text_box(&mut writer, shape_index + 1, text_box)?;
+                        if let Some(Shape::TextBox(text_box)) = slide.shapes.get(shape_idx) {
+                            if captured_str.contains("<p:txBody") {
+                                write_patched_text_box(&mut writer, &captured_str, text_box)?;
+                            } else {
+                                writer.get_mut().write_all(&captured)?;
+                            }
+                        } else {
+                            writer.get_mut().write_all(&captured)?;
+                        }
+                        shape_idx += 1;
+                        buf.clear();
+                        continue;
+                    }
+
+                    writer.write_event(event)?;
+                    depth += 1;
                 }
-                Shape::Passthrough(obj) => {
-                    writer.get_mut().write_all(&obj.raw_bytes)?;
+                Event::End(e) => {
+                    let local = qname_str(e.name());
+                    if local == "spTree" && in_sp_tree && depth == sp_tree_depth + 1 {
+                        in_sp_tree = false;
+                    }
+                    writer.write_event(event)?;
+                    depth = depth.saturating_sub(1);
+                }
+                Event::Empty(e) => {
+                    let local = qname_str(e.name());
+                    if in_sp_tree
+                        && depth == sp_tree_depth
+                        && SHAPE_ELEMENT_NAMES.contains(&local.as_str())
+                    {
+                        if let Some(Shape::TextBox(_)) = slide.shapes.get(shape_idx) {
+                            // An empty shape element cannot contain a txBody,
+                            // so it does not correspond to an editable text box.
+                        }
+                        shape_idx += 1;
+                    }
+                    writer.write_event(event)?;
+                }
+                Event::Eof => break,
+                _ => {
+                    writer.write_event(event)?;
                 }
             }
+            buf.clear();
         }
-
-        writer.write_event(Event::End(BytesEnd::new("p:spTree")))?;
-        writer.write_event(Event::End(BytesEnd::new("p:cSld")))?;
-        writer.write_event(Event::End(BytesEnd::new("p:sld")))?;
     }
     Ok(out)
 }
 
-fn write_text_box<W: Write>(
+fn write_patched_text_box<W: Write>(
     writer: &mut Writer<W>,
-    shape_id: usize,
-    text_box: &slides_core::TextBox,
+    xml: &str,
+    text_box: &TextBox,
 ) -> Result<()> {
-    writer.write_event(Event::Start(BytesStart::new("p:sp")))?;
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut buf = Vec::new();
 
-    writer.write_event(Event::Start(BytesStart::new("p:nvSpPr")))?;
-    let mut cnvpr = BytesStart::new("p:cNvPr");
-    cnvpr.push_attribute(("id", shape_id.to_string().as_str()));
-    cnvpr.push_attribute(("name", format!("TextBox {}", shape_id).as_str()));
-    writer.write_event(Event::Empty(cnvpr))?;
-    writer.write_event(Event::Empty(BytesStart::new("p:cNvSpPr")))?;
-    writer.write_event(Event::Empty(BytesStart::new("p:nvPr")))?;
-    writer.write_event(Event::End(BytesEnd::new("p:nvSpPr")))?;
+    let mut depth = 0usize;
+    let mut tx_body_depth: Option<usize> = None;
+    let mut a_p_depth: usize = 0;
+    let mut skip_a_p = false;
 
-    writer.write_event(Event::Start(BytesStart::new("p:spPr")))?;
-    write_xfrm(writer, &text_box.frame)?;
-    writer.write_event(Event::End(BytesEnd::new("p:spPr")))?;
-
-    writer.write_event(Event::Start(BytesStart::new("p:txBody")))?;
-    writer.write_event(Event::Empty(BytesStart::new("a:bodyPr")))?;
-    writer.write_event(Event::Empty(BytesStart::new("a:lstStyle")))?;
-    for paragraph in &text_box.paragraphs {
-        write_paragraph(writer, paragraph)?;
+    loop {
+        let event = reader.read_event_into(&mut buf)?;
+        match &event {
+            Event::Start(e) => {
+                let local = qname_str(e.name());
+                if local == "txBody" && tx_body_depth.is_none() {
+                    tx_body_depth = Some(depth + 1);
+                }
+                if local == "p" && tx_body_depth == Some(depth) && !skip_a_p {
+                    skip_a_p = true;
+                    a_p_depth = 1;
+                } else if skip_a_p {
+                    a_p_depth += 1;
+                }
+                if !skip_a_p {
+                    writer.write_event(event)?;
+                }
+                depth += 1;
+            }
+            Event::End(e) => {
+                let local = qname_str(e.name());
+                if local == "txBody" && tx_body_depth == Some(depth) {
+                    for paragraph in &text_box.paragraphs {
+                        write_paragraph(writer, paragraph)?;
+                    }
+                    tx_body_depth = None;
+                }
+                if skip_a_p {
+                    a_p_depth = a_p_depth.saturating_sub(1);
+                    if a_p_depth == 0 {
+                        skip_a_p = false;
+                    }
+                } else {
+                    writer.write_event(event)?;
+                }
+                depth -= 1;
+            }
+            Event::Empty(e) => {
+                let local = qname_str(e.name());
+                if local == "p" && tx_body_depth == Some(depth) && !skip_a_p {
+                    // Skip an empty paragraph placeholder; new paragraphs are
+                    // written before txBody closes.
+                } else if skip_a_p {
+                    // Empty elements do not change the nesting depth, so do
+                    // not increment a_p_depth here.
+                } else {
+                    writer.write_event(event)?;
+                }
+            }
+            Event::Eof => break,
+            _ => {
+                if !skip_a_p {
+                    writer.write_event(event)?;
+                }
+            }
+        }
+        buf.clear();
     }
-    writer.write_event(Event::End(BytesEnd::new("p:txBody")))?;
-
-    writer.write_event(Event::End(BytesEnd::new("p:sp")))?;
     Ok(())
 }
 
-fn write_xfrm<W: Write>(writer: &mut Writer<W>, frame: &Rect) -> Result<()> {
-    writer.write_event(Event::Start(BytesStart::new("a:xfrm")))?;
-    let mut off = BytesStart::new("a:off");
-    off.push_attribute(("x", format_emu(frame.x).as_str()));
-    off.push_attribute(("y", format_emu(frame.y).as_str()));
-    writer.write_event(Event::Empty(off))?;
-    let mut ext = BytesStart::new("a:ext");
-    ext.push_attribute(("cx", format_emu(frame.width).as_str()));
-    ext.push_attribute(("cy", format_emu(frame.height).as_str()));
-    writer.write_event(Event::Empty(ext))?;
-    writer.write_event(Event::End(BytesEnd::new("a:xfrm")))?;
-    Ok(())
-}
-
-fn format_emu(value: f64) -> String {
-    format!("{:.0}", value)
+fn qname_str(q: quick_xml::name::QName) -> String {
+    String::from_utf8_lossy(q.local_name().as_ref()).into_owned()
 }
 
 fn write_paragraph<W: Write>(writer: &mut Writer<W>, paragraph: &Paragraph) -> Result<()> {
