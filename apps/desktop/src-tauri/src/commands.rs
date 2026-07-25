@@ -5,14 +5,21 @@
 //! mutation is applied transactionally in Rust, and the frontend always
 //! re-renders from the returned deck snapshot.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
+
+/// Default PPTX 16:9 slide dimensions, in EMU.
+const SLIDE_WIDTH_EMU: f64 = 12_192_000.0;
+/// Default PPTX 16:9 slide dimensions, in EMU.
+const SLIDE_HEIGHT_EMU: f64 = 6_858_000.0;
 
 /// Global application state held by Tauri.
 ///
@@ -76,6 +83,10 @@ pub struct DeckSnapshot {
     pub theme: ThemeSnapshot,
     /// Ordered slides in the deck.
     pub slides: Vec<SlideSnapshot>,
+    /// Media store: image bytes keyed by their media reference, base64-encoded
+    /// so the frontend can render images directly from the snapshot.
+    #[serde(default)]
+    pub media: BTreeMap<String, MediaEntryDto>,
     /// Warnings from the last load (empty for most commands).
     pub warnings: Vec<WarningDto>,
 }
@@ -128,6 +139,160 @@ pub enum ShapeSnapshot {
     TextBox(TextBoxSnapshot),
     /// An opaque, byte-for-byte preserved object.
     Passthrough(PassthroughSnapshot),
+    /// An image referencing bytes in the deck media store.
+    Image(ImageShapeSnapshot),
+    /// A geometric shape.
+    Geometric(GeometricShapeSnapshot),
+}
+
+/// Snapshot of an image shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageShapeSnapshot {
+    /// Position, size, and rotation of the image.
+    pub transform: TransformDto,
+    /// Key of this image's bytes in the deck media store.
+    pub media_ref: String,
+    /// Optional crop applied to the image.
+    pub crop: Option<CropDto>,
+}
+
+/// Snapshot of a geometric shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeometricShapeSnapshot {
+    /// Position, size, and rotation of the shape.
+    pub transform: TransformDto,
+    /// Primitive geometry of the shape.
+    pub geometry: GeometryDto,
+    /// Visual style of the shape.
+    pub style: StyleDto,
+}
+
+/// Placement of a shape: a bounding frame plus a rotation around its center.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransformDto {
+    /// Bounding rectangle, in EMU.
+    pub frame: RectDto,
+    /// Rotation around the frame center, in degrees.
+    pub rotation: f64,
+}
+
+/// The geometric primitive a shape is built from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GeometryDto {
+    /// A plain rectangle.
+    Rectangle,
+    /// A rectangle with rounded corners.
+    RoundedRectangle {
+        /// Corner radius, in EMU.
+        radius: f64,
+    },
+    /// An ellipse (a circle when square).
+    Ellipse,
+    /// A triangle.
+    Triangle,
+    /// A straight line.
+    Line,
+    /// A single-headed arrow.
+    Arrow,
+    /// A right-arrow callout shape.
+    RightArrowCallout,
+    /// A five-pointed star.
+    Star5,
+}
+
+/// Visual style applied to a geometric shape.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StyleDto {
+    /// Interior fill, if any.
+    pub fill: Option<FillDto>,
+    /// Outline (stroke), if any.
+    pub outline: Option<OutlineDto>,
+    /// Drop shadow, if any.
+    pub shadow: Option<ShadowDto>,
+}
+
+/// Fill applied to a shape's interior.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FillDto {
+    /// A single solid color.
+    Solid(ColorDto),
+}
+
+/// Outline (stroke) of a shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutlineDto {
+    /// Stroke color.
+    pub color: ColorDto,
+    /// Stroke width, in EMU.
+    pub width_emu: f64,
+    /// Dash pattern of the stroke.
+    pub dash: DashStyleDto,
+}
+
+/// Dash pattern for an outline.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DashStyleDto {
+    /// A continuous, unbroken line.
+    #[default]
+    Solid,
+    /// A dashed line.
+    Dash,
+    /// A dotted line.
+    Dot,
+    /// An alternating dash-dot line.
+    DashDot,
+}
+
+/// Drop shadow drawn behind a shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShadowDto {
+    /// Horizontal offset, in EMU.
+    pub offset_x: f64,
+    /// Vertical offset, in EMU.
+    pub offset_y: f64,
+    /// Blur radius, in EMU.
+    pub blur: f64,
+    /// Shadow color.
+    pub color: ColorDto,
+    /// Shadow opacity, in the range `0.0..=1.0`.
+    pub opacity: f64,
+}
+
+/// Crop applied to an image, as fractions of its native size in `0.0..=1.0`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CropDto {
+    /// Fraction cropped from the left edge.
+    pub left: f64,
+    /// Fraction cropped from the top edge.
+    pub top: f64,
+    /// Fraction cropped from the right edge.
+    pub right: f64,
+    /// Fraction cropped from the bottom edge.
+    pub bottom: f64,
+}
+
+/// Media entry sent to the frontend, with bytes base64-encoded.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaEntryDto {
+    /// MIME type of the stored bytes (e.g. `image/png`).
+    pub mime: String,
+    /// Raw media bytes, base64-encoded.
+    pub bytes: String,
+    /// Native pixel width of the media.
+    pub width: u32,
+    /// Native pixel height of the media.
+    pub height: u32,
 }
 
 /// Snapshot of a text box shape.
@@ -216,6 +381,9 @@ pub struct PresenterState {
     pub total: usize,
     /// Plain-text notes for the current slide.
     pub notes: String,
+    /// Media store, base64-encoded, so presenter slides can render images.
+    #[serde(default)]
+    pub media: BTreeMap<String, MediaEntryDto>,
 }
 
 /// Recovery snapshot metadata returned to the frontend.
@@ -342,6 +510,148 @@ pub fn edit_text_box(
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
+}
+
+/// Ingests image bytes, stores them in the deck media store, appends an image
+/// shape to the slide, and returns the updated deck snapshot.
+#[tauri::command]
+pub fn insert_image(
+    slide_id: String,
+    bytes: Vec<u8>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let ingested = slides_media::ingest(&bytes, &slides_media::IngestOptions::default())
+        .map_err(|e| e.to_string())?;
+    let media_key = format!("img-{}", uuid::Uuid::new_v4());
+    let entry = slides_core::MediaEntry {
+        mime: ingested.mime.to_string(),
+        bytes: ingested.bytes,
+        width: ingested.width,
+        height: ingested.height,
+    };
+    let transform = centered_transform(ingested.width, ingested.height);
+
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let command = Box::new(slides_core::InsertImage::new(
+        slide_id, media_key, entry, transform, None,
+    ));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = deck_to_dto(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Appends a geometric shape to a slide and returns the updated deck snapshot.
+#[tauri::command]
+pub fn add_shape(
+    slide_id: String,
+    geometry_kind: String,
+    style: Option<StyleDto>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let geometry = geometry_from_kind(&geometry_kind);
+
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let core_style = style
+        .map(style_to_core)
+        .unwrap_or_else(|| default_shape_style(&session.deck().theme));
+    let shape = slides_core::Shape::Geometric(slides_core::GeometricShape {
+        transform: centered_transform(0, 0),
+        geometry,
+        style: core_style,
+    });
+    let command = Box::new(slides_core::AddShape::new(slide_id, shape));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = deck_to_dto(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Updates a shape's transform (position/size/rotation) and returns the updated
+/// deck snapshot.
+#[tauri::command]
+pub fn update_shape_transform(
+    slide_id: String,
+    shape_index: usize,
+    transform: TransformDto,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let command = Box::new(slides_core::MoveShape::new(
+        slide_id,
+        shape_index,
+        transform_to_core(transform),
+    ));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = deck_to_dto(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Updates a geometric shape's style and returns the updated deck snapshot.
+#[tauri::command]
+pub fn update_shape_style(
+    slide_id: String,
+    shape_index: usize,
+    style: StyleDto,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let command = Box::new(slides_core::SetShapeStyle::new(
+        slide_id,
+        shape_index,
+        style_to_core(style),
+    ));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = deck_to_dto(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Removes a shape from a slide and returns the updated deck snapshot.
+#[tauri::command]
+pub fn delete_shape(
+    slide_id: String,
+    shape_index: usize,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let command = Box::new(slides_core::DeleteShape::new(slide_id, shape_index));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = deck_to_dto(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Renders a single slide to a deterministic SVG string.
+#[tauri::command]
+pub fn render_slide_svg(slide_id: String, state: State<'_, AppState>) -> Result<String, String> {
+    let guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_ref().ok_or("no deck is open")?;
+    let deck = session.deck();
+    let slide = deck.slide(&slide_id).ok_or("slide not found")?;
+    let rendered = slides_render::render_slide(
+        slide,
+        &deck.theme,
+        &deck.media,
+        &slides_render::RenderOptions::default(),
+    );
+    Ok(rendered.svg)
 }
 
 /// Undoes the most recent command and returns the updated deck snapshot.
@@ -521,6 +831,7 @@ fn presenter_state_at(state: &AppState) -> Result<PresenterState, String> {
         slide_number: idx + 1,
         total: slides.len(),
         notes,
+        media: media_to_dto(&session.deck().media),
     })
 }
 
@@ -635,6 +946,7 @@ fn deck_to_dto(deck: &slides_core::Deck) -> DeckSnapshot {
         schema_version: deck.schema_version,
         theme: theme_to_dto(&deck.theme),
         slides: deck.slides.iter().map(slide_to_dto).collect(),
+        media: media_to_dto(&deck.media),
         warnings: Vec::new(),
     }
 }
@@ -677,6 +989,18 @@ fn shape_to_dto(shape: &slides_core::Shape) -> ShapeSnapshot {
             source_part: obj.source_part.clone(),
             frame: obj.frame.map(rect_to_dto),
         }),
+        slides_core::Shape::Image(image) => ShapeSnapshot::Image(ImageShapeSnapshot {
+            transform: transform_to_dto(image.transform),
+            media_ref: image.media_ref.clone(),
+            crop: image.crop.as_ref().map(crop_to_dto),
+        }),
+        slides_core::Shape::Geometric(geometric) => {
+            ShapeSnapshot::Geometric(GeometricShapeSnapshot {
+                transform: transform_to_dto(geometric.transform),
+                geometry: geometry_to_dto(geometric.geometry),
+                style: style_to_dto(&geometric.style),
+            })
+        }
     }
 }
 
@@ -687,6 +1011,206 @@ fn rect_to_dto(rect: slides_core::Rect) -> RectDto {
         width: rect.width,
         height: rect.height,
     }
+}
+
+fn rect_to_core(rect: RectDto) -> slides_core::Rect {
+    slides_core::Rect::new(rect.x, rect.y, rect.width, rect.height)
+}
+
+fn transform_to_dto(transform: slides_core::Transform) -> TransformDto {
+    TransformDto {
+        frame: rect_to_dto(transform.frame),
+        rotation: transform.rotation,
+    }
+}
+
+fn transform_to_core(transform: TransformDto) -> slides_core::Transform {
+    slides_core::Transform {
+        frame: rect_to_core(transform.frame),
+        rotation: transform.rotation,
+    }
+}
+
+fn color_to_core(color: ColorDto) -> slides_core::Color {
+    slides_core::Color {
+        r: color.r,
+        g: color.g,
+        b: color.b,
+        a: color.a,
+    }
+}
+
+fn geometry_to_dto(geometry: slides_core::Geometry) -> GeometryDto {
+    match geometry {
+        slides_core::Geometry::Rectangle => GeometryDto::Rectangle,
+        slides_core::Geometry::RoundedRectangle { radius } => {
+            GeometryDto::RoundedRectangle { radius }
+        }
+        slides_core::Geometry::Ellipse => GeometryDto::Ellipse,
+        slides_core::Geometry::Triangle => GeometryDto::Triangle,
+        slides_core::Geometry::Line => GeometryDto::Line,
+        slides_core::Geometry::Arrow => GeometryDto::Arrow,
+        slides_core::Geometry::RightArrowCallout => GeometryDto::RightArrowCallout,
+        slides_core::Geometry::Star5 => GeometryDto::Star5,
+    }
+}
+
+/// Maps a frontend geometry kind string to the model geometry.
+fn geometry_from_kind(kind: &str) -> slides_core::Geometry {
+    match kind {
+        "rounded_rectangle" => slides_core::Geometry::RoundedRectangle { radius: 100_000.0 },
+        "ellipse" => slides_core::Geometry::Ellipse,
+        "triangle" => slides_core::Geometry::Triangle,
+        "line" => slides_core::Geometry::Line,
+        "arrow" => slides_core::Geometry::Arrow,
+        "right_arrow_callout" => slides_core::Geometry::RightArrowCallout,
+        "star5" => slides_core::Geometry::Star5,
+        _ => slides_core::Geometry::Rectangle,
+    }
+}
+
+fn fill_to_dto(fill: &slides_core::Fill) -> FillDto {
+    match fill {
+        slides_core::Fill::Solid(color) => FillDto::Solid(color_to_dto(*color)),
+    }
+}
+
+fn fill_to_core(fill: FillDto) -> slides_core::Fill {
+    match fill {
+        FillDto::Solid(color) => slides_core::Fill::Solid(color_to_core(color)),
+    }
+}
+
+fn outline_to_dto(outline: &slides_core::Outline) -> OutlineDto {
+    OutlineDto {
+        color: color_to_dto(outline.color),
+        width_emu: outline.width_emu,
+        dash: dash_to_dto(&outline.dash),
+    }
+}
+
+fn outline_to_core(outline: OutlineDto) -> slides_core::Outline {
+    slides_core::Outline {
+        color: color_to_core(outline.color),
+        width_emu: outline.width_emu,
+        dash: dash_to_core(outline.dash),
+    }
+}
+
+fn dash_to_dto(dash: &slides_core::DashStyle) -> DashStyleDto {
+    match dash {
+        slides_core::DashStyle::Solid => DashStyleDto::Solid,
+        slides_core::DashStyle::Dash => DashStyleDto::Dash,
+        slides_core::DashStyle::Dot => DashStyleDto::Dot,
+        slides_core::DashStyle::DashDot => DashStyleDto::DashDot,
+    }
+}
+
+fn dash_to_core(dash: DashStyleDto) -> slides_core::DashStyle {
+    match dash {
+        DashStyleDto::Solid => slides_core::DashStyle::Solid,
+        DashStyleDto::Dash => slides_core::DashStyle::Dash,
+        DashStyleDto::Dot => slides_core::DashStyle::Dot,
+        DashStyleDto::DashDot => slides_core::DashStyle::DashDot,
+    }
+}
+
+fn shadow_to_dto(shadow: &slides_core::Shadow) -> ShadowDto {
+    ShadowDto {
+        offset_x: shadow.offset_x,
+        offset_y: shadow.offset_y,
+        blur: shadow.blur,
+        color: color_to_dto(shadow.color),
+        opacity: shadow.opacity,
+    }
+}
+
+fn shadow_to_core(shadow: ShadowDto) -> slides_core::Shadow {
+    slides_core::Shadow {
+        offset_x: shadow.offset_x,
+        offset_y: shadow.offset_y,
+        blur: shadow.blur,
+        color: color_to_core(shadow.color),
+        opacity: shadow.opacity,
+    }
+}
+
+fn style_to_dto(style: &slides_core::Style) -> StyleDto {
+    StyleDto {
+        fill: style.fill.as_ref().map(fill_to_dto),
+        outline: style.outline.as_ref().map(outline_to_dto),
+        shadow: style.shadow.as_ref().map(shadow_to_dto),
+    }
+}
+
+fn style_to_core(style: StyleDto) -> slides_core::Style {
+    slides_core::Style {
+        fill: style.fill.map(fill_to_core),
+        outline: style.outline.map(outline_to_core),
+        shadow: style.shadow.map(shadow_to_core),
+    }
+}
+
+fn crop_to_dto(crop: &slides_core::Crop) -> CropDto {
+    CropDto {
+        left: crop.left,
+        top: crop.top,
+        right: crop.right,
+        bottom: crop.bottom,
+    }
+}
+
+/// Default style for newly added shapes: a solid accent fill with a thin dark
+/// outline, so the shape is visible without an explicit style from the caller.
+fn default_shape_style(theme: &slides_core::Theme) -> slides_core::Style {
+    slides_core::Style {
+        fill: Some(slides_core::Fill::Solid(theme.accent_color)),
+        outline: Some(slides_core::Outline {
+            color: slides_core::Color::black(),
+            width_emu: 9_525.0,
+            dash: slides_core::DashStyle::Solid,
+        }),
+        shadow: None,
+    }
+}
+
+/// Builds a transform centered on the slide, scaling `native_w` x `native_h`
+/// pixels to fit within 60% of the slide. A zero dimension falls back to a
+/// default 4:3 box.
+fn centered_transform(native_w: u32, native_h: u32) -> slides_core::Transform {
+    let max_w = SLIDE_WIDTH_EMU * 0.6;
+    let max_h = SLIDE_HEIGHT_EMU * 0.6;
+    let (width, height) = if native_w == 0 || native_h == 0 {
+        (max_w, max_w * 0.75)
+    } else {
+        let nw = native_w as f64;
+        let nh = native_h as f64;
+        let scale = (max_w / nw).min(max_h / nh);
+        (nw * scale, nh * scale)
+    };
+    let x = (SLIDE_WIDTH_EMU - width) / 2.0;
+    let y = (SLIDE_HEIGHT_EMU - height) / 2.0;
+    slides_core::Transform {
+        frame: slides_core::Rect::new(x, y, width, height),
+        rotation: 0.0,
+    }
+}
+
+fn media_entry_to_dto(entry: &slides_core::MediaEntry) -> MediaEntryDto {
+    let bytes = base64::engine::general_purpose::STANDARD.encode(&entry.bytes);
+    MediaEntryDto {
+        mime: entry.mime.clone(),
+        bytes,
+        width: entry.width,
+        height: entry.height,
+    }
+}
+
+fn media_to_dto(media: &slides_core::MediaStore) -> BTreeMap<String, MediaEntryDto> {
+    media
+        .iter()
+        .map(|(key, entry)| (key.clone(), media_entry_to_dto(entry)))
+        .collect()
 }
 
 fn paragraph_to_dto(paragraph: &slides_core::Paragraph) -> ParagraphDto {
