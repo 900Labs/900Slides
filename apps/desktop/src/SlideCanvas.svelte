@@ -15,17 +15,16 @@
     /** Deck background color. */
     background: ColorDto
     /** Callback invoked when a text box is edited. */
-    onEdit?: (detail: {
+    onEditTextBox?: (detail: {
       slideId: string
       shapeIndex: number
-      paragraphIndex: number
-      runs: RunDto[]
+      paragraphs: ParagraphDto[]
     }) => void
     /** Whether the canvas is read-only (presenter mode). */
     readonly?: boolean
   }
 
-  let { slide, background, onEdit, readonly = false }: Props = $props()
+  let { slide, background, onEditTextBox, readonly = false }: Props = $props()
 
   /** EMU to CSS pixels for a 1280x720 (16:9) canvas. */
   const EMU_TO_PX = 1.0 / 9525.0
@@ -47,24 +46,59 @@
       .join('\n')
   }
 
-  /** Emits a text edit command for the given shape and paragraph. */
-  function handleBlur(
-    event: FocusEvent,
-    shapeIndex: number,
-    paragraphIndex: number,
-  ): void {
-    if (!onEdit) return
+  /** Concatenates the run text of a single paragraph. */
+  function paragraphText(paragraph: ParagraphDto): string {
+    return paragraph.runs.map((run) => run.text).join('')
+  }
+
+  /** Builds a paragraph DTO, preserving original runs when the text is unchanged. */
+  function buildParagraph(
+    text: string,
+    original: ParagraphDto | undefined,
+  ): ParagraphDto {
+    if (original && paragraphText(original) === text) {
+      return original
+    }
+    return {
+      runs: text ? [{ text, bold: false, italic: false, underline: false }] : [],
+      listStyle: original?.listStyle ?? 'none',
+    }
+  }
+
+  /** Emits a text-box edit command after splitting the textarea value into paragraphs. */
+  function handleBlur(event: FocusEvent, shapeIndex: number): void {
+    if (!onEditTextBox) return
     const target = event.target as HTMLTextAreaElement
-    const text = target.value
-    const runs: RunDto[] = text
-      ? [{ text, bold: false, italic: false, underline: false }]
-      : []
-    onEdit({
-      slideId: slide.id,
-      shapeIndex,
-      paragraphIndex,
-      runs,
-    })
+    const textBox = (slide.shapes[shapeIndex].value as TextBoxSnapshot)
+    const originalParagraphs = textBox.paragraphs
+    const lines = target.value.split('\n')
+
+    const newParagraphs: ParagraphDto[] = lines.map((line, index) =>
+      buildParagraph(line, originalParagraphs[index]),
+    )
+
+    const changed =
+      newParagraphs.length !== originalParagraphs.length ||
+      newParagraphs.some((paragraph, index) => {
+        const original = originalParagraphs[index]
+        if (!original) return true
+        if (paragraph.runs.length !== original.runs.length) return true
+        return paragraph.runs.some(
+          (run, runIndex) =>
+            run.text !== original.runs[runIndex]?.text ||
+            run.bold !== original.runs[runIndex]?.bold ||
+            run.italic !== original.runs[runIndex]?.italic ||
+            run.underline !== original.runs[runIndex]?.underline,
+        )
+      })
+
+    if (changed) {
+      onEditTextBox({
+        slideId: slide.id,
+        shapeIndex,
+        paragraphs: newParagraphs,
+      })
+    }
   }
 </script>
 
@@ -98,14 +132,22 @@
           <textarea
             class="text-box"
             value={textFromParagraphs(textBox.paragraphs)}
-            onblur={(event) => handleBlur(event, shapeIndex, 0)}
+            onblur={(event) => handleBlur(event, shapeIndex)}
             aria-label="Editable text box"
           ></textarea>
         {/if}
       </div>
     {:else if shape.kind === 'passthrough'}
       {@const obj = shape.value as PassthroughSnapshot}
-      <div class="passthrough">
+      {@const passthroughIndex = slide.shapes.filter((s, i) => s.kind === 'passthrough' && i < shapeIndex).length}
+      <div
+        class="passthrough"
+        style:left={obj.frame ? toPx(obj.frame.x) : undefined}
+        style:top={obj.frame ? toPx(obj.frame.y) : `${1 + passthroughIndex * 0.5}rem`}
+        style:right={obj.frame ? undefined : '1rem'}
+        style:width={obj.frame ? toPx(obj.frame.width) : undefined}
+        style:height={obj.frame ? toPx(obj.frame.height) : undefined}
+      >
         [preserved object: {obj.label}]
       </div>
     {/if}
@@ -157,8 +199,6 @@
   }
   .passthrough {
     position: absolute;
-    top: 1rem;
-    right: 1rem;
     padding: 0.5rem;
     border: 2px dashed #c00;
     color: #c00;

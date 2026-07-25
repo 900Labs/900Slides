@@ -179,7 +179,7 @@ longer-horizon work are in §5.3 and `docs/ROADMAP.md`. v0.1.0 claims
 
 **Local file workflow**
 
-- New, open, save, save as, and privacy-preserving recent document tokens.
+- New, open, save, and save as.
 - Autosaved recovery snapshots and a final recovery write on close with
   unsaved changes.
 - A startup recovery prompt that preserves unselected snapshots and
@@ -188,7 +188,7 @@ longer-horizon work are in §5.3 and `docs/ROADMAP.md`. v0.1.0 claims
 **Safety**
 
 - Transactional mutations through a command bus; each transaction produces
-  an inverse. Bounded undo/redo per §6.3.
+  an inverse. Bounded undo per §6.3.
 
 **Internationalization and accessibility**
 
@@ -277,7 +277,7 @@ surface, in the same shape as 900Word and 900Sheets.
 ```
 900Slides/
 ├── apps/desktop/              # Tauri v2 + Svelte 5 desktop app
-├── crates/slides-core/        # Deck model, commands, undo / redo, theme
+├── crates/slides-core/        # Deck model, commands, undo, theme
 ├── crates/slides-pptx/        # PPTX load and save (native format)
 ├── crates/slides-odp/         # ODP import / export conversion boundary
 ├── crates/slides-pdf/         # PDF export and image-per-page import
@@ -418,9 +418,6 @@ PowerPoint compatibility is the default, not a special case.
 
 - No telemetry. No analytics. No crash reporting. No remote calls.
 - No account, no login, no token storage.
-- Recent files are stored as privacy-preserving tokens: a salted hash of the
-  absolute path. The full path is revealed only when the user opens the
-  recent file.
 - The app data directory is the only place where recovery snapshots and
   settings live. The user can open it from the Settings view.
 - Network is used only when the user explicitly exports to a service that

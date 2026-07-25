@@ -16,6 +16,9 @@ pub const REL_TYPE_THEME: &str =
 /// Relationship type for slide parts.
 pub const REL_TYPE_SLIDE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide";
+/// Relationship type for notes slide parts.
+pub const REL_TYPE_NOTES_SLIDE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide";
 /// 900Slides manifest relationship type.
 pub const REL_TYPE_MANIFEST: &str = "http://900labs.github.io/900Slides/1.0/relationships/manifest";
 
@@ -53,11 +56,25 @@ impl Rel {
         }
         let target = self.target.replace('\\', "/");
         if target.starts_with('/') {
-            return Some(target.trim_start_matches('/').to_string());
+            return Some(normalize_package_path(&target));
         }
-        let joined = std::path::Path::new(base_dir).join(&target);
-        Some(joined.to_string_lossy().replace('\\', "/"))
+        Some(normalize_package_path(&format!("{base_dir}/{target}")))
     }
+}
+
+fn normalize_package_path(path: &str) -> String {
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            parts.pop();
+        } else {
+            parts.push(part);
+        }
+    }
+    parts.join("/")
 }
 
 /// Content type defaults keyed by extension.

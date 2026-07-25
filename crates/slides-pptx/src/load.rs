@@ -13,11 +13,11 @@ use slides_core::{
 use crate::error::{Error, Result};
 use crate::ledger::{LossLedger, LossWarning};
 use crate::package::{
-    find_rel_by_type, parse_rels, Rel, REL_TYPE_MANIFEST, REL_TYPE_OFFICE_DOCUMENT, REL_TYPE_SLIDE,
-    REL_TYPE_THEME,
+    find_rel_by_type, parse_rels, Rel, REL_TYPE_MANIFEST, REL_TYPE_NOTES_SLIDE,
+    REL_TYPE_OFFICE_DOCUMENT, REL_TYPE_SLIDE, REL_TYPE_THEME,
 };
 
-const SHAPE_ELEMENT_NAMES: &[&str] =
+pub(crate) const SHAPE_ELEMENT_NAMES: &[&str] =
     &["sp", "pic", "graphicFrame", "cxnSp", "grpSp", "contentPart"];
 
 /// Opens and validates a PPTX ZIP archive.
@@ -134,6 +134,9 @@ pub fn load(bytes: &[u8]) -> Result<LoadResult> {
         let slide_xml = read_entry_to_string(&mut archive, slide_path)?;
         let mut slide = parse_slide(&slide_xml, slide_path, &mut ledger)?;
         slide.id = slide_path.to_string();
+        if let Ok(notes) = load_slide_notes(&mut archive, slide_path) {
+            slide.notes = notes;
+        }
         slide_paths.insert(slide_path.to_string(), slide_path.to_string());
         deck.slides.push(slide);
     }
@@ -223,11 +226,13 @@ fn parse_slide(xml: &str, slide_id: &str, ledger: &mut LossLedger) -> Result<Sli
                                     slide_id,
                                     format!("failed to parse text box: {err}"),
                                 ));
+                                let frame = parse_frame(&captured_str);
                                 shapes.push(Shape::Passthrough(PassthroughObject {
                                     id: extract_id(&captured_str, shapes.len()),
                                     label: local,
                                     source_part: slide_id.to_string(),
                                     raw_bytes: captured,
+                                    frame,
                                 }));
                             }
                         }
@@ -236,11 +241,13 @@ fn parse_slide(xml: &str, slide_id: &str, ledger: &mut LossLedger) -> Result<Sli
                             slide_id,
                             format!("preserved {local} as opaque object; not editable"),
                         ));
+                        let frame = parse_frame(&captured_str);
                         shapes.push(Shape::Passthrough(PassthroughObject {
                             id: extract_id(&captured_str, shapes.len()),
                             label: local,
                             source_part: slide_id.to_string(),
                             raw_bytes: captured,
+                            frame,
                         }));
                     }
                 }
@@ -265,7 +272,7 @@ fn parse_slide(xml: &str, slide_id: &str, ledger: &mut LossLedger) -> Result<Sli
     })
 }
 
-fn copy_element<R, W>(
+pub(crate) fn copy_element<R, W>(
     reader: &mut Reader<R>,
     start: &BytesStart<'_>,
     writer: &mut Writer<W>,
@@ -485,6 +492,147 @@ fn parse_text_box(xml: &str) -> Result<TextBox> {
         frame: frame.unwrap_or_else(|| Rect::new(0.0, 0.0, 0.0, 0.0)),
         paragraphs,
     })
+}
+
+fn parse_frame(xml: &str) -> Option<Rect> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+
+    let mut in_xfrm = false;
+    let mut off: Option<(f64, f64)> = None;
+    let mut ext: Option<(f64, f64)> = None;
+
+    loop {
+        match reader.read_event_into(&mut buf).ok()? {
+            Event::Start(e) => {
+                let local = qname_str(e.name());
+                match local.as_str() {
+                    "xfrm" => in_xfrm = true,
+                    "off" if in_xfrm => {
+                        off = Some((
+                            parse_attr_f64(&e, "x").unwrap_or(0.0),
+                            parse_attr_f64(&e, "y").unwrap_or(0.0),
+                        ));
+                    }
+                    "ext" if in_xfrm => {
+                        ext = Some((
+                            parse_attr_f64(&e, "cx").unwrap_or(0.0),
+                            parse_attr_f64(&e, "cy").unwrap_or(0.0),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            Event::Empty(e) => {
+                let local = qname_str(e.name());
+                match local.as_str() {
+                    "off" if in_xfrm => {
+                        off = Some((
+                            parse_attr_f64(&e, "x").unwrap_or(0.0),
+                            parse_attr_f64(&e, "y").unwrap_or(0.0),
+                        ));
+                    }
+                    "ext" if in_xfrm => {
+                        ext = Some((
+                            parse_attr_f64(&e, "cx").unwrap_or(0.0),
+                            parse_attr_f64(&e, "cy").unwrap_or(0.0),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            Event::End(e) => {
+                if qname_str(e.name()) == "xfrm" {
+                    in_xfrm = false;
+                    if let (Some((x, y)), Some((cx, cy))) = (off, ext) {
+                        return Some(Rect::new(x, y, cx, cy));
+                    }
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    None
+}
+
+fn load_slide_notes(
+    archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+    slide_path: &str,
+) -> Result<String> {
+    let rels_path = rels_path_for(slide_path);
+    let rels_xml = read_entry_to_string(archive, &rels_path)?;
+    let rels = parse_rels(&rels_xml)?;
+    let Some(notes_rel) = find_rel_by_type(&rels, REL_TYPE_NOTES_SLIDE) else {
+        return Ok(String::new());
+    };
+    let base = base_dir(slide_path);
+    let notes_path = notes_rel
+        .resolve(&base)
+        .ok_or_else(|| Error::MissingPart("notes slide".to_string()))?;
+    let notes_xml = read_entry_to_string(archive, &notes_path)?;
+    Ok(extract_notes_text(&notes_xml))
+}
+
+fn extract_notes_text(xml: &str) -> String {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+
+    let mut in_tx_body = false;
+    let mut tx_body_depth = 0usize;
+    let mut paragraph_texts: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_text = false;
+    let mut depth = 0usize;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                depth += 1;
+                let local = qname_str(e.name());
+                if local == "txBody" {
+                    in_tx_body = true;
+                    tx_body_depth = depth;
+                } else if local == "p" && in_tx_body && depth == tx_body_depth + 1 {
+                    current.clear();
+                } else if local == "t" {
+                    in_text = true;
+                }
+            }
+            Ok(Event::Empty(e)) => {
+                let local = qname_str(e.name());
+                if local == "p" && in_tx_body && depth == tx_body_depth + 1 {
+                    paragraph_texts.push(String::new());
+                }
+            }
+            Ok(Event::Text(t)) => {
+                if in_text {
+                    current.push_str(&t.unescape().unwrap_or_default());
+                }
+            }
+            Ok(Event::End(e)) => {
+                let local = qname_str(e.name());
+                if local == "txBody" && depth == tx_body_depth {
+                    in_tx_body = false;
+                } else if local == "p" && in_tx_body && depth == tx_body_depth + 1 {
+                    paragraph_texts.push(std::mem::take(&mut current));
+                } else if local == "t" {
+                    in_text = false;
+                }
+                depth -= 1;
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    paragraph_texts.join("\n")
 }
 
 fn parse_theme(xml: &str) -> Result<Theme> {

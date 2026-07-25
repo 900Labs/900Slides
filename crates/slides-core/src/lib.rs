@@ -1,4 +1,4 @@
-//! Deck model, commands, undo / redo, theme.
+//! Deck model, commands, undo, theme.
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -239,6 +239,8 @@ pub struct PassthroughObject {
     pub source_part: String,
     /// Raw XML bytes from the source document.
     pub raw_bytes: Vec<u8>,
+    /// Bounding rectangle of the object, in EMU, if it could be parsed.
+    pub frame: Option<Rect>,
 }
 
 /// Reserved animation field for future use.
@@ -265,6 +267,14 @@ pub trait Command: std::fmt::Debug + Send {
     fn affected_slide_ids(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// Validates that the command can be applied to the given deck.
+    ///
+    /// The default implementation accepts every command; specific commands
+    /// should override this to reject invalid indices or shapes.
+    fn validate(&self, _deck: &Deck) -> bool {
+        true
+    }
 }
 
 /// Errors returned by [`CommandBus`].
@@ -276,6 +286,9 @@ pub enum CommandError {
     /// The undo history is full.
     #[error("undo history is full")]
     HistoryFull,
+    /// The command is invalid for the current deck state.
+    #[error("invalid command")]
+    InvalidCommand,
 }
 
 /// Transactional command bus with bounded undo history.
@@ -300,12 +313,17 @@ impl CommandBus {
     /// onto the undo stack.
     ///
     /// If a bound is exceeded, the deck is left unchanged and an error is
-    /// returned.
+    /// returned. If the command fails validation, it is rejected without
+    /// modifying the deck or the history.
     pub fn apply(
         &mut self,
         command: Box<dyn Command>,
         deck: &mut Deck,
     ) -> Result<(), CommandError> {
+        if !command.validate(deck) {
+            return Err(CommandError::InvalidCommand);
+        }
+
         let inverse = command.inverse(deck);
         let inv_size = inverse.serialized_size();
         let cmd_size = command.serialized_size();
@@ -328,14 +346,14 @@ impl CommandBus {
 
     /// Pops the most recent transaction and applies its inverse.
     ///
-    /// Returns `false` if there was nothing to undo.
-    pub fn undo(&mut self, deck: &mut Deck) -> bool {
-        let Some(inverse) = self.undo_stack.pop() else {
-            return false;
-        };
+    /// Returns the affected slide ids if a command was undone, or `None` if the
+    /// history was empty.
+    pub fn undo(&mut self, deck: &mut Deck) -> Option<Vec<String>> {
+        let inverse = self.undo_stack.pop()?;
+        let affected = inverse.affected_slide_ids();
         self.total_size = self.total_size.saturating_sub(inverse.serialized_size());
         inverse.apply(deck);
-        true
+        Some(affected)
     }
 
     /// Returns the number of transactions that can currently be undone.
@@ -418,6 +436,92 @@ impl Command for EditText {
     fn affected_slide_ids(&self) -> Vec<String> {
         vec![self.slide_id.clone()]
     }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        let Some(slide) = deck.slide(&self.slide_id) else {
+            return false;
+        };
+        let Some(shape) = slide.shapes.get(self.shape_index) else {
+            return false;
+        };
+        let Shape::TextBox(text_box) = shape else {
+            return false;
+        };
+        self.paragraph_index < text_box.paragraphs.len()
+    }
+}
+
+/// Replaces all paragraphs in a specific slide's text box.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EditTextBox {
+    slide_id: String,
+    shape_index: usize,
+    replacement_paragraphs: Vec<Paragraph>,
+}
+
+impl EditTextBox {
+    /// Creates a new text-box edit command.
+    pub fn new(
+        slide_id: impl Into<String>,
+        shape_index: usize,
+        replacement_paragraphs: Vec<Paragraph>,
+    ) -> Self {
+        Self {
+            slide_id: slide_id.into(),
+            shape_index,
+            replacement_paragraphs,
+        }
+    }
+}
+
+impl Command for EditTextBox {
+    fn apply(&self, deck: &mut Deck) {
+        let Some(slide) = deck.slide_mut(&self.slide_id) else {
+            return;
+        };
+        let Some(shape) = slide.shapes.get_mut(self.shape_index) else {
+            return;
+        };
+        let Shape::TextBox(text_box) = shape else {
+            return;
+        };
+        text_box.paragraphs = self.replacement_paragraphs.clone();
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        let current_paragraphs = deck
+            .slide(&self.slide_id)
+            .and_then(|slide| slide.shapes.get(self.shape_index))
+            .and_then(|shape| match shape {
+                Shape::TextBox(text_box) => Some(text_box.paragraphs.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+
+        Box::new(Self {
+            slide_id: self.slide_id.clone(),
+            shape_index: self.shape_index,
+            replacement_paragraphs: current_paragraphs,
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        let Some(slide) = deck.slide(&self.slide_id) else {
+            return false;
+        };
+        let Some(shape) = slide.shapes.get(self.shape_index) else {
+            return false;
+        };
+        matches!(shape, Shape::TextBox(_))
+    }
 }
 
 /// Returns the crate version.
@@ -492,7 +596,7 @@ mod tests {
             panic!("expected text box");
         }
 
-        assert!(bus.undo(&mut deck));
+        assert!(bus.undo(&mut deck).is_some());
         if let Shape::TextBox(tb) = &deck.slides[0].shapes[0] {
             assert_eq!(tb.paragraphs[0].runs[0].text, "before");
         } else {
@@ -527,6 +631,97 @@ mod tests {
 
         if let Shape::TextBox(tb) = &deck.slides[0].shapes[0] {
             assert_eq!(tb.paragraphs[0].runs[0].text, "seed");
+        } else {
+            panic!("expected text box");
+        }
+    }
+
+    #[test]
+    fn command_bus_rejects_invalid_edit_text() {
+        let mut deck = Deck::new();
+        deck.slides.push(Slide {
+            id: "s1".to_string(),
+            notes: String::new(),
+            shapes: vec![Shape::TextBox(TextBox {
+                frame: Rect::new(0.0, 0.0, 100.0, 100.0),
+                paragraphs: vec![Paragraph {
+                    runs: vec![Run::new("seed")],
+                    list_style: ListStyle::None,
+                }],
+            })],
+            animation: None,
+            transition: None,
+        });
+
+        let mut bus = CommandBus::default();
+        let bad = Box::new(EditText::new("s1", 0, 5, vec![Run::new("after")]));
+        assert_eq!(bus.apply(bad, &mut deck), Err(CommandError::InvalidCommand));
+
+        if let Shape::TextBox(tb) = &deck.slides[0].shapes[0] {
+            assert_eq!(tb.paragraphs[0].runs[0].text, "seed");
+        } else {
+            panic!("expected text box");
+        }
+        assert_eq!(bus.undo_len(), 0);
+    }
+
+    #[test]
+    fn edit_text_box_applies_and_undoes_preserving_formatting() {
+        let mut deck = Deck::new();
+        deck.slides.push(Slide {
+            id: "s1".to_string(),
+            notes: String::new(),
+            shapes: vec![Shape::TextBox(TextBox {
+                frame: Rect::new(0.0, 0.0, 100.0, 100.0),
+                paragraphs: vec![
+                    Paragraph {
+                        runs: vec![Run::new("Hello").bold()],
+                        list_style: ListStyle::None,
+                    },
+                    Paragraph {
+                        runs: vec![Run::new("World").italic()],
+                        list_style: ListStyle::None,
+                    },
+                ],
+            })],
+            animation: None,
+            transition: None,
+        });
+
+        let mut bus = CommandBus::default();
+        // Change only the second paragraph; the first should keep its bold run.
+        let cmd = Box::new(EditTextBox::new(
+            "s1",
+            0,
+            vec![
+                Paragraph {
+                    runs: vec![Run::new("Hello").bold()],
+                    list_style: ListStyle::None,
+                },
+                Paragraph {
+                    runs: vec![Run::new("Moon")],
+                    list_style: ListStyle::None,
+                },
+            ],
+        ));
+        bus.apply(cmd, &mut deck).expect("apply should succeed");
+
+        if let Shape::TextBox(tb) = &deck.slides[0].shapes[0] {
+            assert_eq!(tb.paragraphs.len(), 2);
+            assert!(tb.paragraphs[0].runs[0].bold);
+            assert_eq!(tb.paragraphs[0].runs[0].text, "Hello");
+            assert!(!tb.paragraphs[1].runs[0].bold);
+            assert_eq!(tb.paragraphs[1].runs[0].text, "Moon");
+        } else {
+            panic!("expected text box");
+        }
+
+        assert!(bus.undo(&mut deck).is_some());
+        if let Shape::TextBox(tb) = &deck.slides[0].shapes[0] {
+            assert!(tb.paragraphs[0].runs[0].bold);
+            assert_eq!(tb.paragraphs[0].runs[0].text, "Hello");
+            assert!(tb.paragraphs[1].runs[0].italic);
+            assert_eq!(tb.paragraphs[1].runs[0].text, "World");
         } else {
             panic!("expected text box");
         }

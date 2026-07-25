@@ -34,8 +34,7 @@ What v0.1.0 does:
   speaker notes. Keyboard navigation only.
 - Recovers work after a crash or accidental quit via debounced autosave
   snapshots and a startup recovery prompt.
-- Undoes and redoes text edits through a transactional command bus with
-  bounded history.
+- Undoes text edits through a transactional command bus with bounded history.
 
 What v0.1.0 does **not** do yet:
 
@@ -84,8 +83,7 @@ visibility:
 
 1. Choose **New** for a blank deck with one editable text box, or **Open** to
    load an existing `.pptx` file.
-2. Click a text box on the slide canvas and type. Use **Ctrl/Cmd-B**,
-   **Ctrl/Cmd-I**, and **Ctrl/Cmd-U** for bold, italic, and underline.
+2. Click a text box on the slide canvas and type.
 3. Edits are sent to the Rust backend on each change; the canvas re-renders
    from the returned snapshot. Undo with the toolbar button.
 4. Content 900Slides cannot edit (images, charts, tables, SmartArt) appears as
@@ -125,7 +123,7 @@ application:
 
 ```
 apps/desktop/             Desktop UI and Tauri command boundary
-crates/slides-core/       Deck model, commands, undo / redo, theme
+crates/slides-core/       Deck model, commands, undo, theme
 crates/slides-pptx/       PPTX load and save (native format)
 crates/slides-odp/        ODP import / export conversion boundary (stub)
 crates/slides-pdf/        PDF export and image-per-page import (stub)

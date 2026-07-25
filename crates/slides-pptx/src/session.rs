@@ -102,11 +102,25 @@ impl Session {
         Ok(())
     }
 
-    /// Undoes the most recent command.
+    /// Undoes the most recent command and marks affected slides dirty.
     ///
     /// Returns `true` if a command was undone.
     pub fn undo(&mut self) -> bool {
-        self.command_bus.undo(&mut self.deck)
+        if let Some(affected) = self.command_bus.undo(&mut self.deck) {
+            for id in affected {
+                self.mark_slide_dirty(&id);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Commits a successful save by replacing the original bytes and clearing
+    /// the dirty slide set.
+    pub fn commit_save(&mut self, new_bytes: Vec<u8>) {
+        self.original_bytes = new_bytes;
+        self.dirty_slides.clear();
     }
 
     /// Returns the number of transactions available to undo.

@@ -203,11 +203,11 @@ fn blank_theme_xml() -> String {
       <a:lt2><a:srgbClr val="E7E6E6"/></a:lt2>
       <a:accent1><a:srgbClr val="4472C4"/></a:accent1>
       <a:accent2><a:srgbClr val="ED7D31"/></a:accent2>
-      <a:fontScheme name="Office">
-        <a:majorFont><a:latin typeface="Calibri Light"/></a:majorFont>
-        <a:minorFont><a:latin typeface="Calibri"/></a:minorFont>
-      </a:fontScheme>
     </a:clrScheme>
+    <a:fontScheme name="Office">
+      <a:majorFont><a:latin typeface="Calibri Light"/></a:majorFont>
+      <a:minorFont><a:latin typeface="Calibri"/></a:minorFont>
+    </a:fontScheme>
   </a:themeElements>
 </a:theme>"#
     )
