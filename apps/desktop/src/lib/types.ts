@@ -50,10 +50,82 @@ export interface PassthroughSnapshot {
   frame?: { x: number; y: number; width: number; height: number }
 }
 
+/** Placement of a shape: a bounding frame plus a rotation around its center. */
+export interface TransformDto {
+  frame: RectDto
+  rotation: number
+}
+
+/** The geometric primitive a shape is built from (mirrors slides-core Geometry). */
+export type GeometryDto =
+  | 'rectangle'
+  | 'ellipse'
+  | 'triangle'
+  | 'line'
+  | 'arrow'
+  | 'right_arrow_callout'
+  | 'star5'
+  | { rounded_rectangle: { radius: number } }
+
+/** Fill applied to a shape's interior. */
+export type FillDto = { solid: ColorDto }
+
+/** Dash pattern for an outline. */
+export type DashStyleDto = 'solid' | 'dash' | 'dot' | 'dash_dot'
+
+/** Outline (stroke) of a shape. */
+export interface OutlineDto {
+  color: ColorDto
+  widthEmu: number
+  dash: DashStyleDto
+}
+
+/** Drop shadow drawn behind a shape. */
+export interface ShadowDto {
+  offsetX: number
+  offsetY: number
+  blur: number
+  color: ColorDto
+  opacity: number
+}
+
+/** Visual style applied to a geometric shape. */
+export interface StyleDto {
+  fill?: FillDto
+  outline?: OutlineDto
+  shadow?: ShadowDto
+}
+
+/** Crop applied to an image, as fractions of its native size in 0..=1. */
+export interface CropDto {
+  left: number
+  top: number
+  right: number
+  bottom: number
+}
+
+/** Image shape snapshot, referencing bytes in the deck media store. */
+export interface ImageShapeSnapshot {
+  transform: TransformDto
+  mediaRef: string
+  crop?: CropDto
+}
+
+/** Geometric shape snapshot. */
+export interface GeometricShapeSnapshot {
+  transform: TransformDto
+  geometry: GeometryDto
+  style: StyleDto
+}
+
 /** Shape snapshot union. */
 export interface ShapeSnapshot {
-  kind: 'text_box' | 'passthrough'
-  value: TextBoxSnapshot | PassthroughSnapshot
+  kind: 'text_box' | 'passthrough' | 'image' | 'geometric'
+  value:
+    | TextBoxSnapshot
+    | PassthroughSnapshot
+    | ImageShapeSnapshot
+    | GeometricShapeSnapshot
 }
 
 /** Slide snapshot. */
@@ -63,12 +135,24 @@ export interface SlideSnapshot {
   shapes: ShapeSnapshot[]
 }
 
+/** Media entry with bytes base64-encoded, keyed by media reference. */
+export interface MediaEntryDto {
+  mime: string
+  bytes: string
+  width: number
+  height: number
+}
+
+/** Map of media reference to its base64-encoded entry. */
+export type MediaMap = Record<string, MediaEntryDto>
+
 /** Deck snapshot returned by every mutating command. */
 export interface DeckSnapshot {
   id: string
   schemaVersion: number
   theme: ThemeSnapshot
   slides: SlideSnapshot[]
+  media: MediaMap
   warnings: WarningDto[]
 }
 
@@ -85,6 +169,7 @@ export interface PresenterState {
   slideNumber: number
   total: number
   notes: string
+  media: MediaMap
 }
 
 /** Recovery snapshot metadata. */

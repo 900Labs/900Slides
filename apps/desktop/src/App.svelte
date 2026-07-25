@@ -11,7 +11,7 @@
     RecoverySnapshot,
     SlideSnapshot,
     WarningDto,
-  } from './lib/types'}
+  } from './lib/types'
 
   /** True if this window is the presenter view. */
   const isPresenter = window.location.hash === '#/presenter'
@@ -22,6 +22,8 @@
   let showWarnings = $state(true)
   let recoverySnapshots = $state<RecoverySnapshot[]>([])
   let showRecovery = $state(false)
+  /** Hidden file input used to pick an image to insert. */
+  let imageInput = $state<HTMLInputElement | null>(null)
 
   const activeSlide = $derived<SlideSnapshot | null>(deck?.slides[activeIndex] ?? null)
   const notes = $derived(activeSlide?.notes ?? '')
@@ -102,6 +104,34 @@
     })
   }
 
+  /** Opens the file picker to choose an image to insert onto the active slide. */
+  function onInsertImage(): void {
+    imageInput?.click()
+  }
+
+  /** Reads the chosen image file and inserts it onto the active slide. */
+  async function handleImageSelected(event: Event): Promise<void> {
+    const input = event.target as HTMLInputElement
+    const file = input.files?.[0]
+    input.value = ''
+    if (!file || !activeSlide) return
+    const buffer = await file.arrayBuffer()
+    const bytes = Array.from(new Uint8Array(buffer))
+    deck = await invoke<DeckSnapshot>('insert_image', {
+      slide_id: activeSlide.id,
+      bytes,
+    })
+  }
+
+  /** Appends a geometric shape of the given kind to the active slide. */
+  async function onAddShape(geometryKind: string): Promise<void> {
+    if (!activeSlide) return
+    deck = await invoke<DeckSnapshot>('add_shape', {
+      slide_id: activeSlide.id,
+      geometry_kind: geometryKind,
+    })
+  }
+
   /** Selects a different slide in the thumbnail panel. */
   function selectSlide(index: number): void {
     activeIndex = index
@@ -143,6 +173,21 @@
       <button onclick={onSave} type="button">Save</button>
       <button onclick={onUndo} type="button">Undo</button>
       <button onclick={onStartPresenter} type="button">Present</button>
+      <span class="toolbar-divider"></span>
+      <button onclick={onInsertImage} type="button">Insert Image</button>
+      <span class="shape-group">
+        <span class="shape-label">Shape:</span>
+        <button onclick={() => onAddShape('rectangle')} type="button">Rectangle</button>
+        <button onclick={() => onAddShape('ellipse')} type="button">Ellipse</button>
+        <button onclick={() => onAddShape('triangle')} type="button">Triangle</button>
+      </span>
+      <input
+        bind:this={imageInput}
+        class="hidden-input"
+        type="file"
+        accept="image/png,image/jpeg,image/gif,image/webp,image/svg+xml"
+        onchange={handleImageSelected}
+      />
     </header>
 
     {#if showWarnings && warnings.length > 0}
@@ -175,6 +220,7 @@
           <SlideCanvas
             slide={activeSlide}
             background={deck.theme.background}
+            media={deck.media}
             onEditTextBox={handleTextEdit}
           />
         {:else}
@@ -222,6 +268,24 @@
   }
   .toolbar button {
     padding: 0.4rem 0.8rem;
+  }
+  .toolbar-divider {
+    width: 1px;
+    align-self: stretch;
+    background: #ccc;
+    margin: 0 0.25rem;
+  }
+  .shape-group {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+  }
+  .shape-label {
+    font-size: 0.85rem;
+    color: #555;
+  }
+  .hidden-input {
+    display: none;
   }
   .banner {
     padding: 0.5rem 1rem;

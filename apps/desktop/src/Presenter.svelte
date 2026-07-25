@@ -98,6 +98,7 @@
       <SlideCanvas
         slide={presenterState.currentSlide}
         background={backgroundColor()}
+        media={presenterState.media}
         readonly
       />
     </div>
@@ -108,6 +109,7 @@
           <SlideCanvas
             slide={presenterState.nextSlide}
             background={backgroundColor()}
+            media={presenterState.media}
             readonly
           />
         {:else}
