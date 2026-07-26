@@ -661,7 +661,7 @@ mod tests {
 
     #[test]
     fn rejects_svg_with_file_url() {
-        let svg = b"<svg><image href=\"file:///etc/passwd\"/></svg>";
+        let svg = b"<svg><image href=\"file:///etc/hosts\"/></svg>";
         let err = ingest(svg, &IngestOptions::default()).unwrap_err();
         assert!(matches!(err, Error::UnsafeSvg(_)));
     }

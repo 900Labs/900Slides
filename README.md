@@ -23,23 +23,31 @@ What v0.1.0 does:
 
 - Opens `.pptx` files and edits **text boxes**: paragraphs, bold, italic,
   underline, and ordered or unordered lists.
-- Preserves everything else in the PPTX package **byte-for-byte**. Shapes,
-  images, charts, tables, and any other content 900Slides does not yet edit
-  are carried as opaque objects and re-emitted unchanged on save. Save
-  regenerates only the slides you actually edited.
+- Edits **images and geometric shapes** (rectangle, rounded rectangle,
+  ellipse, triangle, line, arrow, right-arrow callout, five-point star) with
+  fill, outline, shadow, rotation, and crop. Insert an image through the
+  toolbar or a shape through the shape menu.
+- Sanitizes every image on the way in: EXIF and other metadata are stripped by
+  default, only allowlisted image formats are accepted, and embedded SVG is
+  scrubbed of scripts, event handlers, and unsafe URL references.
+- Preserves everything else in the PPTX package **byte-for-byte**. Charts,
+  tables, SmartArt, and any other content 900Slides does not yet edit are
+  carried as opaque objects and re-emitted unchanged on save. Save regenerates
+  only the slides you actually edited.
 - Shows per-slide warnings when a file contains content that is preserved but
   not editable (the loss ledger).
+- Renders a slide to deterministic SVG for thumbnails and presenter previews.
 - Presents a deck locally: a fullscreen presenter window with the current
-  slide, a next-slide preview, a slide counter, an elapsed timer, and
-  speaker notes. Keyboard navigation only.
+  slide, a next-slide preview, a slide counter, an elapsed timer, and speaker
+  notes. Keyboard navigation only.
 - Recovers work after a crash or accidental quit via debounced autosave
   snapshots and a startup recovery prompt.
-- Undoes text edits through a transactional command bus with bounded history.
+- Undoes every edit through a transactional command bus with bounded history.
 
 What v0.1.0 does **not** do yet:
 
-- Edit images, shapes, tables, or charts (they are preserved on save but
-  shown as non-editable placeholders in the editor).
+- Edit tables or charts (they are preserved on save but shown as
+  non-editable placeholders in the editor).
 - Animate builds or transitions.
 - Export to PDF, PNG, SVG, or ODP.
 - Spell-check.
@@ -86,11 +94,14 @@ visibility:
 2. Click a text box on the slide canvas and type.
 3. Edits are sent to the Rust backend on each change; the canvas re-renders
    from the returned snapshot. Undo with the toolbar button.
-4. Content 900Slides cannot edit (images, charts, tables, SmartArt) appears as
-   a labelled placeholder. It is preserved on save but cannot be modified.
-5. Choose **Save** to write a `.pptx` file. Only edited slides are
+4. Insert an image with the toolbar button (it is sanitized on the way in), or
+   add a geometric shape from the shape menu. Images and shapes render on the
+   canvas and can be moved and restyled.
+5. Content 900Slides cannot edit (charts, tables, SmartArt) appears as a
+   labelled placeholder. It is preserved on save but cannot be modified.
+6. Choose **Save** to write a `.pptx` file. Only edited slides are
    regenerated; every other part of the original file is unchanged.
-6. Choose **Present** to open a fullscreen presenter window. Use arrow keys,
+7. Choose **Present** to open a fullscreen presenter window. Use arrow keys,
    space, Home, End, and Escape to navigate.
 
 ### Recovery
@@ -127,11 +138,11 @@ crates/slides-core/       Deck model, commands, undo, theme
 crates/slides-pptx/       PPTX load and save (native format)
 crates/slides-odp/        ODP import / export conversion boundary (stub)
 crates/slides-pdf/        PDF export and image-per-page import (stub)
-crates/slides-render/     Slide rendering to PDF, SVG, and PNG (stub)
+crates/slides-render/     Deterministic slide rendering to SVG
 crates/slides-animation/  Deterministic build and transition playback (stub)
 crates/slides-chart/      Chart data and SVG previews (stub)
 crates/slides-spell/      Spell-check dictionary boundary (stub)
-crates/slides-media/      Image ingest, EXIF strip, MIME allowlist (stub)
+crates/slides-media/      Image ingest, EXIF strip, MIME allowlist, SVG sanitize
 crates/slides-i18n/       Locale and accessibility helpers (stub)
 crates/slides-fixtures/   Sanitized generated fixtures only (stub)
 ```
@@ -148,9 +159,10 @@ Run the complete local gate before opening a pull request:
 ./scripts/verify-local.sh
 ```
 
-The v0.1.0 baseline is 19 Rust tests, zero clippy warnings, and a clean
-svelte-check. The Rust suite includes a generated PPTX round-trip that
-asserts untouched parts are byte-identical after a no-op open and save.
+The workspace test suite is 90 Rust tests, zero clippy warnings, and a clean
+svelte-check. The Rust suite includes generated PPTX round-trip tests that
+assert untouched parts are byte-identical after edits, and determinism tests
+for the renderer.
 
 ## Contributing and support
 
