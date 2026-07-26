@@ -11,14 +11,17 @@ use std::io::Write;
 use zip::write::{FileOptions, ZipWriter};
 
 mod error;
+mod geometry;
 mod ledger;
 mod load;
+mod media;
 mod package;
 mod save;
 mod session;
 
 pub use error::{Error, Result};
 pub use ledger::{LossLedger, LossWarning};
+pub use media::media_key;
 pub use session::Session;
 
 use crate::package::{CT_MANIFEST, REL_TYPE_MANIFEST};
@@ -41,6 +44,7 @@ pub fn load(bytes: &[u8]) -> Result<Session> {
         result.package_rels,
         content_types,
         result.slide_paths,
+        result.slide_media_rids,
         result.manifest_path,
         result.loss_ledger,
     ))

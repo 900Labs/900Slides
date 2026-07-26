@@ -17,6 +17,9 @@ thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 zip = "2"
 quick-xml = "0.36"
+base64 = "0.22"
+twox-hash = "1"
+image = "0.25"
 
 [profile.release]
 opt-level = "s"
