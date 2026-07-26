@@ -380,6 +380,9 @@ pub struct Paragraph {
     pub runs: Vec<Run>,
     /// List style for this paragraph.
     pub list_style: ListStyle,
+    /// Paragraph-level style (heading, blockquote, code block, indentation).
+    #[serde(default)]
+    pub style: ParagraphStyle,
 }
 
 /// List style of a paragraph.
@@ -395,8 +398,149 @@ pub enum ListStyle {
     Unordered,
 }
 
+/// Heading level for a paragraph style.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeadingLevel {
+    /// Heading level 1.
+    H1,
+    /// Heading level 2.
+    H2,
+    /// Heading level 3.
+    H3,
+    /// Heading level 4.
+    H4,
+    /// Heading level 5.
+    H5,
+    /// Heading level 6.
+    H6,
+}
+
+/// Style block applied to a paragraph.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParagraphStyle {
+    /// Heading level, if this paragraph is a heading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heading: Option<HeadingLevel>,
+    /// Whether this paragraph is a block quote.
+    #[serde(default)]
+    pub blockquote: bool,
+    /// Whether this paragraph is a fenced code block.
+    #[serde(default)]
+    pub code_block: bool,
+    /// Indentation level of the paragraph.
+    #[serde(default)]
+    pub indent_level: u32,
+}
+
+/// Vertical alignment of a run relative to the baseline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VerticalAlign {
+    /// Normal baseline alignment.
+    #[default]
+    Baseline,
+    /// Superscript text.
+    Superscript,
+    /// Subscript text.
+    Subscript,
+}
+
+/// A validated hyperlink attached to a run.
+///
+/// The public constructor [`Link::new`] enforces the URL allowlist. Fields are
+/// public so the model can be constructed directly, but callers that build
+/// links from untrusted input (PPTX loaders, desktop commands) must use
+/// [`Link::new`] so the safety boundary is respected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Link {
+    /// URL target of the link.
+    pub url: String,
+    /// Optional display text override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
+}
+
+/// Errors returned by [`Link::new`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LinkError {
+    /// The URL uses a disallowed scheme.
+    #[error("disallowed URL scheme: {0}")]
+    DisallowedScheme(String),
+    /// The URL contains control characters.
+    #[error("URL contains control characters")]
+    ControlCharacters,
+}
+
+impl Link {
+    /// Validates `url` against the link allowlist and constructs a Link.
+    ///
+    /// Rejects:
+    /// - `javascript:`, `vbscript:`, `mocha:`, `livescript:`, `http:`,
+    ///   `https:`, `file:`, and `data:` schemes (case-insensitive prefix),
+    /// - any value with a colon before the first slash (i.e. an unknown scheme),
+    /// - any control character (U+0000..=U+001F or U+007F).
+    ///
+    /// Allowed: `mailto:`, `tel:`, `#fragment`, and schemeless relative paths.
+    pub fn new(url: impl Into<String>) -> std::result::Result<Self, LinkError> {
+        let url = url.into();
+        if url.chars().any(|c| {
+            let code = c as u32;
+            code <= 0x1F || code == 0x7F
+        }) {
+            return Err(LinkError::ControlCharacters);
+        }
+
+        let trimmed = url.trim();
+        if trimmed.starts_with('#') {
+            return Ok(Self { url, display: None });
+        }
+
+        let lowered = trimmed.to_ascii_lowercase();
+        const DANGEROUS_SCHEMES: &[&str] = &[
+            "javascript:",
+            "vbscript:",
+            "mocha:",
+            "livescript:",
+            "http:",
+            "https:",
+            "file:",
+            "data:",
+        ];
+        if let Some(scheme) = DANGEROUS_SCHEMES.iter().find(|s| lowered.starts_with(*s)) {
+            return Err(LinkError::DisallowedScheme(
+                scheme.trim_end_matches(':').to_string(),
+            ));
+        }
+
+        const ALLOWED_SCHEMES: &[&str] = &["mailto:", "tel:"];
+        if ALLOWED_SCHEMES.iter().any(|s| lowered.starts_with(s)) {
+            return Ok(Self { url, display: None });
+        }
+
+        if let Some(colon) = lowered.find(':') {
+            let before_colon = &lowered[..colon];
+            if !before_colon.contains('/') {
+                return Err(LinkError::DisallowedScheme(before_colon.to_string()));
+            }
+        }
+
+        Ok(Self { url, display: None })
+    }
+
+    /// Constructs a Link WITHOUT validation. Only for internal use (e.g. the
+    /// PPTX loader that needs to preserve an existing link then decide whether
+    /// to surface a loss warning). Prefer [`Link::new`] for untrusted input.
+    pub fn new_unchecked(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            display: None,
+        }
+    }
+}
+
 /// An inline run of text with formatting.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Run {
     /// Text content.
     pub text: String,
@@ -406,6 +550,21 @@ pub struct Run {
     pub italic: bool,
     /// Underline formatting.
     pub underline: bool,
+    /// Strikethrough formatting.
+    #[serde(default)]
+    pub strikethrough: bool,
+    /// Vertical alignment (superscript, subscript, or baseline).
+    #[serde(default)]
+    pub vertical_align: VerticalAlign,
+    /// Hyperlink attached to this run.
+    #[serde(default)]
+    pub link: Option<Link>,
+    /// Inline code: monospaced, marked run.
+    #[serde(default)]
+    pub code: bool,
+    /// Run-level font family override; used by code.
+    #[serde(default)]
+    pub font_family: Option<String>,
 }
 
 impl Run {
@@ -416,6 +575,11 @@ impl Run {
             bold: false,
             italic: false,
             underline: false,
+            strikethrough: false,
+            vertical_align: VerticalAlign::Baseline,
+            link: None,
+            code: false,
+            font_family: None,
         }
     }
 
@@ -435,6 +599,44 @@ impl Run {
     pub fn underline(mut self) -> Self {
         self.underline = true;
         self
+    }
+
+    /// Returns a new run with strikethrough set.
+    pub fn strikethrough(mut self) -> Self {
+        self.strikethrough = true;
+        self
+    }
+
+    /// Returns a new run with superscript vertical alignment.
+    pub fn superscript(mut self) -> Self {
+        self.vertical_align = VerticalAlign::Superscript;
+        self
+    }
+
+    /// Returns a new run with subscript vertical alignment.
+    pub fn subscript(mut self) -> Self {
+        self.vertical_align = VerticalAlign::Subscript;
+        self
+    }
+
+    /// Returns a new run marked as inline code.
+    pub fn code(mut self) -> Self {
+        self.code = true;
+        self
+    }
+
+    /// Returns a new run with the given font family override.
+    pub fn font(mut self, family: impl Into<String>) -> Self {
+        self.font_family = Some(family.into());
+        self
+    }
+
+    /// Returns a new run with the given validated link.
+    ///
+    /// Returns an error if the URL fails the link safety allowlist.
+    pub fn link(mut self, url: impl Into<String>) -> std::result::Result<Self, LinkError> {
+        self.link = Some(Link::new(url)?);
+        Ok(self)
     }
 }
 
@@ -731,6 +933,202 @@ impl Command for EditTextBox {
             return false;
         };
         matches!(shape, Shape::TextBox(_))
+    }
+}
+
+/// Merge-patch over a single run's style flags.
+///
+/// Only fields set to `Some(...)` are modified; `None` fields leave the target
+/// run unchanged.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetRunStyle {
+    slide_id: String,
+    shape_index: usize,
+    paragraph_index: usize,
+    run_index: usize,
+    bold: Option<bool>,
+    italic: Option<bool>,
+    underline: Option<bool>,
+    strikethrough: Option<bool>,
+    vertical_align: Option<VerticalAlign>,
+    code: Option<bool>,
+}
+
+impl SetRunStyle {
+    /// Creates a new set-run-style command with all style fields unset.
+    pub fn new(
+        slide_id: impl Into<String>,
+        shape_index: usize,
+        paragraph_index: usize,
+        run_index: usize,
+    ) -> Self {
+        Self {
+            slide_id: slide_id.into(),
+            shape_index,
+            paragraph_index,
+            run_index,
+            bold: None,
+            italic: None,
+            underline: None,
+            strikethrough: None,
+            vertical_align: None,
+            code: None,
+        }
+    }
+
+    /// Sets the bold flag to apply.
+    pub fn bold(mut self, bold: bool) -> Self {
+        self.bold = Some(bold);
+        self
+    }
+
+    /// Sets the italic flag to apply.
+    pub fn italic(mut self, italic: bool) -> Self {
+        self.italic = Some(italic);
+        self
+    }
+
+    /// Sets the underline flag to apply.
+    pub fn underline(mut self, underline: bool) -> Self {
+        self.underline = Some(underline);
+        self
+    }
+
+    /// Sets the strikethrough flag to apply.
+    pub fn strikethrough(mut self, strikethrough: bool) -> Self {
+        self.strikethrough = Some(strikethrough);
+        self
+    }
+
+    /// Sets vertical alignment to superscript.
+    pub fn superscript(mut self) -> Self {
+        self.vertical_align = Some(VerticalAlign::Superscript);
+        self
+    }
+
+    /// Sets vertical alignment to subscript.
+    pub fn subscript(mut self) -> Self {
+        self.vertical_align = Some(VerticalAlign::Subscript);
+        self
+    }
+
+    /// Sets vertical alignment to baseline.
+    pub fn baseline(mut self) -> Self {
+        self.vertical_align = Some(VerticalAlign::Baseline);
+        self
+    }
+
+    /// Sets the inline-code flag to apply.
+    pub fn code(mut self, code: bool) -> Self {
+        self.code = Some(code);
+        self
+    }
+}
+
+impl Command for SetRunStyle {
+    fn apply(&self, deck: &mut Deck) {
+        let Some(slide) = deck.slide_mut(&self.slide_id) else {
+            return;
+        };
+        let Some(shape) = slide.shapes.get_mut(self.shape_index) else {
+            return;
+        };
+        let Shape::TextBox(text_box) = shape else {
+            return;
+        };
+        let Some(paragraph) = text_box.paragraphs.get_mut(self.paragraph_index) else {
+            return;
+        };
+        let Some(run) = paragraph.runs.get_mut(self.run_index) else {
+            return;
+        };
+        if let Some(bold) = self.bold {
+            run.bold = bold;
+        }
+        if let Some(italic) = self.italic {
+            run.italic = italic;
+        }
+        if let Some(underline) = self.underline {
+            run.underline = underline;
+        }
+        if let Some(strikethrough) = self.strikethrough {
+            run.strikethrough = strikethrough;
+        }
+        if let Some(vertical_align) = self.vertical_align {
+            run.vertical_align = vertical_align;
+        }
+        if let Some(code) = self.code {
+            run.code = code;
+        }
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        let snapshot = deck
+            .slide(&self.slide_id)
+            .and_then(|slide| slide.shapes.get(self.shape_index))
+            .and_then(|shape| match shape {
+                Shape::TextBox(text_box) => text_box.paragraphs.get(self.paragraph_index),
+                _ => None,
+            })
+            .and_then(|paragraph| paragraph.runs.get(self.run_index));
+
+        let mut inverse = Self {
+            slide_id: self.slide_id.clone(),
+            shape_index: self.shape_index,
+            paragraph_index: self.paragraph_index,
+            run_index: self.run_index,
+            bold: None,
+            italic: None,
+            underline: None,
+            strikethrough: None,
+            vertical_align: None,
+            code: None,
+        };
+        if let Some(run) = snapshot {
+            if self.bold.is_some() {
+                inverse.bold = Some(run.bold);
+            }
+            if self.italic.is_some() {
+                inverse.italic = Some(run.italic);
+            }
+            if self.underline.is_some() {
+                inverse.underline = Some(run.underline);
+            }
+            if self.strikethrough.is_some() {
+                inverse.strikethrough = Some(run.strikethrough);
+            }
+            if self.vertical_align.is_some() {
+                inverse.vertical_align = Some(run.vertical_align);
+            }
+            if self.code.is_some() {
+                inverse.code = Some(run.code);
+            }
+        }
+        Box::new(inverse)
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        let Some(slide) = deck.slide(&self.slide_id) else {
+            return false;
+        };
+        let Some(shape) = slide.shapes.get(self.shape_index) else {
+            return false;
+        };
+        let Shape::TextBox(text_box) = shape else {
+            return false;
+        };
+        let Some(paragraph) = text_box.paragraphs.get(self.paragraph_index) else {
+            return false;
+        };
+        self.run_index < paragraph.runs.len()
     }
 }
 
@@ -1249,6 +1647,7 @@ mod tests {
                         Run::new(" world").italic().underline(),
                     ],
                     list_style: ListStyle::Unordered,
+                    ..Default::default()
                 }],
             })],
             animation: None,
@@ -1271,6 +1670,7 @@ mod tests {
                 paragraphs: vec![Paragraph {
                     runs: vec![Run::new("before")],
                     list_style: ListStyle::None,
+                    ..Default::default()
                 }],
             })],
             animation: None,
@@ -1306,6 +1706,7 @@ mod tests {
                 paragraphs: vec![Paragraph {
                     runs: vec![Run::new("seed")],
                     list_style: ListStyle::None,
+                    ..Default::default()
                 }],
             })],
             animation: None,
@@ -1338,6 +1739,7 @@ mod tests {
                 paragraphs: vec![Paragraph {
                     runs: vec![Run::new("seed")],
                     list_style: ListStyle::None,
+                    ..Default::default()
                 }],
             })],
             animation: None,
@@ -1368,10 +1770,12 @@ mod tests {
                     Paragraph {
                         runs: vec![Run::new("Hello").bold()],
                         list_style: ListStyle::None,
+                        ..Default::default()
                     },
                     Paragraph {
                         runs: vec![Run::new("World").italic()],
                         list_style: ListStyle::None,
+                        ..Default::default()
                     },
                 ],
             })],
@@ -1388,10 +1792,12 @@ mod tests {
                 Paragraph {
                     runs: vec![Run::new("Hello").bold()],
                     list_style: ListStyle::None,
+                    ..Default::default()
                 },
                 Paragraph {
                     runs: vec![Run::new("Moon")],
                     list_style: ListStyle::None,
+                    ..Default::default()
                 },
             ],
         ));
@@ -1934,5 +2340,312 @@ mod tests {
             "pre-existing media must survive undo"
         );
         assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn rich_text_run_serializes_and_deserializes() {
+        let run = Run::new("link")
+            .strikethrough()
+            .superscript()
+            .link("mailto:hi@example.com")
+            .expect("valid mailto link")
+            .code()
+            .font("Consolas");
+        assert!(run.strikethrough);
+        assert_eq!(run.vertical_align, VerticalAlign::Superscript);
+        assert!(run.code);
+        assert_eq!(run.font_family, Some("Consolas".to_string()));
+        assert_eq!(
+            run.link.as_ref().map(|l| l.url.as_str()),
+            Some("mailto:hi@example.com")
+        );
+
+        let json = serde_json::to_string(&run).expect("serialize run");
+        let restored: Run = serde_json::from_str(&json).expect("deserialize run");
+        assert_eq!(run, restored);
+    }
+
+    #[test]
+    fn paragraph_style_serializes_and_deserializes() {
+        let paragraph = Paragraph {
+            runs: vec![Run::new("heading text")],
+            list_style: ListStyle::None,
+            style: ParagraphStyle {
+                heading: Some(HeadingLevel::H2),
+                blockquote: true,
+                code_block: true,
+                indent_level: 2,
+            },
+        };
+
+        let json = serde_json::to_string(&paragraph).expect("serialize paragraph");
+        let restored: Paragraph = serde_json::from_str(&json).expect("deserialize paragraph");
+        assert_eq!(paragraph, restored);
+    }
+
+    #[test]
+    fn old_deck_without_new_text_fields_deserializes() {
+        let mut deck = Deck::new();
+        deck.slides.push(Slide {
+            id: "s1".to_string(),
+            notes: String::new(),
+            shapes: vec![Shape::TextBox(TextBox {
+                frame: Rect::new(0.0, 0.0, 100.0, 100.0),
+                paragraphs: vec![Paragraph {
+                    runs: vec![Run::new("legacy").bold().italic()],
+                    list_style: ListStyle::Ordered,
+                    ..Default::default()
+                }],
+            })],
+            animation: None,
+            transition: None,
+        });
+
+        let mut value = serde_json::to_value(&deck).expect("serialize to value");
+        let object = value.as_object_mut().expect("deck is an object");
+        // Strip paragraph.style and the new run fields from the JSON.
+        let slides = object.get_mut("slides").unwrap().as_array_mut().unwrap();
+        for slide in slides {
+            let shapes = slide.get_mut("shapes").unwrap().as_array_mut().unwrap();
+            for shape in shapes {
+                let tb = shape.get_mut("value").unwrap();
+                let paragraphs = tb.get_mut("paragraphs").unwrap().as_array_mut().unwrap();
+                for paragraph in paragraphs {
+                    paragraph.as_object_mut().unwrap().remove("style");
+                    let runs = paragraph.get_mut("runs").unwrap().as_array_mut().unwrap();
+                    for run in runs {
+                        let run_obj = run.as_object_mut().unwrap();
+                        run_obj.remove("strikethrough");
+                        run_obj.remove("vertical_align");
+                        run_obj.remove("link");
+                        run_obj.remove("code");
+                        run_obj.remove("font_family");
+                    }
+                }
+            }
+        }
+
+        let old_json = serde_json::to_string(&value).expect("reserialize old deck");
+        let restored: Deck = serde_json::from_str(&old_json).expect("old deck must load");
+
+        let slide = &restored.slides[0];
+        let Shape::TextBox(tb) = &slide.shapes[0] else {
+            panic!("expected text box");
+        };
+        let run = &tb.paragraphs[0].runs[0];
+        assert!(run.bold);
+        assert!(run.italic);
+        assert!(!run.strikethrough);
+        assert_eq!(run.vertical_align, VerticalAlign::Baseline);
+        assert!(run.link.is_none());
+        assert!(!run.code);
+        assert!(run.font_family.is_none());
+        assert_eq!(tb.paragraphs[0].style, ParagraphStyle::default());
+    }
+
+    #[test]
+    fn link_allowlist_and_rejections() {
+        assert!(Link::new("mailto:hi@example.com").is_ok());
+        assert!(Link::new("tel:+123").is_ok());
+        assert!(Link::new("#fragment").is_ok());
+        assert!(Link::new("relative.html").is_ok());
+        assert!(Link::new("./x").is_ok());
+
+        assert_eq!(
+            Link::new("http://example.com"),
+            Err(LinkError::DisallowedScheme("http".to_string()))
+        );
+        assert_eq!(
+            Link::new("https://example.com"),
+            Err(LinkError::DisallowedScheme("https".to_string()))
+        );
+        assert_eq!(
+            Link::new("javascript:alert(1)"),
+            Err(LinkError::DisallowedScheme("javascript".to_string()))
+        );
+        assert_eq!(
+            Link::new("JavaScript:alert(1)"),
+            Err(LinkError::DisallowedScheme("javascript".to_string()))
+        );
+        assert_eq!(
+            Link::new("vbscript:msgbox(1)"),
+            Err(LinkError::DisallowedScheme("vbscript".to_string()))
+        );
+        assert_eq!(
+            Link::new("mocha:test"),
+            Err(LinkError::DisallowedScheme("mocha".to_string()))
+        );
+        assert_eq!(
+            Link::new("livescript:test"),
+            Err(LinkError::DisallowedScheme("livescript".to_string()))
+        );
+        assert_eq!(
+            Link::new("data:text/html,<script>"),
+            Err(LinkError::DisallowedScheme("data".to_string()))
+        );
+        assert_eq!(
+            Link::new("file:///etc/hosts"),
+            Err(LinkError::DisallowedScheme("file".to_string()))
+        );
+        assert_eq!(
+            Link::new("unknown-scheme:foo"),
+            Err(LinkError::DisallowedScheme("unknown-scheme".to_string()))
+        );
+
+        let control_url = "http://example.com\u{0001}x".to_string();
+        assert_eq!(Link::new(control_url), Err(LinkError::ControlCharacters));
+    }
+
+    #[test]
+    fn link_new_unchecked_does_not_validate() {
+        let link = Link::new_unchecked("javascript:alert(1)");
+        assert_eq!(link.url, "javascript:alert(1)");
+    }
+
+    #[test]
+    fn set_run_style_applies_and_undoes_only_some_fields() {
+        let mut deck = Deck::new();
+        deck.slides.push(Slide {
+            id: "s1".to_string(),
+            notes: String::new(),
+            shapes: vec![Shape::TextBox(TextBox {
+                frame: Rect::new(0.0, 0.0, 100.0, 100.0),
+                paragraphs: vec![Paragraph {
+                    runs: vec![Run::new("seed").bold().strikethrough().superscript()],
+                    list_style: ListStyle::None,
+                    ..Default::default()
+                }],
+            })],
+            animation: None,
+            transition: None,
+        });
+        let original = deck.clone();
+
+        let mut bus = CommandBus::default();
+        bus.apply(
+            Box::new(
+                SetRunStyle::new("s1", 0, 0, 0)
+                    .italic(true)
+                    .code(true)
+                    .subscript(),
+            ),
+            &mut deck,
+        )
+        .expect("apply");
+
+        let Shape::TextBox(tb) = &deck.slides[0].shapes[0] else {
+            panic!("expected text box");
+        };
+        let run = &tb.paragraphs[0].runs[0];
+        assert!(run.bold, "bold should remain untouched");
+        assert!(run.italic, "italic should be set");
+        assert!(!run.underline, "underline should remain default");
+        assert!(run.strikethrough, "strikethrough should remain untouched");
+        assert_eq!(
+            run.vertical_align,
+            VerticalAlign::Subscript,
+            "subscript should be set"
+        );
+        assert!(run.code, "code should be set");
+
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn set_run_style_merge_preserves_untouched_flags() {
+        let mut deck = Deck::new();
+        deck.slides.push(Slide {
+            id: "s1".to_string(),
+            notes: String::new(),
+            shapes: vec![Shape::TextBox(TextBox {
+                frame: Rect::new(0.0, 0.0, 100.0, 100.0),
+                paragraphs: vec![Paragraph {
+                    runs: vec![Run::new("seed").bold()],
+                    list_style: ListStyle::None,
+                    ..Default::default()
+                }],
+            })],
+            animation: None,
+            transition: None,
+        });
+
+        let mut bus = CommandBus::default();
+        bus.apply(
+            Box::new(SetRunStyle::new("s1", 0, 0, 0).italic(true)),
+            &mut deck,
+        )
+        .expect("apply");
+
+        let Shape::TextBox(tb) = &deck.slides[0].shapes[0] else {
+            panic!("expected text box");
+        };
+        let run = &tb.paragraphs[0].runs[0];
+        assert!(run.bold, "bold should remain true");
+        assert!(run.italic, "italic should be set");
+    }
+
+    #[test]
+    fn set_run_style_validates_indices_and_shape_kind() {
+        let mut deck = Deck::new();
+        deck.slides.push(Slide {
+            id: "s1".to_string(),
+            notes: String::new(),
+            shapes: vec![
+                Shape::TextBox(TextBox {
+                    frame: Rect::new(0.0, 0.0, 100.0, 100.0),
+                    paragraphs: vec![Paragraph {
+                        runs: vec![Run::new("seed")],
+                        list_style: ListStyle::None,
+                        ..Default::default()
+                    }],
+                }),
+                Shape::Geometric(GeometricShape {
+                    transform: Transform::default(),
+                    geometry: Geometry::Rectangle,
+                    style: Style::default(),
+                }),
+            ],
+            animation: None,
+            transition: None,
+        });
+
+        let mut bus = CommandBus::default();
+        assert_eq!(
+            bus.apply(
+                Box::new(SetRunStyle::new("missing", 0, 0, 0).italic(true)),
+                &mut deck
+            ),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(
+            bus.apply(
+                Box::new(SetRunStyle::new("s1", 9, 0, 0).italic(true)),
+                &mut deck
+            ),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(
+            bus.apply(
+                Box::new(SetRunStyle::new("s1", 0, 9, 0).italic(true)),
+                &mut deck
+            ),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(
+            bus.apply(
+                Box::new(SetRunStyle::new("s1", 0, 0, 9).italic(true)),
+                &mut deck
+            ),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(
+            bus.apply(
+                Box::new(SetRunStyle::new("s1", 1, 0, 0).italic(true)),
+                &mut deck
+            ),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(bus.undo_len(), 0);
     }
 }
