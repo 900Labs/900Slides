@@ -7,7 +7,7 @@ use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::{Reader, Writer};
 use slides_core::{
     Crop, DashStyle, Fill, GeometricShape, Geometry, ImageShape, ListStyle, Outline, Paragraph,
-    Run, Shape, Slide, TextBox, Transform,
+    Run, Shape, Slide, TextBox, Transform, VerticalAlign,
 };
 use zip::write::{FileOptions, ZipWriter};
 
@@ -16,8 +16,8 @@ use crate::geometry;
 use crate::load::{copy_element, extract_blip_embed, rels_path_for, SHAPE_ELEMENT_NAMES};
 use crate::media as pkgmedia;
 use crate::package::{
-    parse_rels, write_content_types, write_rels, Rel, CT_MANIFEST, REL_TYPE_IMAGE,
-    REL_TYPE_MANIFEST,
+    parse_rels, write_content_types, write_rels, Rel, CT_MANIFEST, REL_TYPE_HYPERLINK,
+    REL_TYPE_IMAGE, REL_TYPE_MANIFEST,
 };
 use crate::session::Session;
 
@@ -42,10 +42,12 @@ pub fn save(session: &Session) -> Result<Vec<u8>> {
         .filter_map(|id| session.slide_paths.get(id).cloned())
         .collect();
 
-    // Pre-pass: resolve media for any images inserted since load. This assigns
-    // each new image a package media part, a fresh relationship id, and a
+    // Pre-pass: resolve media for any images inserted since load and collect
+    // hyperlink URLs used by runs on dirty slides. This assigns each new image a
+    // package media part, each new hyperlink a relationship id, and any needed
     // content-type default, all captured before the main write loop runs.
     let mut slide_rids: HashMap<String, HashMap<String, String>> = session.slide_media_rids.clone();
+    let mut slide_link_rids: HashMap<String, HashMap<String, String>> = HashMap::new();
     let mut new_media_parts: Vec<(String, Vec<u8>)> = Vec::new();
     // rels path -> relationships to append (or, if the file is absent, to write
     // as a brand-new part).
@@ -69,6 +71,38 @@ pub fn save(session: &Session) -> Result<Vec<u8>> {
         let mut max_rid = max_rel_number(&existing_rels);
         let rids = slide_rids.entry(slide_id.clone()).or_default();
         let mut additions = Vec::new();
+
+        // Reuse existing hyperlink relationships and allocate new ones for URLs
+        // that do not yet have a relationship on this slide.
+        let mut url_to_rid: HashMap<String, String> = existing_rels
+            .iter()
+            .filter(|r| r.rel_type == REL_TYPE_HYPERLINK)
+            .map(|r| (r.target.clone(), r.id.clone()))
+            .collect();
+        for shape in &slide.shapes {
+            let Shape::TextBox(text_box) = shape else {
+                continue;
+            };
+            for paragraph in &text_box.paragraphs {
+                for run in &paragraph.runs {
+                    if let Some(link) = &run.link {
+                        if url_to_rid.contains_key(&link.url) {
+                            continue;
+                        }
+                        max_rid += 1;
+                        let rid = format!("rId{max_rid}");
+                        url_to_rid.insert(link.url.clone(), rid.clone());
+                        additions.push(Rel {
+                            id: rid,
+                            rel_type: REL_TYPE_HYPERLINK.to_string(),
+                            target: link.url.clone(),
+                            target_mode: Some("External".to_string()),
+                        });
+                    }
+                }
+            }
+        }
+        slide_link_rids.insert(rels_path.clone(), url_to_rid);
 
         for shape in &slide.shapes {
             let Shape::Image(image) = shape else {
@@ -151,7 +185,9 @@ pub fn save(session: &Session) -> Result<Vec<u8>> {
                 .get(slide.id.as_str())
                 .cloned()
                 .unwrap_or_default();
-            let xml = patch_slide_xml(slide, &original_xml, &rids)?;
+            let rels_path = rels_path_for(&name);
+            let link_rids = slide_link_rids.get(&rels_path).cloned().unwrap_or_default();
+            let xml = patch_slide_xml(slide, &original_xml, &rids, &link_rids)?;
             writer.start_file(&name, options)?;
             writer.write_all(&xml)?;
         } else {
@@ -344,6 +380,7 @@ fn regenerate_sp_tree(
     slide: &Slide,
     original_xml: &str,
     rids: &HashMap<String, String>,
+    link_rids: &HashMap<String, String>,
 ) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     {
@@ -383,7 +420,7 @@ fn regenerate_sp_tree(
                     let local = qname_str(e.name());
                     if local == "spTree" && in_sp_tree {
                         for (index, shape) in slide.shapes.iter().enumerate() {
-                            write_model_shape(&mut writer, shape, rids, index)?;
+                            write_model_shape(&mut writer, shape, rids, link_rids, index)?;
                         }
                         in_sp_tree = false;
                     }
@@ -406,6 +443,7 @@ fn write_model_shape<W: Write>(
     writer: &mut Writer<W>,
     shape: &Shape,
     rids: &HashMap<String, String>,
+    link_rids: &HashMap<String, String>,
     index: usize,
 ) -> Result<()> {
     let id = 100_000 + index as i64;
@@ -436,7 +474,7 @@ fn write_model_shape<W: Write>(
             );
             writer.get_mut().write_all(header.as_bytes())?;
             for paragraph in &text_box.paragraphs {
-                write_paragraph(writer, paragraph)?;
+                write_paragraph(writer, paragraph, link_rids)?;
             }
             writer.get_mut().write_all(b"</p:txBody></p:sp>")?;
         }
@@ -458,13 +496,14 @@ fn patch_slide_xml(
     slide: &Slide,
     original_xml: &str,
     rids: &HashMap<String, String>,
+    link_rids: &HashMap<String, String>,
 ) -> Result<Vec<u8>> {
     // If the model has fewer shapes than the original slide XML, a shape was
     // deleted. The positional patch below cannot represent a deletion (it would
     // misalign every following shape and leave the deleted element in place), so
     // fall back to regenerating the entire shape tree from the model.
     if count_top_level_shapes(original_xml)? > slide.shapes.len() {
-        return regenerate_sp_tree(slide, original_xml, rids);
+        return regenerate_sp_tree(slide, original_xml, rids, link_rids);
     }
 
     let mut out = Vec::new();
@@ -508,6 +547,7 @@ fn patch_slide_xml(
                                     &mut writer,
                                     &String::from_utf8_lossy(&captured),
                                     text_box,
+                                    link_rids,
                                 )?;
                                 Some(shape)
                             }
@@ -542,7 +582,13 @@ fn patch_slide_xml(
                         // Append any shapes the model carries beyond the
                         // original XML (inserted since load).
                         while shape_idx < slide.shapes.len() {
-                            append_shape(&mut writer, &slide.shapes[shape_idx], rids, shape_idx)?;
+                            append_shape(
+                                &mut writer,
+                                &slide.shapes[shape_idx],
+                                rids,
+                                link_rids,
+                                shape_idx,
+                            )?;
                             shape_idx += 1;
                         }
                         in_sp_tree = false;
@@ -720,6 +766,7 @@ fn append_shape<W: Write>(
     writer: &mut Writer<W>,
     shape: &Shape,
     rids: &HashMap<String, String>,
+    link_rids: &HashMap<String, String>,
     index: usize,
 ) -> Result<()> {
     let id = 100_000 + index as i64;
@@ -737,7 +784,25 @@ fn append_shape<W: Write>(
             let xml = sp_element_xml(geo, id, &name);
             writer.get_mut().write_all(xml.as_bytes())?;
         }
-        _ => {}
+        Shape::TextBox(text_box) => {
+            let name = format!("TextBox {}", index + 1);
+            let header = format!(
+                "<p:sp><p:nvSpPr><p:cNvPr id=\"{id}\" name=\"{name}\"/>\
+                 <p:cNvSpPr><a:spLocks/></p:cNvSpPr><p:nvPr/></p:nvSpPr>\
+                 <p:spPr>{xfrm}<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></p:spPr>\
+                 <p:txBody><a:bodyPr/><a:lstStyle/>",
+                xfrm = xfrm_xml(&slides_core::Transform {
+                    frame: text_box.frame,
+                    rotation: 0.0,
+                })
+            );
+            writer.get_mut().write_all(header.as_bytes())?;
+            for paragraph in &text_box.paragraphs {
+                write_paragraph(writer, paragraph, link_rids)?;
+            }
+            writer.get_mut().write_all(b"</p:txBody></p:sp>")?;
+        }
+        Shape::Passthrough(_) => {}
     }
     Ok(())
 }
@@ -902,6 +967,7 @@ fn write_patched_text_box<W: Write>(
     writer: &mut Writer<W>,
     xml: &str,
     text_box: &TextBox,
+    link_rids: &HashMap<String, String>,
 ) -> Result<()> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(false);
@@ -935,7 +1001,7 @@ fn write_patched_text_box<W: Write>(
                 let local = qname_str(e.name());
                 if local == "txBody" && tx_body_depth == Some(depth) {
                     for paragraph in &text_box.paragraphs {
-                        write_paragraph(writer, paragraph)?;
+                        write_paragraph(writer, paragraph, link_rids)?;
                     }
                     tx_body_depth = None;
                 }
@@ -977,15 +1043,24 @@ fn qname_str(q: quick_xml::name::QName) -> String {
     String::from_utf8_lossy(q.local_name().as_ref()).into_owned()
 }
 
-fn write_paragraph<W: Write>(writer: &mut Writer<W>, paragraph: &Paragraph) -> Result<()> {
+fn write_paragraph<W: Write>(
+    writer: &mut Writer<W>,
+    paragraph: &Paragraph,
+    link_rids: &HashMap<String, String>,
+) -> Result<()> {
     writer.write_event(Event::Start(BytesStart::new("a:p")))?;
 
+    let mut ppr = BytesStart::new("a:pPr");
+    let lvl_str;
+    if paragraph.style.indent_level > 0 {
+        lvl_str = paragraph.style.indent_level.to_string();
+        ppr.push_attribute(("lvl", lvl_str.as_str()));
+    }
     match paragraph.list_style {
         ListStyle::None => {
-            writer.write_event(Event::Empty(BytesStart::new("a:pPr")))?;
+            writer.write_event(Event::Empty(ppr))?;
         }
         ListStyle::Ordered => {
-            let ppr = BytesStart::new("a:pPr");
             let mut num = BytesStart::new("a:buAutoNum");
             num.push_attribute(("type", "arabicParenR"));
             writer.write_event(Event::Start(ppr))?;
@@ -993,7 +1068,6 @@ fn write_paragraph<W: Write>(writer: &mut Writer<W>, paragraph: &Paragraph) -> R
             writer.write_event(Event::End(BytesEnd::new("a:pPr")))?;
         }
         ListStyle::Unordered => {
-            let ppr = BytesStart::new("a:pPr");
             let mut bullet = BytesStart::new("a:buChar");
             bullet.push_attribute(("char", "•"));
             writer.write_event(Event::Start(ppr))?;
@@ -1003,14 +1077,18 @@ fn write_paragraph<W: Write>(writer: &mut Writer<W>, paragraph: &Paragraph) -> R
     }
 
     for run in &paragraph.runs {
-        write_run(writer, run)?;
+        write_run(writer, run, link_rids)?;
     }
 
     writer.write_event(Event::End(BytesEnd::new("a:p")))?;
     Ok(())
 }
 
-fn write_run<W: Write>(writer: &mut Writer<W>, run: &Run) -> Result<()> {
+fn write_run<W: Write>(
+    writer: &mut Writer<W>,
+    run: &Run,
+    link_rids: &HashMap<String, String>,
+) -> Result<()> {
     writer.write_event(Event::Start(BytesStart::new("a:r")))?;
 
     let mut rpr = BytesStart::new("a:rPr");
@@ -1023,7 +1101,42 @@ fn write_run<W: Write>(writer: &mut Writer<W>, run: &Run) -> Result<()> {
     if run.underline {
         rpr.push_attribute(("u", "sng"));
     }
-    writer.write_event(Event::Empty(rpr))?;
+    if run.strikethrough {
+        rpr.push_attribute(("strike", "sngStrike"));
+    }
+    let baseline_str;
+    match run.vertical_align {
+        VerticalAlign::Superscript => {
+            baseline_str = "30000".to_string();
+            rpr.push_attribute(("baseline", baseline_str.as_str()));
+        }
+        VerticalAlign::Subscript => {
+            baseline_str = "-30000".to_string();
+            rpr.push_attribute(("baseline", baseline_str.as_str()));
+        }
+        VerticalAlign::Baseline => {}
+    }
+
+    let has_link = run.link.is_some();
+    let needs_rpr_inner = run.font_family.is_some() || has_link;
+    if needs_rpr_inner {
+        writer.write_event(Event::Start(rpr))?;
+        if let Some(font) = &run.font_family {
+            let mut latin = BytesStart::new("a:latin");
+            latin.push_attribute(("typeface", font.as_str()));
+            writer.write_event(Event::Empty(latin))?;
+        }
+        if let Some(link) = &run.link {
+            if let Some(rid) = link_rids.get(&link.url) {
+                let mut hlink = BytesStart::new("a:hlinkClick");
+                hlink.push_attribute(("r:id", rid.as_str()));
+                writer.write_event(Event::Empty(hlink))?;
+            }
+        }
+        writer.write_event(Event::End(BytesEnd::new("a:rPr")))?;
+    } else {
+        writer.write_event(Event::Empty(rpr))?;
+    }
 
     if run.text.is_empty() {
         writer.write_event(Event::Empty(BytesStart::new("a:t")))?;
