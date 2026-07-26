@@ -19,6 +19,9 @@ pub const REL_TYPE_SLIDE: &str =
 /// Relationship type for notes slide parts.
 pub const REL_TYPE_NOTES_SLIDE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide";
+/// Relationship type for image (picture) media parts embedded in a slide.
+pub const REL_TYPE_IMAGE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image";
 /// 900Slides manifest relationship type.
 pub const REL_TYPE_MANIFEST: &str = "http://900labs.github.io/900Slides/1.0/relationships/manifest";
 
@@ -62,7 +65,7 @@ impl Rel {
     }
 }
 
-fn normalize_package_path(path: &str) -> String {
+pub(crate) fn normalize_package_path(path: &str) -> String {
     let mut parts = Vec::new();
     for part in path.split('/') {
         if part.is_empty() || part == "." {

@@ -23,6 +23,11 @@ pub struct Session {
     pub(crate) content_types: ContentTypes,
     /// Map of slide id to original part path.
     pub(crate) slide_paths: HashMap<String, String>,
+    /// For each slide (keyed by id), a map from a media content key (into
+    /// `deck.media`) to the OOXML relationship id that resolves it. Used by the
+    /// saver to emit `<a:blip r:embed>` for modeled images and to recognize
+    /// newly inserted images.
+    pub(crate) slide_media_rids: HashMap<String, HashMap<String, String>>,
     /// Path where the 900Slides manifest is (or will be) stored.
     pub(crate) manifest_path: String,
     /// Existing manifest relationship id, if any.
@@ -37,12 +42,14 @@ pub struct Session {
 
 impl Session {
     /// Creates a new session from its components.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         deck: Deck,
         original_bytes: Vec<u8>,
         package_rels: Vec<Rel>,
         content_types: ContentTypes,
         slide_paths: HashMap<String, String>,
+        slide_media_rids: HashMap<String, HashMap<String, String>>,
         manifest_path: Option<String>,
         loss_ledger: LossLedger,
     ) -> Self {
@@ -57,6 +64,7 @@ impl Session {
             package_rels,
             content_types,
             slide_paths,
+            slide_media_rids,
             manifest_path,
             manifest_rel_id,
             dirty_slides: HashSet::new(),

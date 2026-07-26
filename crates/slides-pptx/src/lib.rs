@@ -11,8 +11,10 @@ use std::io::Write;
 use zip::write::{FileOptions, ZipWriter};
 
 mod error;
+mod geometry;
 mod ledger;
 mod load;
+mod media;
 mod package;
 mod save;
 mod session;
@@ -41,6 +43,7 @@ pub fn load(bytes: &[u8]) -> Result<Session> {
         result.package_rels,
         content_types,
         result.slide_paths,
+        result.slide_media_rids,
         result.manifest_path,
         result.loss_ledger,
     ))
