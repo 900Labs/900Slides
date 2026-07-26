@@ -1313,11 +1313,14 @@ version = "0.1.0"
 name = "slides-pptx"
 version = "0.1.0"
 dependencies = [
+ "image",
  "quick-xml",
  "serde",
  "serde_json",
  "slides-core",
+ "slides-media",
  "thiserror",
+ "twox-hash",
  "zip",
 ]
 

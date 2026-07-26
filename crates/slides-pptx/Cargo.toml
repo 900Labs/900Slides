@@ -8,8 +8,13 @@ description = "PPTX load and save (native format)"
 
 [dependencies]
 slides-core = { path = "../slides-core" }
+slides-media = { path = "../slides-media" }
 zip = { workspace = true }
 quick-xml = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+twox-hash = { workspace = true }
+
+[dev-dependencies]
+image = { workspace = true }

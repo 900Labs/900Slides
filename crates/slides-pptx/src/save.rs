@@ -1,16 +1,24 @@
 //! PPTX saving: regenerate only edited parts, copy everything else verbatim.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read, Write};
 
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::{Reader, Writer};
-use slides_core::{ListStyle, Paragraph, Run, Shape, Slide, TextBox};
+use slides_core::{
+    Crop, DashStyle, Fill, GeometricShape, Geometry, ImageShape, ListStyle, Outline, Paragraph,
+    Run, Shape, Slide, TextBox, Transform,
+};
 use zip::write::{FileOptions, ZipWriter};
 
-use crate::error::Result;
-use crate::load::{copy_element, SHAPE_ELEMENT_NAMES};
-use crate::package::{write_content_types, write_rels, Rel, CT_MANIFEST, REL_TYPE_MANIFEST};
+use crate::error::{Error, Result};
+use crate::geometry;
+use crate::load::{copy_element, extract_blip_embed, rels_path_for, SHAPE_ELEMENT_NAMES};
+use crate::media as pkgmedia;
+use crate::package::{
+    parse_rels, write_content_types, write_rels, Rel, CT_MANIFEST, REL_TYPE_IMAGE,
+    REL_TYPE_MANIFEST,
+};
 use crate::session::Session;
 
 const MANIFEST_NS: &str = "http://900labs.github.io/900Slides/1.0";
@@ -18,7 +26,7 @@ const MANIFEST_NS: &str = "http://900labs.github.io/900Slides/1.0";
 /// Serializes the current deck to a PPTX package, preserving every untouched
 /// part byte-for-byte.
 pub fn save(session: &Session) -> Result<Vec<u8>> {
-    let mut archive = zip::ZipArchive::new(Cursor::new(&session.original_bytes))?;
+    let mut archive = zip::ZipArchive::new(Cursor::new(session.original_bytes.as_slice()))?;
     let mut out = Cursor::new(Vec::new());
     let mut writer = ZipWriter::new(&mut out);
     let options = FileOptions::<()>::default().compression_method(zip::CompressionMethod::Deflated);
@@ -33,6 +41,70 @@ pub fn save(session: &Session) -> Result<Vec<u8>> {
         .iter()
         .filter_map(|id| session.slide_paths.get(id).cloned())
         .collect();
+
+    // Pre-pass: resolve media for any images inserted since load. This assigns
+    // each new image a package media part, a fresh relationship id, and a
+    // content-type default, all captured before the main write loop runs.
+    let mut slide_rids: HashMap<String, HashMap<String, String>> = session.slide_media_rids.clone();
+    let mut new_media_parts: Vec<(String, Vec<u8>)> = Vec::new();
+    // rels path -> relationships to append (or, if the file is absent, to write
+    // as a brand-new part).
+    let mut slide_rels_additions: HashMap<String, Vec<Rel>> = HashMap::new();
+
+    let mut media_counter = max_media_counter(&mut archive)?;
+
+    for slide_id in session.dirty_slides.iter() {
+        let Some(slide_path) = session.slide_paths.get(slide_id) else {
+            continue;
+        };
+        let Some(slide) = session.deck.slides.iter().find(|s| &s.id == slide_id) else {
+            continue;
+        };
+
+        let rels_path = rels_path_for(slide_path);
+        let existing_rels = match crate::load::read_entry_to_string(&mut archive, &rels_path) {
+            Ok(xml) => parse_rels(&xml).unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        let mut max_rid = max_rel_number(&existing_rels);
+        let rids = slide_rids.entry(slide_id.clone()).or_default();
+        let mut additions = Vec::new();
+
+        for shape in &slide.shapes {
+            let Shape::Image(image) = shape else {
+                continue;
+            };
+            if rids.contains_key(&image.media_ref) {
+                continue;
+            };
+            let Some(entry) = session.deck.media.get(&image.media_ref) else {
+                continue;
+            };
+            let Some(ext) = pkgmedia::extension_for_mime(&entry.mime) else {
+                continue;
+            };
+            media_counter += 1;
+            let part_path = format!("ppt/media/image{media_counter}.{ext}");
+            max_rid += 1;
+            let rid = format!("rId{max_rid}");
+            rids.insert(image.media_ref.clone(), rid.clone());
+            new_media_parts.push((part_path.clone(), entry.bytes.clone()));
+            additions.push(Rel {
+                id: rid,
+                rel_type: REL_TYPE_IMAGE.to_string(),
+                target: pkgmedia::relative_target(slide_path, &part_path),
+                target_mode: None,
+            });
+            content_types
+                .defaults
+                .entry(ext.to_string())
+                .or_insert_with(|| entry.mime.clone());
+        }
+
+        if !additions.is_empty() {
+            slide_rels_additions.insert(rels_path, additions);
+        }
+    }
 
     let mut manifest_seen = false;
     let mut content_types_seen = false;
@@ -57,10 +129,22 @@ pub fn save(session: &Session) -> Result<Vec<u8>> {
             writer.start_file(&name, options)?;
             writer.write_all(&xml)?;
             rels_seen = true;
+        } else if let Some(additions) = slide_rels_additions.remove(&name) {
+            let mut xml = String::new();
+            entry.read_to_string(&mut xml)?;
+            let mut rels = parse_rels(&xml)?;
+            rels.extend(additions);
+            let bytes = write_rels(&rels)?;
+            writer.start_file(&name, options)?;
+            writer.write_all(&bytes)?;
         } else if let Some(slide) = find_slide_by_path(session, &dirty_paths, &name) {
             let mut original_xml = String::new();
             entry.read_to_string(&mut original_xml)?;
-            let xml = patch_slide_xml(slide, &original_xml)?;
+            let rids = slide_rids
+                .get(slide.id.as_str())
+                .cloned()
+                .unwrap_or_default();
+            let xml = patch_slide_xml(slide, &original_xml, &rids)?;
             writer.start_file(&name, options)?;
             writer.write_all(&xml)?;
         } else {
@@ -68,8 +152,20 @@ pub fn save(session: &Session) -> Result<Vec<u8>> {
         }
     }
 
+    // Write brand-new media parts (inserted images) and any slide rels files
+    // that did not previously exist.
+    for (part, bytes) in &new_media_parts {
+        writer.start_file(part.as_str(), options)?;
+        writer.write_all(bytes)?;
+    }
+    for (rels_path, additions) in &slide_rels_additions {
+        let bytes = write_rels(additions)?;
+        writer.start_file(rels_path.as_str(), options)?;
+        writer.write_all(&bytes)?;
+    }
+
     if !manifest_seen {
-        writer.start_file(&session.manifest_path, options)?;
+        writer.start_file(session.manifest_path.as_str(), options)?;
         writer.write_all(&manifest_xml)?;
     }
     if !content_types_seen {
@@ -86,6 +182,34 @@ pub fn save(session: &Session) -> Result<Vec<u8>> {
 
     writer.finish()?;
     Ok(out.into_inner())
+}
+
+/// Returns the highest `image<N>` index under `ppt/media/`, or `0` if none.
+fn max_media_counter(archive: &mut zip::ZipArchive<Cursor<&[u8]>>) -> Result<usize> {
+    let mut max = 0usize;
+    for i in 0..archive.len() {
+        let entry = archive.by_index(i)?;
+        let name = entry.name();
+        if let Some(rest) = name.strip_prefix("ppt/media/image") {
+            if let Some(num) = rest.split('.').next() {
+                if let Ok(n) = num.parse::<usize>() {
+                    max = max.max(n);
+                }
+            }
+        }
+    }
+    Ok(max)
+}
+
+/// Returns the highest numeric `rId<N>` in `rels`, or `0` if none.
+fn max_rel_number(rels: &[Rel]) -> usize {
+    rels.iter()
+        .filter_map(|r| {
+            r.id.strip_prefix("rId")
+                .and_then(|s| s.parse::<usize>().ok())
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn find_slide_by_path<'a>(
@@ -152,10 +276,18 @@ fn write_manifest(session: &Session) -> Vec<u8> {
     out
 }
 
-/// Patches a single slide XML document, replacing only the paragraph content of
-/// editable text boxes and leaving every other element (pictures, transitions,
-/// timing, backgrounds, etc.) untouched.
-fn patch_slide_xml(slide: &Slide, original_xml: &str) -> Result<Vec<u8>> {
+/// Patches a single slide XML document in place.
+///
+/// Editable text boxes have their paragraphs rewritten; modeled images and
+/// geometric shapes have their `<p:spPr>` (and `<p:blipFill>` for pictures)
+/// regenerated from the model while every other element on the slide —
+/// pictures, transitions, timing, backgrounds, non-editable shapes — is copied
+/// through untouched. Shapes added since load are appended to the shape tree.
+fn patch_slide_xml(
+    slide: &Slide,
+    original_xml: &str,
+    rids: &HashMap<String, String>,
+) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     {
         let mut writer = Writer::new(&mut out);
@@ -186,18 +318,38 @@ fn patch_slide_xml(slide: &Slide, original_xml: &str) -> Result<Vec<u8>> {
                         let mut captured = Vec::new();
                         let mut capture_writer = Writer::new(&mut captured);
                         copy_element(&mut reader, &start, &mut capture_writer, &mut buf)?;
-                        let captured_str = String::from_utf8_lossy(&captured);
 
-                        if let Some(Shape::TextBox(text_box)) = slide.shapes.get(shape_idx) {
-                            if captured_str.contains("<p:txBody") {
-                                write_patched_text_box(&mut writer, &captured_str, text_box)?;
-                            } else {
-                                writer.get_mut().write_all(&captured)?;
+                        let model_shape = slide.shapes.get(shape_idx);
+                        let handled = match model_shape {
+                            Some(shape @ Shape::TextBox(text_box))
+                                if local == "sp"
+                                    && String::from_utf8_lossy(&captured).contains("<p:txBody") =>
+                            {
+                                write_patched_text_box(
+                                    &mut writer,
+                                    &String::from_utf8_lossy(&captured),
+                                    text_box,
+                                )?;
+                                Some(shape)
                             }
-                        } else {
-                            writer.get_mut().write_all(&captured)?;
+                            Some(shape) if matches!(shape, Shape::Image(_)) && local == "pic" => {
+                                patch_shape_xml_into(&mut writer, &captured, shape, rids)?;
+                                Some(shape)
+                            }
+                            Some(shape)
+                                if matches!(shape, Shape::Geometric(_)) && local == "sp" =>
+                            {
+                                patch_shape_xml_into(&mut writer, &captured, shape, rids)?;
+                                Some(shape)
+                            }
+                            _ => {
+                                writer.get_mut().write_all(&captured)?;
+                                model_shape
+                            }
+                        };
+                        if handled.is_some() {
+                            shape_idx += 1;
                         }
-                        shape_idx += 1;
                         buf.clear();
                         continue;
                     }
@@ -207,7 +359,13 @@ fn patch_slide_xml(slide: &Slide, original_xml: &str) -> Result<Vec<u8>> {
                 }
                 Event::End(e) => {
                     let local = qname_str(e.name());
-                    if local == "spTree" && in_sp_tree && depth == sp_tree_depth + 1 {
+                    if local == "spTree" && in_sp_tree {
+                        // Append any shapes the model carries beyond the
+                        // original XML (inserted since load).
+                        while shape_idx < slide.shapes.len() {
+                            append_shape(&mut writer, &slide.shapes[shape_idx], rids, shape_idx)?;
+                            shape_idx += 1;
+                        }
                         in_sp_tree = false;
                     }
                     writer.write_event(event)?;
@@ -236,6 +394,329 @@ fn patch_slide_xml(slide: &Slide, original_xml: &str) -> Result<Vec<u8>> {
         }
     }
     Ok(out)
+}
+
+/// Replaces the `<p:spPr>` (and `<p:blipFill>` for pictures) of a captured
+/// shape element with output regenerated from the model, streaming every other
+/// part of the element through verbatim so non-modeled attributes survive.
+fn patch_shape_xml_into<W: Write>(
+    writer: &mut Writer<W>,
+    captured: &[u8],
+    shape: &Shape,
+    rids: &HashMap<String, String>,
+) -> Result<()> {
+    let captured_str = std::str::from_utf8(captured)
+        .map_err(|_| Error::UnsupportedFormat("non-utf8 shape element".into()))?;
+    let generated = generate_shape_xml(shape, rids, captured_str)?;
+    replace_sp_pr_and_blip_fill(
+        writer,
+        captured_str,
+        &generated.sp_pr,
+        generated.blip_fill.as_deref(),
+    )?;
+    Ok(())
+}
+
+/// Streams `captured_str` to `writer`, replacing the top-level `<p:spPr>` child
+/// with `sp_pr` and (when provided) the top-level `<p:blipFill>` child with
+/// `blip_fill`. All other content is copied verbatim.
+fn replace_sp_pr_and_blip_fill<W: Write>(
+    writer: &mut Writer<W>,
+    captured_str: &str,
+    sp_pr: &str,
+    blip_fill: Option<&str>,
+) -> Result<()> {
+    let mut reader = Reader::from_str(captured_str);
+    reader.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+    let mut depth: i64 = 0;
+    loop {
+        let event = reader.read_event_into(&mut buf)?;
+        match &event {
+            Event::Start(e) => {
+                let local = qname_str(e.name());
+                if depth == 1 && local == "spPr" {
+                    writer.get_mut().write_all(sp_pr.as_bytes())?;
+                    skip_subtree(&mut reader, &mut buf)?;
+                    buf.clear();
+                    continue;
+                }
+                if depth == 1 && local == "blipFill" {
+                    if let Some(fill) = blip_fill {
+                        writer.get_mut().write_all(fill.as_bytes())?;
+                        skip_subtree(&mut reader, &mut buf)?;
+                        buf.clear();
+                        continue;
+                    }
+                }
+                writer.write_event(event)?;
+                depth += 1;
+            }
+            Event::Empty(e) => {
+                let local = qname_str(e.name());
+                if depth == 1 && local == "spPr" {
+                    writer.get_mut().write_all(sp_pr.as_bytes())?;
+                    continue;
+                }
+                if depth == 1 && local == "blipFill" {
+                    if let Some(fill) = blip_fill {
+                        writer.get_mut().write_all(fill.as_bytes())?;
+                        continue;
+                    }
+                }
+                writer.write_event(event)?;
+            }
+            Event::End(_) => {
+                writer.write_event(event)?;
+                depth -= 1;
+            }
+            Event::Eof => break,
+            _ => {
+                writer.write_event(event)?;
+            }
+        }
+        buf.clear();
+    }
+    Ok(())
+}
+
+/// Consumes events until the matching `End` of an already-opened `Start`.
+fn skip_subtree<R: std::io::BufRead>(reader: &mut Reader<R>, buf: &mut Vec<u8>) -> Result<()> {
+    let mut depth = 0i64;
+    loop {
+        match reader.read_event_into(buf)? {
+            Event::Start(_) => depth += 1,
+            Event::End(_) => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            }
+            Event::Eof => return Err(Error::MissingPart("truncated shape XML".into())),
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(())
+}
+
+/// The model-generated XML for a modeled shape element.
+struct GeneratedShape {
+    sp_pr: String,
+    blip_fill: Option<String>,
+}
+
+/// Builds the regenerated `<p:spPr>` (and `<p:blipFill>` for images) for a
+/// modeled shape, recovering the relationship id for an image from `rids` or,
+/// failing that, from the original captured XML.
+fn generate_shape_xml(
+    shape: &Shape,
+    rids: &HashMap<String, String>,
+    captured_str: &str,
+) -> Result<GeneratedShape> {
+    Ok(match shape {
+        Shape::Image(image) => {
+            let embed = rids
+                .get(&image.media_ref)
+                .cloned()
+                .or_else(|| extract_blip_embed(captured_str));
+            GeneratedShape {
+                sp_pr: image_sp_pr_xml(image),
+                blip_fill: embed.map(|e| blip_fill_xml(&e, image.crop.as_ref())),
+            }
+        }
+        Shape::Geometric(geo) => GeneratedShape {
+            sp_pr: geometric_sp_pr_xml(geo),
+            blip_fill: None,
+        },
+        _ => GeneratedShape {
+            sp_pr: String::new(),
+            blip_fill: None,
+        },
+    })
+}
+
+/// Appends a brand-new shape element (inserted since load) to the shape tree.
+fn append_shape<W: Write>(
+    writer: &mut Writer<W>,
+    shape: &Shape,
+    rids: &HashMap<String, String>,
+    index: usize,
+) -> Result<()> {
+    let id = 100_000 + index as i64;
+    match shape {
+        Shape::Image(image) => {
+            let Some(embed) = rids.get(&image.media_ref) else {
+                return Ok(());
+            };
+            let name = format!("Picture {}", index + 1);
+            let xml = pic_element_xml(image, embed, id, &name);
+            writer.get_mut().write_all(xml.as_bytes())?;
+        }
+        Shape::Geometric(geo) => {
+            let name = format!("Shape {}", index + 1);
+            let xml = sp_element_xml(geo, id, &name);
+            writer.get_mut().write_all(xml.as_bytes())?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Formats an EMU/coordinate `f64` as a deterministic attribute string.
+fn emu(value: f64) -> String {
+    format!("{value}")
+}
+
+/// Formats a color as an uppercase `RRGGBB` hex string.
+fn hex_color(color: &slides_core::Color) -> String {
+    format!("{:02x}{:02x}{:02x}", color.r, color.g, color.b)
+}
+
+/// Builds the `<a:xfrm>` element for a transform.
+fn xfrm_xml(transform: &Transform) -> String {
+    let f = transform.frame;
+    let rot = if transform.rotation != 0.0 {
+        format!(
+            " rot=\"{}\"",
+            (transform.rotation * 60_000.0).round() as i64
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "<a:xfrm{rot}><a:off x=\"{}\" y=\"{}\"/><a:ext cx=\"{}\" cy=\"{}\"/></a:xfrm>",
+        emu(f.x),
+        emu(f.y),
+        emu(f.width),
+        emu(f.height)
+    )
+}
+
+/// Builds the `<a:prstGeom>` element for a geometric primitive.
+fn prst_geom_xml(geometry: &Geometry, frame: slides_core::Rect) -> String {
+    let prst = geometry::prst_from_geometry(geometry);
+    if matches!(geometry, Geometry::RoundedRectangle { .. }) {
+        if let Some(adj) = geometry::rounded_rect_adj(geometry, frame) {
+            return format!(
+                "<a:prstGeom prst=\"{prst}\"><a:avLst><a:gd name=\"adj\" fmla=\"val {adj}\"/></a:avLst></a:prstGeom>"
+            );
+        }
+    }
+    format!("<a:prstGeom prst=\"{prst}\"><a:avLst/></a:prstGeom>")
+}
+
+/// Builds a fill element, or an empty string when the shape has no fill.
+fn fill_xml(fill: &Option<Fill>) -> String {
+    match fill {
+        Some(Fill::Solid(color)) => format!(
+            "<a:solidFill><a:srgbClr val=\"{}\"/></a:solidFill>",
+            hex_color(color)
+        ),
+        None => String::new(),
+    }
+}
+
+/// Builds an `<a:ln>` element, or an empty string when the shape has no outline.
+fn outline_xml(outline: &Option<Outline>) -> String {
+    let Some(o) = outline else {
+        return String::new();
+    };
+    let dash = match o.dash {
+        DashStyle::Solid => "solid",
+        DashStyle::Dash => "dash",
+        DashStyle::Dot => "dot",
+        DashStyle::DashDot => "dashDot",
+    };
+    format!(
+        "<a:ln w=\"{}\"><a:solidFill><a:srgbClr val=\"{}\"/></a:solidFill><a:prstDash val=\"{dash}\"/></a:ln>",
+        emu(o.width_emu),
+        hex_color(&o.color)
+    )
+}
+
+/// Builds an `<a:effectLst>` with an outer shadow, or an empty string.
+fn shadow_xml(shadow: &Option<slides_core::Shadow>) -> String {
+    let Some(s) = shadow else {
+        return String::new();
+    };
+    let dist = (s.offset_x.powi(2) + s.offset_y.powi(2)).sqrt();
+    let dir_deg = s.offset_y.atan2(s.offset_x).to_degrees();
+    let dir = (dir_deg * 60_000.0).round() as i64;
+    let alpha = if (s.opacity - 1.0).abs() > f64::EPSILON {
+        format!(
+            "<a:alpha val=\"{}\"/>",
+            (s.opacity * 100_000.0).round() as i64
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "<a:effectLst><a:outerShdw blurRad=\"{}\" dist=\"{}\" dir=\"{}\" rotWithShape=\"0\"><a:srgbClr val=\"{}\">{alpha}</a:srgbClr></a:outerShdw></a:effectLst>",
+        emu(s.blur),
+        emu(dist),
+        dir,
+        hex_color(&s.color)
+    )
+}
+
+/// Builds the full `<p:spPr>` for an image.
+fn image_sp_pr_xml(image: &ImageShape) -> String {
+    format!(
+        "<p:spPr>{}<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></p:spPr>",
+        xfrm_xml(&image.transform)
+    )
+}
+
+/// Builds the full `<p:spPr>` for a geometric shape.
+fn geometric_sp_pr_xml(geo: &GeometricShape) -> String {
+    let mut s = String::from("<p:spPr>");
+    s.push_str(&xfrm_xml(&geo.transform));
+    s.push_str(&prst_geom_xml(&geo.geometry, geo.transform.frame));
+    s.push_str(&fill_xml(&geo.style.fill));
+    s.push_str(&outline_xml(&geo.style.outline));
+    s.push_str(&shadow_xml(&geo.style.shadow));
+    s.push_str("</p:spPr>");
+    s
+}
+
+/// Builds the `<p:blipFill>` element for an image, including a crop when one is
+/// set.
+fn blip_fill_xml(embed: &str, crop: Option<&Crop>) -> String {
+    let src = crop
+        .filter(|c| !is_zero_crop(c))
+        .map(|c| {
+            format!(
+                "<a:srcRect l=\"{}\" t=\"{}\" r=\"{}\" b=\"{}\"/>",
+                (c.left * 100_000.0).round() as i64,
+                (c.top * 100_000.0).round() as i64,
+                (c.right * 100_000.0).round() as i64,
+                (c.bottom * 100_000.0).round() as i64
+            )
+        })
+        .unwrap_or_default();
+    format!("<p:blipFill><a:blip r:embed=\"{embed}\"/>{src}</p:blipFill>")
+}
+
+fn is_zero_crop(c: &Crop) -> bool {
+    c.left == 0.0 && c.top == 0.0 && c.right == 0.0 && c.bottom == 0.0
+}
+
+/// Builds a complete `<p:pic>` element for an inserted image.
+fn pic_element_xml(image: &ImageShape, embed: &str, id: i64, name: &str) -> String {
+    format!(
+        "<p:pic><p:nvPicPr><p:cNvPr id=\"{id}\" name=\"{name}\"/><p:cNvPicPr><a:picLocks/></p:cNvPicPr><p:nvPr/></p:nvPicPr>{}{}</p:pic>",
+        blip_fill_xml(embed, image.crop.as_ref()),
+        image_sp_pr_xml(image)
+    )
+}
+
+/// Builds a complete `<p:sp>` element for an inserted geometric shape.
+fn sp_element_xml(geo: &GeometricShape, id: i64, name: &str) -> String {
+    format!(
+        "<p:sp><p:nvSpPr><p:cNvPr id=\"{id}\" name=\"{name}\"/><p:cNvSpPr><a:spLocks/></p:cNvSpPr><p:nvPr/></p:nvSpPr>{}<p:txBody><a:bodyPr/><a:lstStyle/><a:p/></p:txBody></p:sp>",
+        geometric_sp_pr_xml(geo)
+    )
 }
 
 fn write_patched_text_box<W: Write>(
