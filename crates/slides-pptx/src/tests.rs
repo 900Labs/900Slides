@@ -337,6 +337,7 @@ fn deck_round_trip_serialization() {
             paragraphs: vec![Paragraph {
                 runs: vec![Run::new("test").bold().italic().underline()],
                 list_style: ListStyle::Unordered,
+                ..Default::default()
             }],
         })],
         animation: None,

@@ -546,6 +546,7 @@ fn parse_text_box(xml: &str) -> Result<TextBox> {
                         paragraphs.push(Paragraph {
                             runs: Vec::new(),
                             list_style: ListStyle::None,
+                            ..Default::default()
                         });
                     }
                     "buAutoNum" if in_ppr => {
@@ -573,6 +574,7 @@ fn parse_text_box(xml: &str) -> Result<TextBox> {
                                 bold,
                                 italic,
                                 underline,
+                                ..Default::default()
                             });
                         }
                     }
@@ -602,7 +604,11 @@ fn parse_text_box(xml: &str) -> Result<TextBox> {
                     }
                     "p" => {
                         if let Some((runs, list_style)) = current_paragraph.take() {
-                            paragraphs.push(Paragraph { runs, list_style });
+                            paragraphs.push(Paragraph {
+                                runs,
+                                list_style,
+                                ..Default::default()
+                            });
                         }
                     }
                     "pPr" => in_ppr = false,
@@ -613,6 +619,7 @@ fn parse_text_box(xml: &str) -> Result<TextBox> {
                                 bold: current_run_bold,
                                 italic: current_run_italic,
                                 underline: current_run_underline,
+                                ..Default::default()
                             });
                         }
                     }
