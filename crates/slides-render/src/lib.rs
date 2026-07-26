@@ -564,21 +564,25 @@ mod tests {
                         bold: true,
                         italic: false,
                         underline: false,
+                        ..Default::default()
                     },
                     Run {
                         text: "italic".to_string(),
                         bold: false,
                         italic: true,
                         underline: false,
+                        ..Default::default()
                     },
                     Run {
                         text: "under".to_string(),
                         bold: false,
                         italic: false,
                         underline: true,
+                        ..Default::default()
                     },
                 ],
                 list_style: ListStyle::None,
+                ..Default::default()
             }],
         }));
 
@@ -688,6 +692,7 @@ mod tests {
             paragraphs: vec![Paragraph {
                 runs: vec![Run::new("hello")],
                 list_style: ListStyle::Unordered,
+                ..Default::default()
             }],
         }));
         slide.shapes.push(Shape::Geometric(GeometricShape {
