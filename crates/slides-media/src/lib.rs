@@ -13,6 +13,7 @@
 
 use std::io::Cursor;
 
+use image::ImageReader;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
@@ -69,6 +70,41 @@ impl ImageFormat {
             ImageFormat::Svg => "image/svg+xml",
         }
     }
+
+    /// Returns the canonical lowercase file extension for this format.
+    pub fn extension(self) -> &'static str {
+        match self {
+            ImageFormat::Png => "png",
+            ImageFormat::Jpeg => "jpeg",
+            ImageFormat::Gif => "gif",
+            ImageFormat::Webp => "webp",
+            ImageFormat::Svg => "svg",
+        }
+    }
+}
+
+/// Returns the file extension for an allowlisted MIME type, or `None` when the
+/// MIME type is not one of the formats this crate accepts.
+///
+/// This is the single source of truth for the MIME-to-extension mapping; other
+/// crates should call this rather than re-declaring a parallel table.
+pub fn extension_for_mime(mime: &str) -> Option<&'static str> {
+    all_formats()
+        .iter()
+        .copied()
+        .find(|f| f.mime() == mime)
+        .map(ImageFormat::extension)
+}
+
+/// Returns every supported image format.
+fn all_formats() -> &'static [ImageFormat] {
+    &[
+        ImageFormat::Png,
+        ImageFormat::Jpeg,
+        ImageFormat::Gif,
+        ImageFormat::Webp,
+        ImageFormat::Svg,
+    ]
 }
 
 /// An image that passed ingest, ready to store in a deck's media store.
@@ -167,8 +203,15 @@ fn looks_like_svg(raw: &[u8]) -> bool {
 /// The first frame is decoded; GIF and animated WebP keep only that frame on
 /// re-encode.
 fn ingest_raster(raw: &[u8], opts: &IngestOptions, format: ImageFormat) -> Result<IngestedImage> {
-    let img = image::load_from_memory(raw).map_err(|e| Error::Corrupt(e.to_string()))?;
-    let (width, height) = (img.width(), img.height());
+    // Probe dimensions from the header BEFORE full decode so a malicious
+    // small-compressed / huge-dimension image cannot trigger a multi-GB
+    // pixel-buffer allocation before the cap rejects it.
+    let reader = ImageReader::new(Cursor::new(raw))
+        .with_guessed_format()
+        .map_err(|e| Error::Corrupt(e.to_string()))?;
+    let (width, height) = reader
+        .into_dimensions()
+        .map_err(|e| Error::Corrupt(e.to_string()))?;
 
     if width > opts.max_dim || height > opts.max_dim {
         return Err(Error::TooLargeDim { max: opts.max_dim });
@@ -176,7 +219,15 @@ fn ingest_raster(raw: &[u8], opts: &IngestOptions, format: ImageFormat) -> Resul
 
     let bytes = if opts.preserve_exif {
         raw.to_vec()
+    } else if !raster_has_privacy_metadata(raw, format) {
+        // The source carries no EXIF/text metadata, so there is nothing to
+        // strip. Skip the full decode + re-encode and return the bytes
+        // verbatim. (Multi-frame GIF/WebP: returning the original bytes also
+        // preserves extra frames; the load path keeps only the modeled frame
+        // count via the renderer, which is acceptable for v0.1/v0.2.)
+        raw.to_vec()
     } else {
+        let img = image::load_from_memory(raw).map_err(|e| Error::Corrupt(e.to_string()))?;
         reencode_clean(&img, format)?
     };
 
@@ -187,6 +238,96 @@ fn ingest_raster(raw: &[u8], opts: &IngestOptions, format: ImageFormat) -> Resul
         width,
         height,
     })
+}
+
+/// Returns `true` when `raw` (of `format`) carries privacy-sensitive metadata
+/// (EXIF, XMP, ICC, embedded text) that the ingest path must strip.
+///
+/// Conservative: when the format's metadata layout cannot be confirmed clean
+/// (e.g. truncated, or an unhandled container), this returns `true` so the
+/// caller re-encodes and strips, rather than risking leaving metadata in. The
+/// scan is bounded to the leading 256 KiB where these markers live.
+fn raster_has_privacy_metadata(raw: &[u8], format: ImageFormat) -> bool {
+    let window: &[u8] = if raw.len() > 256 * 1024 {
+        &raw[..256 * 1024]
+    } else {
+        raw
+    };
+    match format {
+        ImageFormat::Jpeg => {
+            // APP1 (FF E1) carries EXIF and XMP; APP2 (FF E2) carries ICC
+            // profiles; COM (FF FE) carries comment text.
+            jpeg_marker_present(window, 0xE1)
+                || jpeg_marker_present(window, 0xE2)
+                || jpeg_marker_present(window, 0xFE)
+        }
+        ImageFormat::Png => {
+            // PNG ancillary chunks that carry text/profile metadata.
+            png_chunk_present(window, b"tEXt")
+                || png_chunk_present(window, b"zTXt")
+                || png_chunk_present(window, b"iTXt")
+                || png_chunk_present(window, b"eXIf")
+                || png_chunk_present(window, b"iCCp")
+        }
+        // Conservative default for GIF/WebP: assume metadata may be present and
+        // let the re-encode path strip it.
+        ImageFormat::Gif | ImageFormat::Webp => true,
+        ImageFormat::Svg => false,
+    }
+}
+
+/// Scans a JPEG stream (bounded `window`) for a segment marker `code` (the
+/// low byte after `0xFF`). Walks APPn/COM markers by their 2-byte length fields
+/// so a coincidental `FF xx` inside compressed scan data does not cause a
+/// false positive.
+fn jpeg_marker_present(window: &[u8], code: u8) -> bool {
+    let mut i = 2; // skip the SOI marker FF D8
+    while i + 3 < window.len() {
+        if window[i] != 0xFF {
+            // Not a marker boundary; resync to the next FF.
+            i += 1;
+            continue;
+        }
+        let marker = window[i + 1];
+        // Standalone markers (no length payload) — includes RSTn, SOI, EOI.
+        if marker == 0xD8 || marker == 0xD9 || (0xD0..=0xD7).contains(&marker) || marker == 0x01 {
+            i += 2;
+            continue;
+        }
+        // SOS (0xFFDA) begins the compressed image data; no metadata follows it.
+        if marker == 0xDA {
+            return false;
+        }
+        if marker == code {
+            return true;
+        }
+        // Advance by the segment length (stored big-endian after the marker).
+        let len = (u16::from_be_bytes([window[i + 2], window[i + 3]]) as usize) + 2;
+        i += len;
+    }
+    false
+}
+
+/// Returns `true` when `window` (a PNG prefix) contains a chunk of the given
+/// 4-byte type. Walks chunks by their length fields so compressed IDAT data
+/// cannot produce a false positive.
+fn png_chunk_present(window: &[u8], chunk_type: &[u8; 4]) -> bool {
+    // Skip the 8-byte PNG signature; each chunk is [len:4][type:4][data:len][crc:4].
+    let mut i = 8;
+    while i + 8 <= window.len() {
+        let len =
+            u32::from_be_bytes([window[i], window[i + 1], window[i + 2], window[i + 3]]) as usize;
+        let ctype = &window[i + 4..i + 8];
+        if ctype == chunk_type {
+            return true;
+        }
+        // Stop at the first IDAT: no metadata chunks follow compressed data.
+        if ctype == b"IDAT" {
+            return false;
+        }
+        i += 12 + len; // len field + type + data + crc
+    }
+    false
 }
 
 /// Re-encodes a decoded image to a clean byte stream with no metadata.
@@ -238,8 +379,11 @@ fn validate_svg(text: &str) -> Result<()> {
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
-                if name.eq_ignore_ascii_case("script") {
+                // Compare the local name (after any namespace prefix) so a
+                // namespaced `<svg:script>` cannot bypass the `<script>` reject.
+                let local = e.name().local_name();
+                let local_str = String::from_utf8_lossy(local.as_ref());
+                if local_str.eq_ignore_ascii_case("script") {
                     return Err(Error::UnsafeSvg("contains a <script> element".into()));
                 }
                 for attr in e.attributes().flatten() {
@@ -266,17 +410,40 @@ fn validate_svg(text: &str) -> Result<()> {
 }
 
 /// Returns `true` when a URL is not a safe relative reference.
+///
+/// Only `#`-fragment references and schemeless relative paths are allowed.
+/// Any scheme (`javascript`, `vbscript`, `http`, `file`, `data`, etc.) is
+/// rejected, identified by a colon appearing before the first slash.
 fn is_unsafe_url(value: &str) -> bool {
     let trimmed = value.trim();
     if trimmed.starts_with('#') {
         return false;
     }
     let lowered = trimmed.to_ascii_lowercase();
-    lowered.starts_with("http://")
-        || lowered.starts_with("https://")
-        || lowered.starts_with("file://")
-        || lowered.starts_with("data:")
-        || lowered.contains("://")
+    // Reject known dangerous script schemes explicitly...
+    const DANGEROUS_SCHEMES: &[&str] = &[
+        "javascript:",
+        "vbscript:",
+        "mocha:",
+        "livescript:",
+        "http:",
+        "https:",
+        "file:",
+        "data:",
+    ];
+    if DANGEROUS_SCHEMES.iter().any(|s| lowered.starts_with(s)) {
+        return true;
+    }
+    // ...and any other scheme: a colon before the first slash means a scheme is
+    // present, which is unsafe. Relative paths and fragments contain no such
+    // leading colon.
+    if let Some(colon) = lowered.find(':') {
+        let before_colon = &lowered[..colon];
+        if !before_colon.contains('/') {
+            return true;
+        }
+    }
+    false
 }
 
 /// Best-effort extraction of `width`/`height` attributes from the root `<svg>`.
@@ -389,6 +556,64 @@ mod tests {
     }
 
     #[test]
+    fn clean_raster_returned_verbatim_without_reencode() {
+        // A clean PNG (no tEXt/eXIf chunks) is returned verbatim: the ingest
+        // bytes equal the input bytes, proving the decode+re-encode was skipped.
+        let input = real_png_1x1();
+        let img = ingest(&input, &IngestOptions::default()).expect("ingest");
+        assert_eq!(img.bytes, input, "clean PNG should pass through verbatim");
+    }
+
+    #[test]
+    fn png_with_text_chunk_is_reencoded() {
+        // Inject a tEXt chunk after the IHDR of a clean PNG; ingest must detect
+        // it and re-encode (so the stripped output no longer contains the chunk).
+        let bytes = real_png_1x1();
+        // Build a tEXt chunk: len=8, type "tEXt", data "key\0val" (8 bytes), crc.
+        let text_chunk = {
+            let data = b"key\0val";
+            let mut chunk = Vec::new();
+            chunk.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            chunk.extend_from_slice(b"tEXt");
+            chunk.extend_from_slice(data);
+            let crc = png_crc32(b"tEXtkey\0val");
+            chunk.extend_from_slice(&crc.to_be_bytes());
+            chunk
+        };
+        // Splice it right after the IHDR (signature 8 + IHDR chunk 25 = offset 33).
+        let mut injected = Vec::with_capacity(bytes.len() + text_chunk.len());
+        injected.extend_from_slice(&bytes[..33]);
+        injected.extend_from_slice(&text_chunk);
+        injected.extend_from_slice(&bytes[33..]);
+
+        let img = ingest(&injected, &IngestOptions::default()).expect("ingest");
+        assert!(
+            !img.bytes.windows(4).any(|w| w == b"tEXt"),
+            "re-encoded output must not contain the injected tEXt chunk"
+        );
+    }
+
+    #[test]
+    fn jpeg_with_app1_marker_is_reencoded() {
+        // A JPEG carrying an APP1 (EXIF) marker must be re-encoded.
+        let bytes = real_jpeg_1x1();
+        // Insert a minimal APP1 segment after SOI (FF D8): FF E1 + len + "Exif".
+        let mut app1 = vec![0xFF, 0xE1, 0x00, 0x08];
+        app1.extend_from_slice(b"Exif\x00\x00");
+        let mut injected = Vec::with_capacity(bytes.len() + app1.len());
+        injected.extend_from_slice(&bytes[..2]);
+        injected.extend_from_slice(&app1);
+        injected.extend_from_slice(&bytes[2..]);
+
+        let img = ingest(&injected, &IngestOptions::default()).expect("ingest");
+        // The re-encoded JPEG must not contain the EXIF APP1 marker.
+        assert!(
+            !img.bytes.windows(2).any(|w| w == [0xFF, 0xE1]),
+            "re-encoded JPEG must not contain APP1/EXIF"
+        );
+    }
+
+    #[test]
     fn ingests_clean_svg() {
         let svg = b"<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"50\"><rect/></svg>";
         let img = ingest(svg, &IngestOptions::default()).expect("ingest svg");
@@ -439,6 +664,80 @@ mod tests {
         let svg = b"<svg><image href=\"file:///etc/passwd\"/></svg>";
         let err = ingest(svg, &IngestOptions::default()).unwrap_err();
         assert!(matches!(err, Error::UnsafeSvg(_)));
+    }
+
+    #[test]
+    fn rejects_svg_with_javascript_uri() {
+        // `javascript:` has no `://`, so it must be rejected by scheme, not by
+        // the legacy `://` check.
+        for attr in [
+            b"<svg><a xlink:href=\"javascript:alert(1)\"/></svg>".as_ref(),
+            b"<svg><image href=\"javascript:alert(1)\"/></svg>",
+            b"<svg><image src=\"javascript:alert(1)\"/></svg>",
+            b"<svg><a href=\"JavaScript:alert(1)\"/></svg>",
+        ] {
+            let err = ingest(attr, &IngestOptions::default())
+                .expect_err(&format!("should reject {attr:?}"));
+            assert!(
+                matches!(err, Error::UnsafeSvg(_)),
+                "javascript URI must be rejected for {attr:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_svg_with_vbscript_uri() {
+        let svg = b"<svg><image href=\"vbscript:msgbox(1)\"/></svg>";
+        let err = ingest(svg, &IngestOptions::default()).unwrap_err();
+        assert!(matches!(err, Error::UnsafeSvg(_)));
+    }
+
+    #[test]
+    fn rejects_namespaced_script_element() {
+        // A prefix-bound script element must be caught by local-name comparison.
+        let svg = b"<svg xmlns:svg=\"http://www.w3.org/2000/svg\"><svg:script>alert(1)</svg:script></svg>";
+        let err = ingest(svg, &IngestOptions::default()).unwrap_err();
+        assert!(matches!(err, Error::UnsafeSvg(_)));
+    }
+
+    #[test]
+    fn dimension_cap_rejects_before_full_decode() {
+        // A PNG whose IHDR declares huge dimensions but keeps a tiny data
+        // stream. The header probe reads the declared size and rejects it
+        // (TooLargeDim) before the decoder allocates a multi-GB pixel buffer.
+        // The IHDR CRC is recomputed so the PNG reader accepts the header.
+        let mut huge = real_png_1x1();
+        let width = 65_535u32.to_be_bytes();
+        let height = 65_535u32.to_be_bytes();
+        huge[16..20].copy_from_slice(&width);
+        huge[20..24].copy_from_slice(&height);
+        // IHDR CRC covers bytes 12 (chunk type "IHDR") through 28 (end of the
+        // 13-byte data section); the CRC is stored in bytes 29..33.
+        let crc = png_crc32(&huge[12..29]);
+        huge[29..33].copy_from_slice(&crc.to_be_bytes());
+        let opts = IngestOptions {
+            max_dim: 8192,
+            ..IngestOptions::default()
+        };
+        let err = ingest(&huge, &opts).unwrap_err();
+        assert_eq!(
+            err,
+            Error::TooLargeDim { max: 8192 },
+            "huge-dimension header must be rejected before full decode, got {err:?}"
+        );
+    }
+
+    /// Computes a PNG/CRC-32 (IEEE 802.3) over `bytes`.
+    fn png_crc32(bytes: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &b in bytes {
+            crc ^= b as u32;
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            }
+        }
+        crc ^ 0xFFFF_FFFF
     }
 
     #[test]

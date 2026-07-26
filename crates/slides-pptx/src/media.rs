@@ -9,25 +9,22 @@ use crate::package::normalize_package_path;
 ///
 /// The key is `img-<xxh64-hex>` over the ingested bytes, so identical images
 /// dedup to a single [`slides_core::MediaStore`] entry regardless of how many
-/// shapes reference them or which package part they came from.
-pub(crate) fn media_key(bytes: &[u8]) -> String {
+/// shapes reference them or which package part they came from. Exposed
+/// publicly so callers that insert images through other paths (e.g. the
+/// desktop command surface) use the same keying scheme as the loader.
+pub fn media_key(bytes: &[u8]) -> String {
     use twox_hash::XxHash64;
     let mut hasher = XxHash64::default();
     hasher.write(bytes);
     format!("img-{:016x}", hasher.finish())
 }
 
-/// Returns the canonical file extension for a MIME type, or `None` when the
-/// MIME type is not one of the allowlisted image formats.
+/// Returns the canonical file extension for a MIME type, delegating to the
+/// single source of truth in [`slides_media`] so the allowlist cannot drift
+/// between the two crates. Returns `None` when the MIME type is not one of the
+/// formats [`slides_media`] accepts.
 pub(crate) fn extension_for_mime(mime: &str) -> Option<&'static str> {
-    match mime {
-        "image/png" => Some("png"),
-        "image/jpeg" => Some("jpeg"),
-        "image/gif" => Some("gif"),
-        "image/webp" => Some("webp"),
-        "image/svg+xml" => Some("svg"),
-        _ => None,
-    }
+    slides_media::extension_for_mime(mime)
 }
 
 /// Computes a relationship target path for `target_path` relative to the

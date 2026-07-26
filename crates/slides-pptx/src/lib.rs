@@ -21,6 +21,7 @@ mod session;
 
 pub use error::{Error, Result};
 pub use ledger::{LossLedger, LossWarning};
+pub use media::media_key;
 pub use session::Session;
 
 use crate::package::{CT_MANIFEST, REL_TYPE_MANIFEST};

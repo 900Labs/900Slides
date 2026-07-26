@@ -3622,7 +3622,9 @@ dependencies = [
  "serde",
  "serde_json",
  "slides-core",
+ "slides-media",
  "thiserror 2.0.19",
+ "twox-hash",
  "zip",
 ]
 

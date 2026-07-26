@@ -7,9 +7,9 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::QName;
 use quick_xml::{Reader, Writer};
 use slides_core::{
-    Color, Crop, DashStyle, Deck, Fill, GeometricShape, Geometry, ImageShape, ListStyle,
-    MediaEntry, MediaStore, Outline, Paragraph, PassthroughObject, Rect, Run, Shadow, Shape, Slide,
-    Style, TextBox, Theme, Transform,
+    Color, Crop, DashStyle, Deck, Fill, GeometricShape, ImageShape, ListStyle, MediaEntry,
+    MediaStore, Outline, Paragraph, PassthroughObject, Rect, Run, Shadow, Shape, Slide, Style,
+    TextBox, Theme, Transform,
 };
 
 use crate::error::{Error, Result};
@@ -995,9 +995,12 @@ fn parse_geometric(captured: &str) -> Option<GeometricShape> {
     }
     let transform = props.transform.unwrap_or_default();
     let geometry = geometry::geometry_from_prst(prst, props.adj_fraction, transform.frame)?;
-    // A rectangle carrying editable text is modeled as a text box so its text
-    // stays editable; the geometry is preserved through the patching saver.
-    if matches!(geometry, Geometry::Rectangle) && has_editable_text(captured) {
+    // A shape carrying editable text is modeled as a text box so its text stays
+    // editable. The geometry is still preserved: the saver patches the original
+    // `<p:spPr>` (including the preset geometry) verbatim and only rewrites the
+    // text body. Applied to every geometry, not just rectangles, so that e.g.
+    // a text-bearing ellipse does not silently lose its text.
+    if has_editable_text(captured) {
         return None;
     }
     Some(GeometricShape {

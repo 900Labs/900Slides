@@ -747,6 +747,15 @@ fn count_media_refs(deck: &Deck, key: &str) -> usize {
         .count()
 }
 
+/// Estimates the serialized size of a [`MediaEntry`] without round-tripping its
+/// `bytes` through JSON (which would serialize `Vec<u8>` as a 4x-larger integer
+/// array and blow up undo-budget accounting for image commands).
+fn media_entry_size(entry: &MediaEntry) -> usize {
+    // bytes are serialized as their real length; the rest is a small fixed
+    // overhead for the JSON envelope, mime string, and numeric fields.
+    entry.bytes.len() + entry.mime.len() + 64
+}
+
 /// Appends a shape onto the end of a slide's shape list.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AddShape {
@@ -904,7 +913,15 @@ impl Command for InsertShapeAt {
     }
 
     fn serialized_size(&self) -> usize {
-        serde_json::to_string(self).map_or(0, |s| s.len())
+        // Account the optional media entry's bytes directly instead of
+        // serializing Vec<u8> as a 4x-larger JSON integer array.
+        self.slide_id.len()
+            + self
+                .media
+                .as_ref()
+                .map(|(key, entry)| key.len() + media_entry_size(entry))
+                .unwrap_or(0)
+            + 128
     }
 
     fn affected_slide_ids(&self) -> Vec<String> {
@@ -1116,7 +1133,10 @@ impl Command for InsertImage {
     }
 
     fn serialized_size(&self) -> usize {
-        serde_json::to_string(self).map_or(0, |s| s.len())
+        // Account media bytes directly instead of serializing Vec<u8> as a
+        // 4x-larger JSON integer array, which would blow up undo-budget
+        // accounting for image inserts.
+        self.slide_id.len() + self.media_key.len() + media_entry_size(&self.entry) + 128
     }
 
     fn affected_slide_ids(&self) -> Vec<String> {

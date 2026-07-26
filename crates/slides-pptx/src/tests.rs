@@ -4,9 +4,9 @@ use std::collections::HashSet;
 use std::io::{Read, Write};
 
 use slides_core::{
-    AddShape, Color, DashStyle, Deck, EditText, Fill, GeometricShape, Geometry, InsertImage,
-    ListStyle, MediaEntry, MoveShape, Outline, Paragraph, Rect, Run, SetShapeStyle, Shape, Style,
-    TextBox, Transform,
+    AddShape, Color, DashStyle, Deck, DeleteShape, EditText, Fill, GeometricShape, Geometry,
+    InsertImage, ListStyle, MediaEntry, MoveShape, Outline, Paragraph, Rect, Run, SetShapeStyle,
+    Shape, Style, TextBox, Transform,
 };
 use zip::write::{FileOptions, ZipWriter};
 
@@ -1201,4 +1201,54 @@ fn insert_geometric_then_save_round_trips() {
         .expect("inserted geometric should reload");
     assert_eq!(g.geometry, Geometry::Ellipse);
     assert_eq!(g.transform.frame.width, 914_400.0);
+}
+
+#[test]
+fn delete_shape_is_persisted_on_save() {
+    // The geometric fixture loads five geometric shapes. Deleting the middle
+    // one must remove it from the saved PPTX (the positional patch path used
+    // to misalign and leave the deleted element in place).
+    let original = build_pptx_with_geometric();
+    let mut session = load(&original).expect("load");
+    let slide_id = "ppt/slides/slide1.xml".to_string();
+    session
+        .execute(Box::new(DeleteShape::new(slide_id.clone(), 2)))
+        .expect("delete middle shape");
+    assert_eq!(session.deck().slides[0].shapes.len(), 4);
+
+    let saved = save(&session).expect("save");
+    let again = load(&saved).expect("reload");
+    let slide = &again.deck().slides[0];
+    // The deleted shape is gone: 4 shapes remain, and reloading produced a
+    // deck whose shape count matches the model after deletion.
+    assert_eq!(
+        slide.shapes.len(),
+        4,
+        "deleted shape must not be present in the saved PPTX"
+    );
+    // Every remaining shape is still geometric (no misalignment corruption).
+    assert!(
+        slide
+            .shapes
+            .iter()
+            .all(|s| matches!(s, Shape::Geometric(_))),
+        "remaining shapes must stay geometric, not be misaligned"
+    );
+}
+
+#[test]
+fn delete_shape_then_undo_round_trips() {
+    let original = build_pptx_with_geometric();
+    let mut session = load(&original).expect("load");
+    let slide_id = "ppt/slides/slide1.xml".to_string();
+    session
+        .execute(Box::new(DeleteShape::new(slide_id.clone(), 0)))
+        .expect("delete");
+    assert!(session.undo(), "undo should restore the shape");
+
+    // After undo the model has 5 shapes again; the patch path runs (equal
+    // counts) and must keep all parts byte-identical except the slide.
+    let saved = save(&session).expect("save");
+    let again = load(&saved).expect("reload");
+    assert_eq!(again.deck().slides[0].shapes.len(), 5);
 }

@@ -42,6 +42,9 @@ pub enum Error {
     /// A generic I/O error.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// A slide or media part could not be emitted during save.
+    #[error("save error: {0}")]
+    Save(String),
 }
 
 /// Result type alias for the PPTX crate.

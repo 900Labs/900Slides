@@ -35,6 +35,19 @@ pub struct AppState {
     pub presenter_index: Mutex<usize>,
     /// Monotonic token for debounced recovery writes.
     pub recovery_token: AtomicU64,
+    /// Cache of the base64-encoded media DTO, reused across snapshots whose
+    /// media store has not changed so that non-media commands (text edits,
+    /// moves, style changes) do not re-encode every image on every keystroke.
+    pub media_cache: Mutex<MediaCache>,
+}
+
+/// Cached media snapshot, keyed by a content fingerprint of the deck's media.
+#[derive(Debug, Default)]
+pub struct MediaCache {
+    /// Fingerprint the cached `dto` corresponds to (`u64::MAX` forces a rebuild).
+    pub fingerprint: u64,
+    /// Last-encoded media DTO map.
+    pub dto: BTreeMap<String, MediaEntryDto>,
 }
 
 /// Tracks pending recovery writes and the directory they are stored in.
@@ -67,8 +80,56 @@ impl AppState {
             }),
             presenter_index: Mutex::new(0),
             recovery_token: AtomicU64::new(0),
+            media_cache: Mutex::new(MediaCache::default()),
         }
     }
+}
+
+impl AppState {
+    /// Builds a [`DeckSnapshot`], reusing the cached media DTO when the deck's
+    /// media store is unchanged so that non-media commands do not re-encode
+    /// every image's bytes to base64 on each keystroke.
+    pub fn snapshot(&self, deck: &slides_core::Deck) -> DeckSnapshot {
+        let fingerprint = media_fingerprint(deck);
+        let media = {
+            let mut cache = self
+                .media_cache
+                .lock()
+                .expect("media cache mutex poisoned");
+            if cache.fingerprint != fingerprint {
+                cache.dto = media_to_dto(&deck.media);
+                cache.fingerprint = fingerprint;
+            }
+            cache.dto.clone()
+        };
+        DeckSnapshot {
+            id: deck.id.clone(),
+            schema_version: deck.schema_version,
+            theme: theme_to_dto(&deck.theme),
+            slides: deck.slides.iter().map(slide_to_dto).collect(),
+            media,
+            warnings: Vec::new(),
+        }
+    }
+}
+
+/// Computes a runtime fingerprint of a deck's media store. Only used to decide
+/// whether the cached base64 DTO is still valid; not persisted, so a
+/// non-stable hasher is acceptable.
+fn media_fingerprint(deck: &slides_core::Deck) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::Hasher;
+    let mut hasher = DefaultHasher::new();
+    hasher.write(deck.id.as_bytes());
+    hasher.write_u64(deck.media.len() as u64);
+    for (key, entry) in deck.media.iter() {
+        hasher.write(key.as_bytes());
+        hasher.write(entry.mime.as_bytes());
+        hasher.write(&entry.bytes);
+        hasher.write_u32(entry.width);
+        hasher.write_u32(entry.height);
+    }
+    hasher.finish()
 }
 
 /// Snapshot of a deck sent to the frontend after every command.
@@ -405,7 +466,7 @@ pub fn new_deck(state: State<'_, AppState>) -> Result<DeckSnapshot, String> {
     let mut session = slides_pptx::load(&bytes).map_err(|e| e.to_string())?;
     let fresh = slides_core::Deck::new();
     session.deck_mut().id = fresh.id;
-    let snapshot = deck_to_dto(session.deck());
+    let snapshot = state.snapshot(session.deck());
     *state
         .session
         .lock()
@@ -422,7 +483,7 @@ pub fn new_deck(state: State<'_, AppState>) -> Result<DeckSnapshot, String> {
 pub fn open_deck(path: String, state: State<'_, AppState>) -> Result<DeckSnapshot, String> {
     let bytes = fs::read(&path).map_err(|e| e.to_string())?;
     let session = slides_pptx::load(&bytes).map_err(|e| e.to_string())?;
-    let mut snapshot = deck_to_dto(session.deck());
+    let mut snapshot = state.snapshot(session.deck());
     snapshot.warnings = session
         .loss_ledger()
         .warnings()
@@ -458,7 +519,7 @@ pub fn save_deck(path: String, state: State<'_, AppState>) -> Result<(), String>
 #[tauri::command]
 pub fn get_snapshot(state: State<'_, AppState>) -> Option<DeckSnapshot> {
     let guard = state.session.lock().ok()?;
-    guard.as_ref().map(|s| deck_to_dto(s.deck()))
+    guard.as_ref().map(|s| state.snapshot(s.deck()))
 }
 
 /// Edits a paragraph inside a text box and returns the updated deck snapshot.
@@ -481,7 +542,7 @@ pub fn edit_text(
         core_runs,
     ));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = deck_to_dto(session.deck());
+    let snapshot = state.snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -506,7 +567,7 @@ pub fn edit_text_box(
         core_paragraphs,
     ));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = deck_to_dto(session.deck());
+    let snapshot = state.snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -523,13 +584,16 @@ pub fn insert_image(
 ) -> Result<DeckSnapshot, String> {
     let ingested = slides_media::ingest(&bytes, &slides_media::IngestOptions::default())
         .map_err(|e| e.to_string())?;
-    let media_key = format!("img-{}", uuid::Uuid::new_v4());
     let entry = slides_core::MediaEntry {
         mime: ingested.mime.to_string(),
-        bytes: ingested.bytes,
+        bytes: ingested.bytes.clone(),
         width: ingested.width,
         height: ingested.height,
     };
+    // Use the same content-addressed key the PPTX loader uses, so inserting an
+    // image that already exists (or re-inserting a loaded image) dedups to a
+    // single media entry instead of creating duplicate package parts.
+    let media_key = slides_pptx::media_key(&ingested.bytes);
     let transform = centered_transform(ingested.width, ingested.height);
 
     let mut guard = state.session.lock().map_err(|e| e.to_string())?;
@@ -538,7 +602,7 @@ pub fn insert_image(
         slide_id, media_key, entry, transform, None,
     ));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = deck_to_dto(session.deck());
+    let snapshot = state.snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -567,7 +631,7 @@ pub fn add_shape(
     });
     let command = Box::new(slides_core::AddShape::new(slide_id, shape));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = deck_to_dto(session.deck());
+    let snapshot = state.snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -591,7 +655,7 @@ pub fn update_shape_transform(
         transform_to_core(transform),
     ));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = deck_to_dto(session.deck());
+    let snapshot = state.snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -614,7 +678,7 @@ pub fn update_shape_style(
         style_to_core(style),
     ));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = deck_to_dto(session.deck());
+    let snapshot = state.snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -632,7 +696,7 @@ pub fn delete_shape(
     let session = guard.as_mut().ok_or("no deck is open")?;
     let command = Box::new(slides_core::DeleteShape::new(slide_id, shape_index));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = deck_to_dto(session.deck());
+    let snapshot = state.snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -662,7 +726,7 @@ pub fn undo(app: AppHandle, state: State<'_, AppState>) -> Result<DeckSnapshot, 
     if !session.undo() {
         return Err("nothing to undo".to_string());
     }
-    let snapshot = deck_to_dto(session.deck());
+    let snapshot = state.snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -782,7 +846,7 @@ pub fn restore_recovery(
     };
     let bytes = fs::read(&path).map_err(|e| e.to_string())?;
     let session = slides_pptx::load(&bytes).map_err(|e| e.to_string())?;
-    let mut snapshot = deck_to_dto(session.deck());
+    let mut snapshot = state.snapshot(session.deck());
     snapshot.warnings = session
         .loss_ledger()
         .warnings()
@@ -937,17 +1001,6 @@ fn retire_recovery(state: &State<'_, AppState>, deck_id: &str) {
                 }
             }
         }
-    }
-}
-
-fn deck_to_dto(deck: &slides_core::Deck) -> DeckSnapshot {
-    DeckSnapshot {
-        id: deck.id.clone(),
-        schema_version: deck.schema_version,
-        theme: theme_to_dto(&deck.theme),
-        slides: deck.slides.iter().map(slide_to_dto).collect(),
-        media: media_to_dto(&deck.media),
-        warnings: Vec::new(),
     }
 }
 

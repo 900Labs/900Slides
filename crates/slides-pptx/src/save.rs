@@ -80,9 +80,16 @@ pub fn save(session: &Session) -> Result<Vec<u8>> {
             let Some(entry) = session.deck.media.get(&image.media_ref) else {
                 continue;
             };
-            let Some(ext) = pkgmedia::extension_for_mime(&entry.mime) else {
-                continue;
-            };
+            let ext = pkgmedia::extension_for_mime(&entry.mime).ok_or_else(|| {
+                crate::error::Error::Save(format!(
+                    "image media '{}' has unsupported MIME type '{}'; cannot emit a \
+                     package part. Re-insert the image in a supported format.",
+                    image.media_ref, entry.mime
+                ))
+            })?;
+            // The legacy `else { continue }` silently produced a PPTX whose
+            // `<a:blip r:embed>` pointed at a part that was never written (a
+            // corrupt file). An explicit error surfaces the problem instead.
             media_counter += 1;
             let part_path = format!("ppt/media/image{media_counter}.{ext}");
             max_rid += 1;
@@ -276,6 +283,170 @@ fn write_manifest(session: &Session) -> Vec<u8> {
     out
 }
 
+/// Counts the top-level shape elements (`p:sp`, `p:pic`, `p:grpSp`, ...) inside
+/// the slide's `<p:spTree>`.
+fn count_top_level_shapes(xml: &str) -> Result<usize> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+    let mut count = 0usize;
+    let mut in_sp_tree = false;
+    let mut sp_tree_depth = 0usize;
+    let mut depth = 0usize;
+    loop {
+        let event = reader.read_event_into(&mut buf)?;
+        match &event {
+            Event::Start(e) => {
+                let local = qname_str(e.name());
+                if local == "spTree" {
+                    in_sp_tree = true;
+                    sp_tree_depth = depth + 1;
+                }
+                if in_sp_tree
+                    && depth == sp_tree_depth
+                    && SHAPE_ELEMENT_NAMES.contains(&local.as_str())
+                {
+                    count += 1;
+                }
+                depth += 1;
+            }
+            Event::End(e) => {
+                let local = qname_str(e.name());
+                if local == "spTree" && in_sp_tree {
+                    in_sp_tree = false;
+                }
+                depth = depth.saturating_sub(1);
+            }
+            Event::Empty(e) => {
+                let local = qname_str(e.name());
+                if in_sp_tree
+                    && depth == sp_tree_depth
+                    && SHAPE_ELEMENT_NAMES.contains(&local.as_str())
+                {
+                    count += 1;
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(count)
+}
+
+/// Regenerates the slide XML by rewriting the entire `<p:spTree>` shape set from
+/// the model. Used when a shape has been deleted, where the positional patch
+/// path cannot stay aligned. Everything outside the shape tree (and the
+/// non-shape children of the tree: `nvGrpSpPr`, `grpSpPr`) is copied verbatim;
+/// all original shape elements are dropped and replaced by the model's shapes
+/// in order.
+fn regenerate_sp_tree(
+    slide: &Slide,
+    original_xml: &str,
+    rids: &HashMap<String, String>,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    {
+        let mut writer = Writer::new(&mut out);
+        let mut reader = Reader::from_str(original_xml);
+        reader.config_mut().trim_text(false);
+        let mut buf = Vec::new();
+
+        let mut in_sp_tree = false;
+        let mut sp_tree_depth = 0usize;
+        let mut depth = 0usize;
+
+        loop {
+            let event = reader.read_event_into(&mut buf)?;
+            match &event {
+                Event::Start(e) => {
+                    let local = qname_str(e.name());
+                    if local == "spTree" && !in_sp_tree {
+                        in_sp_tree = true;
+                        sp_tree_depth = depth + 1;
+                    }
+                    // A top-level original shape element is dropped entirely
+                    // (skipped without writing) and replaced by the model's
+                    // shapes when the tree closes. `skip_subtree` consumes the
+                    // element's body and closing End, so depth is unchanged.
+                    if in_sp_tree
+                        && depth == sp_tree_depth
+                        && SHAPE_ELEMENT_NAMES.contains(&local.as_str())
+                    {
+                        skip_subtree(&mut reader, &mut buf)?;
+                    } else {
+                        writer.write_event(event.clone())?;
+                        depth += 1;
+                    }
+                }
+                Event::End(e) => {
+                    let local = qname_str(e.name());
+                    if local == "spTree" && in_sp_tree {
+                        for (index, shape) in slide.shapes.iter().enumerate() {
+                            write_model_shape(&mut writer, shape, rids, index)?;
+                        }
+                        in_sp_tree = false;
+                    }
+                    writer.write_event(event.clone())?;
+                    depth = depth.saturating_sub(1);
+                }
+                Event::Eof => break,
+                _ => {
+                    writer.write_event(event)?;
+                }
+            }
+            buf.clear();
+        }
+    }
+    Ok(out)
+}
+
+/// Writes a single model shape as a complete OOXML element.
+fn write_model_shape<W: Write>(
+    writer: &mut Writer<W>,
+    shape: &Shape,
+    rids: &HashMap<String, String>,
+    index: usize,
+) -> Result<()> {
+    let id = 100_000 + index as i64;
+    match shape {
+        Shape::Image(image) => {
+            if let Some(embed) = rids.get(&image.media_ref) {
+                let name = format!("Picture {}", index + 1);
+                let xml = pic_element_xml(image, embed, id, &name);
+                writer.get_mut().write_all(xml.as_bytes())?;
+            }
+        }
+        Shape::Geometric(geo) => {
+            let name = format!("Shape {}", index + 1);
+            let xml = sp_element_xml(geo, id, &name);
+            writer.get_mut().write_all(xml.as_bytes())?;
+        }
+        Shape::TextBox(text_box) => {
+            let name = format!("TextBox {}", index + 1);
+            let header = format!(
+                "<p:sp><p:nvSpPr><p:cNvPr id=\"{id}\" name=\"{name}\"/>\
+                 <p:cNvSpPr><a:spLocks/></p:cNvSpPr><p:nvPr/></p:nvSpPr>\
+                 <p:spPr>{xfrm}<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></p:spPr>\
+                 <p:txBody><a:bodyPr/><a:lstStyle/>",
+                xfrm = xfrm_xml(&slides_core::Transform {
+                    frame: text_box.frame,
+                    rotation: 0.0,
+                })
+            );
+            writer.get_mut().write_all(header.as_bytes())?;
+            for paragraph in &text_box.paragraphs {
+                write_paragraph(writer, paragraph)?;
+            }
+            writer.get_mut().write_all(b"</p:txBody></p:sp>")?;
+        }
+        Shape::Passthrough(object) => {
+            writer.get_mut().write_all(&object.raw_bytes)?;
+        }
+    }
+    Ok(())
+}
+
 /// Patches a single slide XML document in place.
 ///
 /// Editable text boxes have their paragraphs rewritten; modeled images and
@@ -288,6 +459,14 @@ fn patch_slide_xml(
     original_xml: &str,
     rids: &HashMap<String, String>,
 ) -> Result<Vec<u8>> {
+    // If the model has fewer shapes than the original slide XML, a shape was
+    // deleted. The positional patch below cannot represent a deletion (it would
+    // misalign every following shape and leave the deleted element in place), so
+    // fall back to regenerating the entire shape tree from the model.
+    if count_top_level_shapes(original_xml)? > slide.shapes.len() {
+        return regenerate_sp_tree(slide, original_xml, rids);
+    }
+
     let mut out = Vec::new();
     {
         let mut writer = Writer::new(&mut out);
