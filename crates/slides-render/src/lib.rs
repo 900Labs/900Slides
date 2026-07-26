@@ -13,8 +13,9 @@ use std::hash::Hasher;
 
 use base64::Engine as _;
 use slides_core::{
-    Color, DashStyle, Fill, GeometricShape, Geometry, ImageShape, ListStyle, MediaStore, Outline,
-    Paragraph, PassthroughObject, Rect, Run, Shadow, Shape, Style, TextBox, Theme,
+    Color, DashStyle, Fill, GeometricShape, Geometry, HeadingLevel, ImageShape, ListStyle,
+    MediaStore, Outline, Paragraph, PassthroughObject, Rect, Run, Shadow, Shape, Style, TextBox,
+    Theme, VerticalAlign,
 };
 
 /// Horizontal padding inside a text box, in EMU (0.1 inch).
@@ -23,6 +24,20 @@ const TEXT_PADDING_EMU: f64 = 91_440.0;
 const TEXT_FONT_SIZE_EMU: f64 = 228_600.0;
 /// Constant estimated line height between paragraphs, in EMU (~0.4 inch).
 const TEXT_LINE_HEIGHT_EMU: f64 = 360_000.0;
+/// Horizontal indent per level, in EMU (~0.25 inch).
+const INDENT_EMU: f64 = 360_000.0;
+/// Extra left indent for blockquote paragraphs, in EMU.
+const BLOCKQUOTE_INDENT_EMU: f64 = 180_000.0;
+/// Width of the blockquote left border, in EMU.
+const BLOCKQUOTE_BORDER_WIDTH_EMU: f64 = 30_000.0;
+/// Color of the blockquote left border.
+const BLOCKQUOTE_BORDER_COLOR: &str = "#cccccc";
+/// Font stack used for code blocks and inline code.
+const CODE_BLOCK_FONT: &str = "Courier New, monospace";
+/// Background color for code blocks.
+const CODE_BLOCK_BACKGROUND: &str = "#f5f5f5";
+/// Relative font size for superscript/subscript runs.
+const SCRIPT_FONT_SIZE: &str = "0.7em";
 
 /// Options controlling the dimensions of a rendered slide.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -223,21 +238,118 @@ fn push_outline(out: &mut String, outline: &Outline) {
 /// Renders a text box as a `<g>` containing one `<text>` per paragraph.
 fn render_text_box(text_box: &TextBox, theme: &Theme, out: &mut String) {
     out.push_str("<g>");
-    let font = escape_xml(&theme.body_font);
-    let font_size = fnum(TEXT_FONT_SIZE_EMU);
+    let base_x = text_box.frame.x + TEXT_PADDING_EMU;
+    let line_height = TEXT_LINE_HEIGHT_EMU;
     for (index, paragraph) in text_box.paragraphs.iter().enumerate() {
-        let x = fnum(text_box.frame.x + TEXT_PADDING_EMU);
-        let y = fnum(text_box.frame.y + TEXT_LINE_HEIGHT_EMU * (index as f64 + 1.0));
+        let style = &paragraph.style;
+        let logical_x = base_x + style.indent_level as f64 * INDENT_EMU;
+        let x = logical_x
+            + if style.blockquote {
+                BLOCKQUOTE_INDENT_EMU
+            } else {
+                0.0
+            };
+        let y = text_box.frame.y + line_height * (index as f64 + 1.0);
+
+        if style.code_block {
+            render_code_block_background(text_box, logical_x, y, line_height, out);
+        }
+
+        if style.blockquote {
+            render_blockquote_border(logical_x, y, line_height, out);
+        }
+
+        let (font, font_size, font_weight, font_style) = paragraph_font(paragraph, theme);
+        let x = fnum(x);
+        let y = fnum(y);
+        let font_size = fnum(font_size);
+        let font = escape_xml(font);
         out.push_str(&format!(
-            "<text x=\"{x}\" y=\"{y}\" font-family=\"{font}\" font-size=\"{font_size}\">"
+            "<text x=\"{x}\" y=\"{y}\" font-family=\"{font}\" font-size=\"{font_size}\" font-weight=\"{font_weight}\" font-style=\"{font_style}\">"
         ));
-        push_list_marker(paragraph, index, out);
+
+        if !style.code_block {
+            push_list_marker(paragraph, index, out);
+        }
+
         for run in &paragraph.runs {
             push_run(run, out);
         }
         out.push_str("</text>");
     }
     out.push_str("</g>");
+}
+
+/// Returns the font family, size, weight, and style for a paragraph.
+fn paragraph_font<'a>(
+    paragraph: &'a Paragraph,
+    theme: &'a Theme,
+) -> (&'a str, f64, &'static str, &'static str) {
+    if paragraph.style.code_block {
+        return (CODE_BLOCK_FONT, TEXT_FONT_SIZE_EMU, "normal", "normal");
+    }
+    match paragraph.style.heading {
+        Some(level) => {
+            let size = heading_size(level);
+            (&theme.heading_font, size, "bold", "normal")
+        }
+        None => {
+            let style = if paragraph.style.blockquote {
+                "italic"
+            } else {
+                "normal"
+            };
+            (&theme.body_font, TEXT_FONT_SIZE_EMU, "normal", style)
+        }
+    }
+}
+
+/// Font size for a heading level, in EMU.
+fn heading_size(level: HeadingLevel) -> f64 {
+    match level {
+        HeadingLevel::H1 => TEXT_FONT_SIZE_EMU * 2.0,
+        HeadingLevel::H2 => TEXT_FONT_SIZE_EMU * 1.5,
+        HeadingLevel::H3 => TEXT_FONT_SIZE_EMU * 1.25,
+        HeadingLevel::H4 => TEXT_FONT_SIZE_EMU * 1.1,
+        HeadingLevel::H5 => TEXT_FONT_SIZE_EMU,
+        HeadingLevel::H6 => TEXT_FONT_SIZE_EMU * 0.9,
+    }
+}
+
+/// Renders a light background rectangle behind a code-block paragraph.
+fn render_code_block_background(
+    text_box: &TextBox,
+    logical_x: f64,
+    y: f64,
+    line_height: f64,
+    out: &mut String,
+) {
+    let rect_x = logical_x - TEXT_PADDING_EMU / 2.0;
+    let rect_y = y - line_height * 0.8;
+    let width = text_box.frame.width - (logical_x - text_box.frame.x) - TEXT_PADDING_EMU / 2.0;
+    let height = line_height;
+    let rect_x = fnum(rect_x);
+    let rect_y = fnum(rect_y);
+    let width = fnum(width);
+    let height = fnum(height);
+    out.push_str(&format!(
+        "<rect x=\"{rect_x}\" y=\"{rect_y}\" width=\"{width}\" height=\"{height}\" fill=\"{CODE_BLOCK_BACKGROUND}\" stroke=\"none\"/>"
+    ));
+}
+
+/// Renders a vertical left border for a blockquote paragraph.
+fn render_blockquote_border(logical_x: f64, y: f64, line_height: f64, out: &mut String) {
+    let rect_x = logical_x;
+    let rect_y = y - line_height * 0.8;
+    let width = BLOCKQUOTE_BORDER_WIDTH_EMU;
+    let height = line_height;
+    let rect_x = fnum(rect_x);
+    let rect_y = fnum(rect_y);
+    let width = fnum(width);
+    let height = fnum(height);
+    out.push_str(&format!(
+        "<rect x=\"{rect_x}\" y=\"{rect_y}\" width=\"{width}\" height=\"{height}\" fill=\"{BLOCKQUOTE_BORDER_COLOR}\" stroke=\"none\"/>"
+    ));
 }
 
 /// Pushes the list marker `<tspan>` for a paragraph, if any.
@@ -252,8 +364,13 @@ fn push_list_marker(paragraph: &Paragraph, index: usize, out: &mut String) {
     }
 }
 
-/// Pushes a run as a `<tspan>` with run-level bold/italic/underline.
+/// Pushes a run as a `<tspan>` with run-level formatting.
 fn push_run(run: &Run, out: &mut String) {
+    if let Some(link) = &run.link {
+        let href = escape_xml(&link.url);
+        out.push_str(&format!("<a href=\"{href}\">"));
+    }
+
     out.push_str("<tspan");
     if run.bold {
         out.push_str(" font-weight=\"bold\"");
@@ -261,12 +378,38 @@ fn push_run(run: &Run, out: &mut String) {
     if run.italic {
         out.push_str(" font-style=\"italic\"");
     }
-    if run.underline {
-        out.push_str(" text-decoration=\"underline\"");
+    match (run.underline, run.strikethrough) {
+        (true, true) => out.push_str(" text-decoration=\"underline line-through\""),
+        (true, false) => out.push_str(" text-decoration=\"underline\""),
+        (false, true) => out.push_str(" text-decoration=\"line-through\""),
+        (false, false) => {}
+    }
+    match run.vertical_align {
+        VerticalAlign::Baseline => {}
+        VerticalAlign::Superscript => {
+            out.push_str(" baseline-shift=\"super\"");
+            out.push_str(&format!(" font-size=\"{SCRIPT_FONT_SIZE}\""));
+        }
+        VerticalAlign::Subscript => {
+            out.push_str(" baseline-shift=\"sub\"");
+            out.push_str(&format!(" font-size=\"{SCRIPT_FONT_SIZE}\""));
+        }
+    }
+    if run.code {
+        let family = run.font_family.as_deref().unwrap_or(CODE_BLOCK_FONT);
+        let family = escape_xml(family);
+        out.push_str(&format!(" font-family=\"{family}\" font-style=\"normal\""));
+    } else if let Some(family) = &run.font_family {
+        let family = escape_xml(family);
+        out.push_str(&format!(" font-family=\"{family}\""));
     }
     out.push('>');
     out.push_str(&escape_xml(&run.text));
     out.push_str("</tspan>");
+
+    if run.link.is_some() {
+        out.push_str("</a>");
+    }
 }
 
 /// Renders a geometric shape based on its [`Geometry`].
@@ -537,7 +680,10 @@ fn render_passthrough(object: &PassthroughObject, out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slides_core::{GeometricShape, ImageShape, MediaEntry, Run, TextBox, Transform};
+    use slides_core::{
+        GeometricShape, HeadingLevel, ImageShape, MediaEntry, ParagraphStyle, Run, TextBox,
+        Transform,
+    };
 
     fn rect(x: f64, y: f64, w: f64, h: f64) -> Rect {
         Rect::new(x, y, w, h)
@@ -785,5 +931,238 @@ mod tests {
         let opts = RenderOptions::default();
         assert_eq!(opts.width_emu, 12_192_000.0);
         assert_eq!(opts.height_emu, 6_858_000.0);
+    }
+
+    #[test]
+    fn strikethrough_renders() {
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::TextBox(TextBox {
+            frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
+            paragraphs: vec![Paragraph {
+                runs: vec![Run {
+                    text: "deleted".to_string(),
+                    strikethrough: true,
+                    ..Default::default()
+                }],
+                list_style: ListStyle::None,
+                ..Default::default()
+            }],
+        }));
+
+        let out = render(&slide);
+        assert!(out.svg.contains("text-decoration=\"line-through\""));
+    }
+
+    #[test]
+    fn underline_and_strikethrough_combine() {
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::TextBox(TextBox {
+            frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
+            paragraphs: vec![Paragraph {
+                runs: vec![Run {
+                    text: "both".to_string(),
+                    underline: true,
+                    strikethrough: true,
+                    ..Default::default()
+                }],
+                list_style: ListStyle::None,
+                ..Default::default()
+            }],
+        }));
+
+        let out = render(&slide);
+        assert!(out
+            .svg
+            .contains("text-decoration=\"underline line-through\""));
+    }
+
+    #[test]
+    fn superscript_renders() {
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::TextBox(TextBox {
+            frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
+            paragraphs: vec![Paragraph {
+                runs: vec![Run::new("x").superscript()],
+                list_style: ListStyle::None,
+                ..Default::default()
+            }],
+        }));
+
+        let out = render(&slide);
+        assert!(out.svg.contains("baseline-shift=\"super\""));
+        assert!(out.svg.contains("font-size=\"0.7em\""));
+    }
+
+    #[test]
+    fn subscript_renders() {
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::TextBox(TextBox {
+            frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
+            paragraphs: vec![Paragraph {
+                runs: vec![Run::new("2").subscript()],
+                list_style: ListStyle::None,
+                ..Default::default()
+            }],
+        }));
+
+        let out = render(&slide);
+        assert!(out.svg.contains("baseline-shift=\"sub\""));
+        assert!(out.svg.contains("font-size=\"0.7em\""));
+    }
+
+    #[test]
+    fn link_renders_anchor() {
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::TextBox(TextBox {
+            frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
+            paragraphs: vec![Paragraph {
+                runs: vec![Run::new("click").link("#slide-2").unwrap()],
+                list_style: ListStyle::None,
+                ..Default::default()
+            }],
+        }));
+
+        let out = render(&slide);
+        assert!(out.svg.contains("<a href=\"#slide-2\">"));
+        assert!(out.svg.contains("click"));
+        assert!(out.svg.contains("</a>"));
+    }
+
+    #[test]
+    fn link_url_is_escaped() {
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::TextBox(TextBox {
+            frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
+            paragraphs: vec![Paragraph {
+                runs: vec![Run::new("params")
+                    .link("mailto:a@b.com?subject=1&2")
+                    .unwrap()],
+                list_style: ListStyle::None,
+                ..Default::default()
+            }],
+        }));
+
+        let out = render(&slide);
+        assert!(out.svg.contains("href=\"mailto:a@b.com?subject=1&amp;2\""));
+        assert!(!out.svg.contains("subject=1&2\""));
+    }
+
+    #[test]
+    fn inline_code_renders_monospace() {
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::TextBox(TextBox {
+            frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
+            paragraphs: vec![Paragraph {
+                runs: vec![Run::new("code").code()],
+                list_style: ListStyle::None,
+                ..Default::default()
+            }],
+        }));
+
+        let out = render(&slide);
+        assert!(out.svg.contains("font-family=\"Courier New, monospace\""));
+    }
+
+    #[test]
+    fn inline_code_uses_run_font_family() {
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::TextBox(TextBox {
+            frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
+            paragraphs: vec![Paragraph {
+                runs: vec![Run::new("code").font("Fira Code").code()],
+                list_style: ListStyle::None,
+                ..Default::default()
+            }],
+        }));
+
+        let out = render(&slide);
+        assert!(out.svg.contains("font-family=\"Fira Code\""));
+    }
+
+    #[test]
+    fn heading_renders_larger_bold_font() {
+        let mut slide = slides_core::Slide::default();
+        let style = ParagraphStyle {
+            heading: Some(HeadingLevel::H1),
+            ..Default::default()
+        };
+        slide.shapes.push(Shape::TextBox(TextBox {
+            frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
+            paragraphs: vec![Paragraph {
+                runs: vec![Run::new("Title")],
+                list_style: ListStyle::None,
+                style,
+            }],
+        }));
+
+        let out = render(&slide);
+        assert!(out.svg.contains("font-weight=\"bold\""));
+        assert!(out.svg.contains("font-size=\"457200\""));
+        assert!(out.svg.contains("font-family=\"Calibri\""));
+    }
+
+    #[test]
+    fn blockquote_renders_border_and_italic() {
+        let mut slide = slides_core::Slide::default();
+        let style = ParagraphStyle {
+            blockquote: true,
+            ..Default::default()
+        };
+        slide.shapes.push(Shape::TextBox(TextBox {
+            frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
+            paragraphs: vec![Paragraph {
+                runs: vec![Run::new("quote")],
+                list_style: ListStyle::None,
+                style,
+            }],
+        }));
+
+        let out = render(&slide);
+        assert!(out.svg.contains("font-style=\"italic\""));
+        assert!(out.svg.contains("fill=\"#cccccc\""));
+        assert!(out.svg.contains("<rect"));
+    }
+
+    #[test]
+    fn code_block_renders_background_and_monospace() {
+        let mut slide = slides_core::Slide::default();
+        let style = ParagraphStyle {
+            code_block: true,
+            ..Default::default()
+        };
+        slide.shapes.push(Shape::TextBox(TextBox {
+            frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
+            paragraphs: vec![Paragraph {
+                runs: vec![Run::new("fn main() {}")],
+                list_style: ListStyle::Unordered,
+                style,
+            }],
+        }));
+
+        let out = render(&slide);
+        assert!(out.svg.contains("font-family=\"Courier New, monospace\""));
+        assert!(out.svg.contains("fill=\"#f5f5f5\""));
+        assert!(!out.svg.contains("\u{2022}"));
+    }
+
+    #[test]
+    fn indent_level_shifts_paragraph() {
+        let mut slide = slides_core::Slide::default();
+        let style = ParagraphStyle {
+            indent_level: 2,
+            ..Default::default()
+        };
+        slide.shapes.push(Shape::TextBox(TextBox {
+            frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
+            paragraphs: vec![Paragraph {
+                runs: vec![Run::new("indented")],
+                list_style: ListStyle::None,
+                style,
+            }],
+        }));
+
+        let out = render(&slide);
+        // x = TEXT_PADDING_EMU + 2 * INDENT_EMU = 91440 + 720000 = 811440
+        assert!(out.svg.contains("x=\"811440\""));
     }
 }
