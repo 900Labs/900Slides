@@ -13,9 +13,9 @@ use std::hash::Hasher;
 
 use base64::Engine as _;
 use slides_core::{
-    Color, DashStyle, Fill, GeometricShape, Geometry, HeadingLevel, ImageShape, ListStyle,
-    MediaStore, Outline, Paragraph, PassthroughObject, Rect, Run, Shadow, Shape, Style, TextBox,
-    Theme, VerticalAlign,
+    CellAlign, Color, DashStyle, Fill, GeometricShape, Geometry, HeadingLevel, ImageShape,
+    ListStyle, MediaStore, Outline, Paragraph, PassthroughObject, Rect, Run, Shadow, Shape, Style,
+    TableBorders, TableCell, TableShape, TextBox, Theme, VerticalAlign,
 };
 
 /// Horizontal padding inside a text box, in EMU (0.1 inch).
@@ -38,6 +38,8 @@ const CODE_BLOCK_FONT: &str = "Courier New, monospace";
 const CODE_BLOCK_BACKGROUND: &str = "#f5f5f5";
 /// Relative font size for superscript/subscript runs.
 const SCRIPT_FONT_SIZE: &str = "0.7em";
+/// Fill color used for the header row when a header cell has no explicit fill.
+const TABLE_HEADER_FILL: &str = "#d9e1f2";
 
 /// Options controlling the dimensions of a rendered slide.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -107,7 +109,7 @@ pub fn render_slide(
                 });
                 render_geometric(geometric, filter_id, &mut body);
             }
-            Shape::Table(_) => {}
+            Shape::Table(table) => render_table(table, theme, &mut body),
         }
     }
 
@@ -228,7 +230,12 @@ fn push_outline(out: &mut String, outline: &Outline) {
     let stroke = hex_color(&outline.color);
     let width = fnum(outline.width_emu);
     out.push_str(&format!(" stroke=\"{stroke}\" stroke-width=\"{width}\""));
-    match outline.dash {
+    push_dash_array(out, &outline.dash);
+}
+
+/// Pushes a `stroke-dasharray` attribute for a non-solid dash style.
+fn push_dash_array(out: &mut String, dash: &DashStyle) {
+    match dash {
         DashStyle::Solid => {}
         DashStyle::Dash => out.push_str(" stroke-dasharray=\"300000,150000\""),
         DashStyle::Dot => out.push_str(" stroke-dasharray=\"60000,60000\""),
@@ -678,12 +685,178 @@ fn render_passthrough(object: &PassthroughObject, out: &mut String) {
     ));
 }
 
+/// Renders a table as a grid of `<rect>` cells, one per cell, plus per-cell
+/// border lines and a `<text>` element for each non-empty cell.
+///
+/// Cells are laid out from the table frame's origin using `column_widths` and
+/// each row's `height`. The first row is rendered bold with a distinct fill
+/// when `header_row` is set. Cell-level fills and borders override the table
+/// defaults.
+fn render_table(table: &TableShape, theme: &Theme, out: &mut String) {
+    let frame = table.transform.frame;
+    let cx = frame.x + frame.width / 2.0;
+    let cy = frame.y + frame.height / 2.0;
+
+    out.push_str("<g");
+    push_transform(out, table.transform.rotation, cx, cy);
+    out.push('>');
+
+    if table.rows.is_empty() {
+        let x = fnum(frame.x);
+        let y = fnum(frame.y);
+        let width = fnum(frame.width);
+        let height = fnum(frame.height);
+        out.push_str(&format!(
+            "<rect x=\"{x}\" y=\"{y}\" width=\"{width}\" height=\"{height}\" fill=\"none\" stroke=\"none\"/>"
+        ));
+        out.push_str("</g>");
+        return;
+    }
+
+    // Left x of each column, accumulated from the frame origin.
+    let mut col_x = Vec::with_capacity(table.column_widths.len() + 1);
+    let mut acc = frame.x;
+    for &w in &table.column_widths {
+        col_x.push(acc);
+        acc += w;
+    }
+    col_x.push(acc);
+
+    // Top y of each row, accumulated from the frame origin.
+    let mut row_y = Vec::with_capacity(table.rows.len() + 1);
+    let mut acc = frame.y;
+    for row in &table.rows {
+        row_y.push(acc);
+        acc += row.height;
+    }
+    row_y.push(acc);
+
+    for (ri, row) in table.rows.iter().enumerate() {
+        let is_header = table.header_row && ri == 0;
+        let top = row_y[ri];
+        let bottom = row_y[ri + 1];
+        for (ci, cell) in row.cells.iter().enumerate() {
+            let left = col_x[ci];
+            let right = col_x[ci + 1];
+            let cell_rect = Rect::new(left, top, right - left, bottom - top);
+            render_cell_rect(cell, cell_rect, is_header, out);
+            render_cell_borders(cell, &table.default_borders, cell_rect, out);
+            render_cell_text(cell, cell_rect, is_header, theme, out);
+        }
+    }
+
+    out.push_str("</g>");
+}
+
+/// Renders the background `<rect>` for a single cell.
+fn render_cell_rect(cell: &TableCell, cell_rect: Rect, is_header: bool, out: &mut String) {
+    let x = fnum(cell_rect.x);
+    let y = fnum(cell_rect.y);
+    let width = fnum(cell_rect.width);
+    let height = fnum(cell_rect.height);
+    let fill = cell_fill(cell, is_header);
+    out.push_str(&format!(
+        "<rect x=\"{x}\" y=\"{y}\" width=\"{width}\" height=\"{height}\" fill=\"{fill}\" stroke=\"none\"/>"
+    ));
+}
+
+/// Returns the fill color string for a cell, honoring cell-level fill, then the
+/// header default, then `none`.
+fn cell_fill(cell: &TableCell, is_header: bool) -> String {
+    if let Some(Fill::Solid(color)) = &cell.fill {
+        return hex_color(color);
+    }
+    if is_header {
+        return TABLE_HEADER_FILL.to_string();
+    }
+    "none".to_string()
+}
+
+/// Renders the four border edges of a cell as `<line>` elements. A cell with no
+/// explicit `borders` inherits the table `default_borders`.
+fn render_cell_borders(
+    cell: &TableCell,
+    default_borders: &TableBorders,
+    cell_rect: Rect,
+    out: &mut String,
+) {
+    let borders = cell.borders.as_ref().unwrap_or(default_borders);
+    let left = cell_rect.x;
+    let top = cell_rect.y;
+    let right = cell_rect.x + cell_rect.width;
+    let bottom = cell_rect.y + cell_rect.height;
+    if let Some(edge) = &borders.top {
+        push_border_line(out, edge, left, top, right, top);
+    }
+    if let Some(edge) = &borders.bottom {
+        push_border_line(out, edge, left, bottom, right, bottom);
+    }
+    if let Some(edge) = &borders.left {
+        push_border_line(out, edge, left, top, left, bottom);
+    }
+    if let Some(edge) = &borders.right {
+        push_border_line(out, edge, right, top, right, bottom);
+    }
+}
+
+/// Pushes a single border `<line>` with color, width, and dash style.
+fn push_border_line(
+    out: &mut String,
+    edge: &slides_core::BorderEdge,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+) {
+    let x1 = fnum(x1);
+    let y1 = fnum(y1);
+    let x2 = fnum(x2);
+    let y2 = fnum(y2);
+    let stroke = hex_color(&edge.color);
+    let width = fnum(edge.width_emu);
+    out.push_str(&format!(
+        "<line x1=\"{x1}\" y1=\"{y1}\" x2=\"{x2}\" y2=\"{y2}\" stroke=\"{stroke}\" stroke-width=\"{width}\""
+    ));
+    push_dash_array(out, &edge.dash);
+    out.push_str("/>");
+}
+
+/// Renders the cell's text, horizontally aligned per [`CellAlign`] and vertically
+/// centered. Empty cells emit no `<text>` element.
+fn render_cell_text(
+    cell: &TableCell,
+    cell_rect: Rect,
+    is_header: bool,
+    theme: &Theme,
+    out: &mut String,
+) {
+    if cell.text.is_empty() {
+        return;
+    }
+    let (anchor, tx) = match cell.align {
+        CellAlign::Left => ("start", cell_rect.x + TEXT_PADDING_EMU),
+        CellAlign::Center => ("middle", cell_rect.x + cell_rect.width / 2.0),
+        CellAlign::Right => ("end", cell_rect.x + cell_rect.width - TEXT_PADDING_EMU),
+    };
+    let ty = cell_rect.y + cell_rect.height / 2.0;
+    let font_size = fnum(TEXT_FONT_SIZE_EMU);
+    let font = escape_xml(&theme.body_font);
+    let weight = if is_header { "bold" } else { "normal" };
+    let tx = fnum(tx);
+    let ty = fnum(ty);
+    out.push_str(&format!(
+        "<text x=\"{tx}\" y=\"{ty}\" text-anchor=\"{anchor}\" dominant-baseline=\"central\" font-family=\"{font}\" font-size=\"{font_size}\" font-weight=\"{weight}\">"
+    ));
+    out.push_str(&escape_xml(&cell.text));
+    out.push_str("</text>");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use slides_core::{
-        GeometricShape, HeadingLevel, ImageShape, MediaEntry, ParagraphStyle, Run, TextBox,
-        Transform,
+        BorderEdge, CellAlign, GeometricShape, HeadingLevel, ImageShape, MediaEntry,
+        ParagraphStyle, Run, TableBorders, TableShape, TextBox, Transform,
     };
 
     fn rect(x: f64, y: f64, w: f64, h: f64) -> Rect {
@@ -1165,5 +1338,248 @@ mod tests {
         let out = render(&slide);
         // x = TEXT_PADDING_EMU + 2 * INDENT_EMU = 91440 + 720000 = 811440
         assert!(out.svg.contains("x=\"811440\""));
+    }
+
+    /// Builds a 2x2 table at the origin filling a 2,000,000 x 1,000,000 frame.
+    fn sample_table() -> TableShape {
+        let mut table = TableShape::default_grid(2, 2, rect(0.0, 0.0, 2_000_000.0, 1_000_000.0));
+        table.cell_mut(0, 0).unwrap().text = "A".to_string();
+        table.cell_mut(0, 1).unwrap().text = "B".to_string();
+        table.cell_mut(1, 0).unwrap().text = "C".to_string();
+        table.cell_mut(1, 1).unwrap().text = "D".to_string();
+        table
+    }
+
+    #[test]
+    fn table_renders_rect_per_cell_and_text() {
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::Table(sample_table()));
+
+        let out = render(&slide);
+        // One background rect + one rect per cell (4).
+        assert_eq!(out.svg.matches("<rect ").count(), 5);
+        assert!(out.svg.contains(">A<"));
+        assert!(out.svg.contains(">B<"));
+        assert!(out.svg.contains(">C<"));
+        assert!(out.svg.contains(">D<"));
+    }
+
+    #[test]
+    fn table_header_row_is_bold_and_filled() {
+        let mut table = sample_table();
+        table.header_row = true;
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::Table(table));
+
+        let out = render(&slide);
+        // Header fill appears on the first row's cells.
+        assert!(out.svg.contains(TABLE_HEADER_FILL));
+        // Header text is bold; body text is normal. At least one bold weight.
+        assert!(out.svg.contains("font-weight=\"bold\""));
+        // Both header cells (A, B) share the same bold opening text element.
+        assert!(out.svg.contains("font-weight=\"bold\">A<"));
+        assert!(out.svg.contains("font-weight=\"bold\">B<"));
+        // Non-header cells render normal weight.
+        assert!(out.svg.contains("font-weight=\"normal\">C<"));
+    }
+
+    #[test]
+    fn table_cell_fill_overrides_header_default() {
+        let mut table = sample_table();
+        table.header_row = true;
+        table.cell_mut(0, 0).unwrap().fill = Some(Fill::Solid(Color::rgb(255, 0, 0)));
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::Table(table));
+
+        let out = render(&slide);
+        // The red cell fill appears before the default header fill in document order.
+        let red = out.svg.find("#ff0000").expect("red fill");
+        let header = out
+            .svg
+            .find(TABLE_HEADER_FILL)
+            .expect("header default fill");
+        assert!(red < header);
+    }
+
+    #[test]
+    fn table_alignment_left_center_right() {
+        let mut table = sample_table();
+        table.cell_mut(0, 0).unwrap().align = CellAlign::Left;
+        table.cell_mut(0, 1).unwrap().align = CellAlign::Center;
+        table.cell_mut(1, 0).unwrap().align = CellAlign::Right;
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::Table(table));
+
+        let out = render(&slide);
+        assert!(out.svg.contains("text-anchor=\"start\""));
+        assert!(out.svg.contains("text-anchor=\"middle\""));
+        assert!(out.svg.contains("text-anchor=\"end\""));
+    }
+
+    #[test]
+    fn table_text_is_vertically_centered() {
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::Table(sample_table()));
+
+        let out = render(&slide);
+        assert!(out.svg.contains("dominant-baseline=\"central\""));
+    }
+
+    #[test]
+    fn table_default_borders_render_as_lines() {
+        let mut table = sample_table();
+        let edge = BorderEdge {
+            color: Color::rgb(17, 17, 17),
+            width_emu: 9_525.0,
+            dash: DashStyle::Solid,
+        };
+        table.default_borders = TableBorders {
+            top: Some(edge.clone()),
+            bottom: Some(edge.clone()),
+            left: Some(edge.clone()),
+            right: Some(edge),
+        };
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::Table(table));
+
+        let out = render(&slide);
+        // 4 cells x 4 edges = 16 border lines.
+        assert_eq!(out.svg.matches("<line ").count(), 16);
+        assert!(out.svg.contains("stroke=\"#111111\""));
+        assert!(out.svg.contains("stroke-width=\"9525\""));
+    }
+
+    #[test]
+    fn table_cell_border_override_replaces_default() {
+        let mut table = sample_table();
+        // Table default: no borders anywhere.
+        // One cell overrides with a single top edge.
+        table.cell_mut(1, 1).unwrap().borders = Some(TableBorders {
+            top: Some(BorderEdge {
+                color: Color::rgb(0, 128, 0),
+                width_emu: 9_525.0,
+                dash: DashStyle::Dash,
+            }),
+            ..Default::default()
+        });
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::Table(table));
+
+        let out = render(&slide);
+        // Only the overridden cell's single top edge is drawn.
+        assert_eq!(out.svg.matches("<line ").count(), 1);
+        assert!(out.svg.contains("stroke=\"#008000\""));
+        assert!(out.svg.contains("stroke-dasharray=\"300000,150000\""));
+    }
+
+    #[test]
+    fn table_empty_cell_emits_no_text() {
+        let mut table = TableShape::default_grid(1, 2, rect(0.0, 0.0, 2_000_000.0, 500_000.0));
+        table.cell_mut(0, 0).unwrap().text = "only".to_string();
+        // (0,1) left empty.
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::Table(table));
+
+        let out = render(&slide);
+        // Two cell rects, exactly one text element.
+        assert_eq!(out.svg.matches("<rect ").count(), 3); // bg + 2 cells
+        assert_eq!(out.svg.matches("<text").count(), 1);
+        assert!(out.svg.contains(">only<"));
+    }
+
+    #[test]
+    fn table_text_is_xml_escaped() {
+        let mut table = TableShape::default_grid(1, 1, rect(0.0, 0.0, 1_000_000.0, 500_000.0));
+        table.cell_mut(0, 0).unwrap().text = "<b> & \"x\"".to_string();
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::Table(table));
+
+        let out = render(&slide);
+        assert!(out.svg.contains("&lt;b&gt; &amp; &quot;x&quot;"));
+        assert!(!out.svg.contains("<b>"));
+    }
+
+    #[test]
+    fn table_rotation_emits_transform_on_group() {
+        let mut table = sample_table();
+        table.transform.rotation = 30.0;
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::Table(table));
+
+        let out = render(&slide);
+        // The group opens with the rotate transform first.
+        assert!(out.svg.contains("<g transform=\"rotate(30,"));
+    }
+
+    #[test]
+    fn table_renders_before_following_shapes() {
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::Table(sample_table()));
+        slide.shapes.push(Shape::Geometric(GeometricShape {
+            transform: Transform {
+                frame: rect(0.0, 0.0, 500_000.0, 500_000.0),
+                rotation: 0.0,
+            },
+            geometry: Geometry::Rectangle,
+            style: Style {
+                fill: Some(Fill::Solid(Color::rgb(0, 0, 0))),
+                outline: None,
+                shadow: None,
+            },
+        }));
+
+        let out = render(&slide);
+        let table_group = out.svg.find("<g>").expect("table group");
+        let geo = out.svg.find("<rect x=").expect("geometric rect");
+        // The table's first cell rect (`<rect x=`) comes before the geometric shape.
+        let first_cell = out.svg.find("<rect x=").expect("cell rect");
+        assert!(table_group < first_cell);
+        assert!(first_cell < geo || table_group < geo);
+    }
+
+    #[test]
+    fn table_rendering_is_deterministic() {
+        let mut slide = slides_core::Slide::default();
+        let mut table = sample_table();
+        table.header_row = true;
+        let edge = BorderEdge {
+            color: Color::rgb(0, 0, 0),
+            width_emu: 9_525.0,
+            dash: DashStyle::Solid,
+        };
+        table.default_borders = TableBorders {
+            top: Some(edge.clone()),
+            bottom: Some(edge.clone()),
+            left: Some(edge.clone()),
+            right: Some(edge),
+        };
+        slide.shapes.push(Shape::Table(table));
+
+        let first = render(&slide);
+        let second = render(&slide);
+        assert_eq!(first.svg, second.svg);
+        assert_eq!(first.hash, second.hash);
+    }
+
+    #[test]
+    fn empty_table_renders_frame_rect_without_panicking() {
+        let table = TableShape {
+            transform: Transform {
+                frame: rect(0.0, 0.0, 2_000_000.0, 1_000_000.0),
+                rotation: 0.0,
+            },
+            rows: Vec::new(),
+            column_widths: Vec::new(),
+            default_borders: TableBorders::default(),
+            header_row: false,
+        };
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::Table(table));
+
+        let out = render(&slide);
+        // Exactly one cell rect (the frame) plus the background rect.
+        assert_eq!(out.svg.matches("<rect ").count(), 2);
+        assert!(out.svg.contains("width=\"2000000\""));
+        assert!(out.svg.contains("height=\"1000000\""));
     }
 }
