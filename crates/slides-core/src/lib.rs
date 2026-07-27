@@ -1132,6 +1132,91 @@ impl Command for SetRunStyle {
     }
 }
 
+/// Replaces the paragraph-level style of a specific paragraph.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetParagraphStyle {
+    slide_id: String,
+    shape_index: usize,
+    paragraph_index: usize,
+    style: ParagraphStyle,
+}
+
+impl SetParagraphStyle {
+    /// Creates a new set-paragraph-style command.
+    pub fn new(
+        slide_id: impl Into<String>,
+        shape_index: usize,
+        paragraph_index: usize,
+        style: ParagraphStyle,
+    ) -> Self {
+        Self {
+            slide_id: slide_id.into(),
+            shape_index,
+            paragraph_index,
+            style,
+        }
+    }
+}
+
+impl Command for SetParagraphStyle {
+    fn apply(&self, deck: &mut Deck) {
+        let Some(slide) = deck.slide_mut(&self.slide_id) else {
+            return;
+        };
+        let Some(shape) = slide.shapes.get_mut(self.shape_index) else {
+            return;
+        };
+        let Shape::TextBox(text_box) = shape else {
+            return;
+        };
+        let Some(paragraph) = text_box.paragraphs.get_mut(self.paragraph_index) else {
+            return;
+        };
+        paragraph.style = self.style.clone();
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        let style = deck
+            .slide(&self.slide_id)
+            .and_then(|slide| slide.shapes.get(self.shape_index))
+            .and_then(|shape| match shape {
+                Shape::TextBox(text_box) => text_box
+                    .paragraphs
+                    .get(self.paragraph_index)
+                    .map(|p| p.style.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        Box::new(Self {
+            slide_id: self.slide_id.clone(),
+            shape_index: self.shape_index,
+            paragraph_index: self.paragraph_index,
+            style,
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        let Some(slide) = deck.slide(&self.slide_id) else {
+            return false;
+        };
+        let Some(shape) = slide.shapes.get(self.shape_index) else {
+            return false;
+        };
+        let Shape::TextBox(text_box) = shape else {
+            return false;
+        };
+        self.paragraph_index < text_box.paragraphs.len()
+    }
+}
+
 /// Counts how many image shapes across the deck reference `key`.
 fn count_media_refs(deck: &Deck, key: &str) -> usize {
     deck.slides

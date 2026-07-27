@@ -14,6 +14,8 @@ fn main() {
             commands::get_snapshot,
             commands::edit_text,
             commands::edit_text_box,
+            commands::set_run_style,
+            commands::set_paragraph_style,
             commands::insert_image,
             commands::add_shape,
             commands::update_shape_transform,

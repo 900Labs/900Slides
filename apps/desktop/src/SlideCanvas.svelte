@@ -6,13 +6,17 @@
     FillDto,
     GeometryDto,
     GeometricShapeSnapshot,
+    HeadingLevelDto,
     ImageShapeSnapshot,
     MediaMap,
     ParagraphDto,
+    ParagraphStyleDto,
     PassthroughSnapshot,
+    RunDto,
     SlideSnapshot,
     StyleDto,
     TextBoxSnapshot,
+    VerticalAlignDto,
   } from './lib/types'
 
   /** Props for the slide canvas. */
@@ -71,7 +75,44 @@
     return paragraph.runs.map((run) => run.text).join('')
   }
 
-  /** Builds a paragraph DTO, preserving original runs when the text is unchanged. */
+  /** Compares two paragraph styles for equality. */
+  function paragraphStyleEqual(a: ParagraphStyleDto, b: ParagraphStyleDto): boolean {
+    return (
+      a.heading === b.heading &&
+      a.blockquote === b.blockquote &&
+      a.codeBlock === b.codeBlock &&
+      a.indentLevel === b.indentLevel
+    )
+  }
+
+  /** Class name for a paragraph based on its style. */
+  function paragraphClass(style: ParagraphStyleDto): string {
+    const classes: string[] = []
+    if (style.heading === 'h1') classes.push('heading-1')
+    if (style.heading === 'h2') classes.push('heading-2')
+    if (style.heading === 'h3') classes.push('heading-3')
+    if (style.heading === 'h4') classes.push('heading-4')
+    if (style.heading === 'h5') classes.push('heading-5')
+    if (style.heading === 'h6') classes.push('heading-6')
+    if (style.blockquote) classes.push('blockquote')
+    if (style.codeBlock) classes.push('code-block')
+    return classes.join(' ')
+  }
+
+  /** Class name for a run based on its style. */
+  function runClass(run: RunDto): string {
+    const classes: string[] = []
+    if (run.bold) classes.push('bold')
+    if (run.italic) classes.push('italic')
+    if (run.underline) classes.push('underline')
+    if (run.strikethrough) classes.push('strikethrough')
+    if (run.verticalAlign === 'superscript') classes.push('superscript')
+    if (run.verticalAlign === 'subscript') classes.push('subscript')
+    if (run.code) classes.push('code')
+    return classes.join(' ')
+  }
+
+  /** Builds a paragraph DTO, preserving original runs and style when the text is unchanged. */
   function buildParagraph(
     text: string,
     original: ParagraphDto | undefined,
@@ -80,8 +121,25 @@
       return original
     }
     return {
-      runs: text ? [{ text, bold: false, italic: false, underline: false }] : [],
+      runs: text
+        ? [
+            {
+              text,
+              bold: false,
+              italic: false,
+              underline: false,
+              strikethrough: false,
+              verticalAlign: 'baseline' as VerticalAlignDto,
+              code: false,
+            },
+          ]
+        : [],
       listStyle: original?.listStyle ?? 'none',
+      style: original?.style ?? {
+        blockquote: false,
+        codeBlock: false,
+        indentLevel: 0,
+      },
     }
   }
 
@@ -103,12 +161,18 @@
         const original = originalParagraphs[index]
         if (!original) return true
         if (paragraph.runs.length !== original.runs.length) return true
+        if (paragraph.listStyle !== original.listStyle) return true
+        if (!paragraphStyleEqual(paragraph.style, original.style)) return true
         return paragraph.runs.some(
           (run, runIndex) =>
             run.text !== original.runs[runIndex]?.text ||
             run.bold !== original.runs[runIndex]?.bold ||
             run.italic !== original.runs[runIndex]?.italic ||
-            run.underline !== original.runs[runIndex]?.underline,
+            run.underline !== original.runs[runIndex]?.underline ||
+            run.strikethrough !== original.runs[runIndex]?.strikethrough ||
+            run.verticalAlign !== original.runs[runIndex]?.verticalAlign ||
+            run.code !== original.runs[runIndex]?.code ||
+            run.fontFamily !== original.runs[runIndex]?.fontFamily,
         )
       })
 
@@ -282,9 +346,9 @@
         {#if readonly}
           <div class="text-box-readonly">
             {#each textBox.paragraphs as paragraph}
-              <p>
+              <p class={paragraphClass(paragraph.style)}>
                 {#each paragraph.runs as run}
-                  <span class:bold={run.bold} class:italic={run.italic} class:underline={run.underline}>{run.text}</span>
+                  <span class={runClass(run)}>{run.text}</span>
                 {/each}
               </p>
             {/each}
@@ -292,6 +356,8 @@
         {:else}
           <textarea
             class="text-box"
+            data-slide-id={slide.id}
+            data-shape-index={shapeIndex}
             value={textFromParagraphs(textBox.paragraphs)}
             onblur={(event) => handleBlur(event, shapeIndex)}
             aria-label="Editable text box"
@@ -394,6 +460,55 @@
   }
   .underline {
     text-decoration: underline;
+  }
+  .strikethrough {
+    text-decoration: line-through;
+  }
+  .superscript {
+    vertical-align: super;
+    font-size: 0.7em;
+  }
+  .subscript {
+    vertical-align: sub;
+    font-size: 0.7em;
+  }
+  .code {
+    font-family: 'Courier New', monospace;
+  }
+  .text-box-readonly p.heading-1 {
+    font-size: 2rem;
+    font-weight: bold;
+  }
+  .text-box-readonly p.heading-2 {
+    font-size: 1.5rem;
+    font-weight: bold;
+  }
+  .text-box-readonly p.heading-3 {
+    font-size: 1.25rem;
+    font-weight: bold;
+  }
+  .text-box-readonly p.heading-4 {
+    font-size: 1.1rem;
+    font-weight: bold;
+  }
+  .text-box-readonly p.heading-5 {
+    font-size: 1rem;
+    font-weight: bold;
+  }
+  .text-box-readonly p.heading-6 {
+    font-size: 0.9rem;
+    font-weight: bold;
+  }
+  .text-box-readonly p.blockquote {
+    font-style: italic;
+    border-left: 3px solid #ccc;
+    padding-left: 0.5rem;
+    margin-left: 0;
+  }
+  .text-box-readonly p.code-block {
+    font-family: 'Courier New', monospace;
+    background: #f5f5f5;
+    padding: 0.25rem;
   }
   .passthrough {
     position: absolute;
