@@ -481,6 +481,7 @@ fn write_model_shape<W: Write>(
         Shape::Passthrough(object) => {
             writer.get_mut().write_all(&object.raw_bytes)?;
         }
+        Shape::Table(_) => {}
     }
     Ok(())
 }
@@ -803,6 +804,7 @@ fn append_shape<W: Write>(
             writer.get_mut().write_all(b"</p:txBody></p:sp>")?;
         }
         Shape::Passthrough(_) => {}
+        Shape::Table(_) => {}
     }
     Ok(())
 }

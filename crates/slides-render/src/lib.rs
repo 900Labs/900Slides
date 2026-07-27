@@ -107,6 +107,7 @@ pub fn render_slide(
                 });
                 render_geometric(geometric, filter_id, &mut body);
             }
+            Shape::Table(_) => {}
         }
     }
 

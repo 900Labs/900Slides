@@ -200,6 +200,8 @@ pub enum Shape {
     Image(ImageShape),
     /// A geometric shape.
     Geometric(GeometricShape),
+    /// A table: a grid of cells with per-column widths and per-row heights.
+    Table(TableShape),
 }
 
 /// An editable text box shape.
@@ -231,6 +233,232 @@ pub struct GeometricShape {
     pub geometry: Geometry,
     /// Visual style of the shape.
     pub style: Style,
+}
+
+/// Maximum number of rows in a table (PRODUCT_SPEC.md §5.2).
+pub const MAX_TABLE_ROWS: usize = 50;
+/// Maximum number of columns in a table (PRODUCT_SPEC.md §5.2).
+pub const MAX_TABLE_COLS: usize = 50;
+
+/// Errors returned by [`TableShape::new`] and [`TableShape::validate`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TableError {
+    /// The table must have at least one row.
+    #[error("table must have at least one row")]
+    Empty,
+    /// All rows must have the same number of columns.
+    #[error("all rows must have the same number of columns")]
+    RaggedRows,
+    /// `column_widths` length must equal the column count.
+    #[error("column_widths length ({got}) must equal column count ({want})")]
+    ColumnCountMismatch {
+        /// The length of `column_widths` that was provided.
+        got: usize,
+        /// The number of columns implied by the rows.
+        want: usize,
+    },
+    /// The table exceeds the 50x50 cell limit.
+    #[error("table exceeds the 50x50 cell limit ({rows}x{cols})")]
+    TooLarge {
+        /// The number of rows in the offending table.
+        rows: usize,
+        /// The number of columns in the offending table.
+        cols: usize,
+    },
+}
+
+/// A table shape: a grid of cells with per-column widths and per-row heights.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TableShape {
+    /// Placement of the table on the slide.
+    pub transform: Transform,
+    /// Rows, top to bottom. Must be non-empty.
+    pub rows: Vec<TableRow>,
+    /// Per-column width in EMU. Length must equal the number of columns.
+    pub column_widths: Vec<f64>,
+    /// Default cell borders applied when a cell has no explicit border.
+    #[serde(default)]
+    pub default_borders: TableBorders,
+    /// Whether the first row is rendered as a header (bold, distinct fill).
+    #[serde(default)]
+    pub header_row: bool,
+}
+
+impl TableShape {
+    /// Constructs a table, validating its structural invariants.
+    ///
+    /// Returns [`TableError`] if the rows are empty, ragged, mismatched with
+    /// `column_widths`, or exceed the [`MAX_TABLE_ROWS`] x [`MAX_TABLE_COLS`]
+    /// cap. The new table starts with empty default borders and no header row.
+    pub fn new(
+        transform: Transform,
+        rows: Vec<TableRow>,
+        column_widths: Vec<f64>,
+    ) -> Result<Self, TableError> {
+        if rows.is_empty() {
+            return Err(TableError::Empty);
+        }
+        let col_count = rows[0].cells.len();
+        if !rows.iter().all(|row| row.cells.len() == col_count) {
+            return Err(TableError::RaggedRows);
+        }
+        if column_widths.len() != col_count {
+            return Err(TableError::ColumnCountMismatch {
+                got: column_widths.len(),
+                want: col_count,
+            });
+        }
+        if rows.len() > MAX_TABLE_ROWS || col_count > MAX_TABLE_COLS {
+            return Err(TableError::TooLarge {
+                rows: rows.len(),
+                cols: col_count,
+            });
+        }
+        Ok(Self {
+            transform,
+            rows,
+            column_widths,
+            default_borders: TableBorders::default(),
+            header_row: false,
+        })
+    }
+
+    /// Builds a table that fills `frame` with `rows` rows and `cols` columns of
+    /// equal size, empty cells, and no header row.
+    ///
+    /// Panics if `rows` or `cols` is zero, since an empty table is a
+    /// programming error rather than a recoverable condition.
+    pub fn default_grid(rows: usize, cols: usize, frame: Rect) -> Self {
+        assert!(rows > 0, "default_grid requires at least one row");
+        assert!(cols > 0, "default_grid requires at least one column");
+        let row_height = frame.height / rows as f64;
+        let column_width = frame.width / cols as f64;
+        let table_rows = (0..rows)
+            .map(|_| TableRow {
+                height: row_height,
+                cells: (0..cols).map(|_| TableCell::default()).collect(),
+            })
+            .collect::<Vec<_>>();
+        let column_widths = (0..cols).map(|_| column_width).collect::<Vec<_>>();
+        Self {
+            transform: Transform {
+                frame,
+                rotation: 0.0,
+            },
+            rows: table_rows,
+            column_widths,
+            default_borders: TableBorders::default(),
+            header_row: false,
+        }
+    }
+
+    /// Returns the number of rows in the table.
+    pub fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Returns the number of columns in the table, or `0` if it has no rows.
+    pub fn col_count(&self) -> usize {
+        self.rows.first().map_or(0, |row| row.cells.len())
+    }
+
+    /// Returns a reference to the cell at `(row, col)`, if in range.
+    pub fn cell(&self, row: usize, col: usize) -> Option<&TableCell> {
+        self.rows.get(row).and_then(|row| row.cells.get(col))
+    }
+
+    /// Returns a mutable reference to the cell at `(row, col)`, if in range.
+    pub fn cell_mut(&mut self, row: usize, col: usize) -> Option<&mut TableCell> {
+        self.rows
+            .get_mut(row)
+            .and_then(|row| row.cells.get_mut(col))
+    }
+
+    /// Returns `true` if the table satisfies the same invariants as [`new`].
+    pub fn validate(&self) -> bool {
+        if self.rows.is_empty() {
+            return false;
+        }
+        let col_count = self.rows[0].cells.len();
+        if !self.rows.iter().all(|row| row.cells.len() == col_count) {
+            return false;
+        }
+        if self.column_widths.len() != col_count {
+            return false;
+        }
+        if self.rows.len() > MAX_TABLE_ROWS || col_count > MAX_TABLE_COLS {
+            return false;
+        }
+        true
+    }
+}
+
+/// A single row of cells in a [`TableShape`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TableRow {
+    /// Row height in EMU.
+    pub height: f64,
+    /// Cells, left to right.
+    pub cells: Vec<TableCell>,
+}
+
+/// A single cell in a [`TableShape`].
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct TableCell {
+    /// Plain text content of the cell.
+    #[serde(default)]
+    pub text: String,
+    /// Cell fill, or `None` to inherit the table default.
+    #[serde(default)]
+    pub fill: Option<Fill>,
+    /// Cell-level border overrides. When `None`, inherit the table default.
+    #[serde(default)]
+    pub borders: Option<TableBorders>,
+    /// Horizontal alignment of the cell text.
+    #[serde(default)]
+    pub align: CellAlign,
+}
+
+/// Horizontal alignment of cell text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CellAlign {
+    /// Left-aligned text.
+    #[default]
+    Left,
+    /// Centered text.
+    Center,
+    /// Right-aligned text.
+    Right,
+}
+
+/// The four borders of a cell (or the [`TableShape`] default).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct TableBorders {
+    /// Top edge, if any.
+    #[serde(default)]
+    pub top: Option<BorderEdge>,
+    /// Bottom edge, if any.
+    #[serde(default)]
+    pub bottom: Option<BorderEdge>,
+    /// Left edge, if any.
+    #[serde(default)]
+    pub left: Option<BorderEdge>,
+    /// Right edge, if any.
+    #[serde(default)]
+    pub right: Option<BorderEdge>,
+}
+
+/// A single border edge: color, width, and dash style.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BorderEdge {
+    /// Edge color.
+    pub color: Color,
+    /// Width in EMU.
+    pub width_emu: f64,
+    /// Dash pattern of the edge.
+    #[serde(default)]
+    pub dash: DashStyle,
 }
 
 /// A rectangle in EMU (English Metric Units; 914400 EMU per inch).
@@ -1447,6 +1675,7 @@ impl Command for MoveShape {
             Shape::TextBox(text_box) => text_box.frame = self.transform.frame,
             Shape::Image(image) => image.transform = self.transform,
             Shape::Geometric(geometric) => geometric.transform = self.transform,
+            Shape::Table(table) => table.transform = self.transform,
             Shape::Passthrough(_) => {}
         };
     }
@@ -1462,6 +1691,7 @@ impl Command for MoveShape {
                 }),
                 Shape::Image(image) => Some(image.transform),
                 Shape::Geometric(geometric) => Some(geometric.transform),
+                Shape::Table(table) => Some(table.transform),
                 Shape::Passthrough(_) => None,
             })
             .unwrap_or_default();
@@ -1682,6 +1912,739 @@ impl Command for RemoveInsertedImage {
             entry,
             image.transform,
             image.crop.clone(),
+        ))
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, _deck: &Deck) -> bool {
+        true
+    }
+}
+
+/// Appends a [`Shape::Table`] onto the end of a slide's shape list.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AddTable {
+    slide_id: String,
+    table: TableShape,
+}
+
+impl AddTable {
+    /// Creates a new add-table command.
+    pub fn new(slide_id: impl Into<String>, table: TableShape) -> Self {
+        Self {
+            slide_id: slide_id.into(),
+            table,
+        }
+    }
+}
+
+impl Command for AddTable {
+    fn apply(&self, deck: &mut Deck) {
+        if let Some(slide) = deck.slide_mut(&self.slide_id) {
+            slide.shapes.push(Shape::Table(self.table.clone()));
+        }
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        let shape_index = deck
+            .slide(&self.slide_id)
+            .map_or(0, |slide| slide.shapes.len());
+        Box::new(DeleteShape::new(self.slide_id.clone(), shape_index))
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        deck.slide(&self.slide_id).is_some() && self.table.validate()
+    }
+}
+
+/// Sets the plain-text content of a single cell in a table shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetCellText {
+    slide_id: String,
+    shape_index: usize,
+    row: usize,
+    col: usize,
+    text: String,
+}
+
+impl SetCellText {
+    /// Creates a new set-cell-text command.
+    pub fn new(
+        slide_id: impl Into<String>,
+        shape_index: usize,
+        row: usize,
+        col: usize,
+        text: impl Into<String>,
+    ) -> Self {
+        Self {
+            slide_id: slide_id.into(),
+            shape_index,
+            row,
+            col,
+            text: text.into(),
+        }
+    }
+}
+
+impl Command for SetCellText {
+    fn apply(&self, deck: &mut Deck) {
+        let Some(slide) = deck.slide_mut(&self.slide_id) else {
+            return;
+        };
+        let Some(shape) = slide.shapes.get_mut(self.shape_index) else {
+            return;
+        };
+        let Shape::Table(table) = shape else {
+            return;
+        };
+        if let Some(cell) = table.cell_mut(self.row, self.col) {
+            cell.text = self.text.clone();
+        }
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        let prior = deck
+            .slide(&self.slide_id)
+            .and_then(|slide| slide.shapes.get(self.shape_index))
+            .and_then(|shape| match shape {
+                Shape::Table(table) => table.cell(self.row, self.col).map(|cell| cell.text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        Box::new(Self {
+            slide_id: self.slide_id.clone(),
+            shape_index: self.shape_index,
+            row: self.row,
+            col: self.col,
+            text: prior,
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        let Some(slide) = deck.slide(&self.slide_id) else {
+            return false;
+        };
+        let Some(shape) = slide.shapes.get(self.shape_index) else {
+            return false;
+        };
+        let Shape::Table(table) = shape else {
+            return false;
+        };
+        self.row < table.row_count() && self.col < table.col_count()
+    }
+}
+
+/// Merge-patch over a single cell's style in a table shape.
+///
+/// The outer [`Option`] on `fill` and `borders` indicates whether this command
+/// touches that field; the inner [`Option`] is the field's new value, where
+/// `None` clears it. `align` is a single [`Option`] since it has no "cleared"
+/// state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetCellStyle {
+    slide_id: String,
+    shape_index: usize,
+    row: usize,
+    col: usize,
+    fill: Option<Option<Fill>>,
+    borders: Option<Option<TableBorders>>,
+    align: Option<CellAlign>,
+}
+
+impl SetCellStyle {
+    /// Creates a new set-cell-style command with no fields set.
+    pub fn new(slide_id: impl Into<String>, shape_index: usize, row: usize, col: usize) -> Self {
+        Self {
+            slide_id: slide_id.into(),
+            shape_index,
+            row,
+            col,
+            fill: None,
+            borders: None,
+            align: None,
+        }
+    }
+
+    /// Sets the cell fill to apply (`None` clears the fill).
+    pub fn fill(mut self, fill: Option<Fill>) -> Self {
+        self.fill = Some(fill);
+        self
+    }
+
+    /// Sets the cell borders to apply (`None` clears the borders).
+    pub fn borders(mut self, borders: Option<TableBorders>) -> Self {
+        self.borders = Some(borders);
+        self
+    }
+
+    /// Sets the cell text alignment to apply.
+    pub fn align(mut self, align: CellAlign) -> Self {
+        self.align = Some(align);
+        self
+    }
+}
+
+impl Command for SetCellStyle {
+    fn apply(&self, deck: &mut Deck) {
+        let Some(slide) = deck.slide_mut(&self.slide_id) else {
+            return;
+        };
+        let Some(shape) = slide.shapes.get_mut(self.shape_index) else {
+            return;
+        };
+        let Shape::Table(table) = shape else {
+            return;
+        };
+        let Some(cell) = table.cell_mut(self.row, self.col) else {
+            return;
+        };
+        if let Some(fill) = self.fill.clone() {
+            cell.fill = fill;
+        }
+        if let Some(borders) = self.borders.clone() {
+            cell.borders = borders;
+        }
+        if let Some(align) = self.align {
+            cell.align = align;
+        }
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        let snapshot = deck
+            .slide(&self.slide_id)
+            .and_then(|slide| slide.shapes.get(self.shape_index))
+            .and_then(|shape| match shape {
+                Shape::Table(table) => table.cell(self.row, self.col),
+                _ => None,
+            });
+
+        let mut inverse = Self {
+            slide_id: self.slide_id.clone(),
+            shape_index: self.shape_index,
+            row: self.row,
+            col: self.col,
+            fill: None,
+            borders: None,
+            align: None,
+        };
+        if let Some(cell) = snapshot {
+            if self.fill.is_some() {
+                inverse.fill = Some(cell.fill.clone());
+            }
+            if self.borders.is_some() {
+                inverse.borders = Some(cell.borders.clone());
+            }
+            if self.align.is_some() {
+                inverse.align = Some(cell.align);
+            }
+        }
+        Box::new(inverse)
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        let Some(slide) = deck.slide(&self.slide_id) else {
+            return false;
+        };
+        let Some(shape) = slide.shapes.get(self.shape_index) else {
+            return false;
+        };
+        let Shape::Table(table) = shape else {
+            return false;
+        };
+        self.row < table.row_count() && self.col < table.col_count()
+    }
+}
+
+/// Resizes a table shape's column widths and row heights.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResizeTable {
+    slide_id: String,
+    shape_index: usize,
+    column_widths: Vec<f64>,
+    row_heights: Vec<f64>,
+}
+
+impl ResizeTable {
+    /// Creates a new resize-table command.
+    pub fn new(
+        slide_id: impl Into<String>,
+        shape_index: usize,
+        column_widths: Vec<f64>,
+        row_heights: Vec<f64>,
+    ) -> Self {
+        Self {
+            slide_id: slide_id.into(),
+            shape_index,
+            column_widths,
+            row_heights,
+        }
+    }
+}
+
+impl Command for ResizeTable {
+    fn apply(&self, deck: &mut Deck) {
+        let Some(slide) = deck.slide_mut(&self.slide_id) else {
+            return;
+        };
+        let Some(shape) = slide.shapes.get_mut(self.shape_index) else {
+            return;
+        };
+        let Shape::Table(table) = shape else {
+            return;
+        };
+        if self.column_widths.len() == table.col_count() {
+            table.column_widths = self.column_widths.clone();
+        }
+        if self.row_heights.len() == table.row_count() {
+            for (row, height) in table.rows.iter_mut().zip(self.row_heights.iter()) {
+                row.height = *height;
+            }
+        }
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        let (prior_widths, prior_heights) = deck
+            .slide(&self.slide_id)
+            .and_then(|slide| slide.shapes.get(self.shape_index))
+            .and_then(|shape| match shape {
+                Shape::Table(table) => Some((
+                    table.column_widths.clone(),
+                    table.rows.iter().map(|row| row.height).collect(),
+                )),
+                _ => None,
+            })
+            .unwrap_or_default();
+        Box::new(Self {
+            slide_id: self.slide_id.clone(),
+            shape_index: self.shape_index,
+            column_widths: prior_widths,
+            row_heights: prior_heights,
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        let Some(slide) = deck.slide(&self.slide_id) else {
+            return false;
+        };
+        let Some(shape) = slide.shapes.get(self.shape_index) else {
+            return false;
+        };
+        let Shape::Table(table) = shape else {
+            return false;
+        };
+        self.column_widths.len() == table.col_count()
+            && self.row_heights.len() == table.row_count()
+            && table.row_count() <= MAX_TABLE_ROWS
+            && table.col_count() <= MAX_TABLE_COLS
+    }
+}
+
+/// Inserts a row into a table shape at a given index.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InsertRow {
+    slide_id: String,
+    shape_index: usize,
+    index: usize,
+    row: TableRow,
+}
+
+impl InsertRow {
+    /// Creates a new insert-row command.
+    pub fn new(
+        slide_id: impl Into<String>,
+        shape_index: usize,
+        index: usize,
+        row: TableRow,
+    ) -> Self {
+        Self {
+            slide_id: slide_id.into(),
+            shape_index,
+            index,
+            row,
+        }
+    }
+}
+
+impl Command for InsertRow {
+    fn apply(&self, deck: &mut Deck) {
+        let Some(slide) = deck.slide_mut(&self.slide_id) else {
+            return;
+        };
+        let Some(shape) = slide.shapes.get_mut(self.shape_index) else {
+            return;
+        };
+        let Shape::Table(table) = shape else {
+            return;
+        };
+        if self.index <= table.rows.len() {
+            table.rows.insert(self.index, self.row.clone());
+        }
+    }
+
+    fn inverse(&self, _deck: &Deck) -> Box<dyn Command> {
+        Box::new(DeleteRow::new(
+            self.slide_id.clone(),
+            self.shape_index,
+            self.index,
+        ))
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        let Some(slide) = deck.slide(&self.slide_id) else {
+            return false;
+        };
+        let Some(shape) = slide.shapes.get(self.shape_index) else {
+            return false;
+        };
+        let Shape::Table(table) = shape else {
+            return false;
+        };
+        self.index <= table.row_count()
+            && self.row.cells.len() == table.col_count()
+            && table.row_count() < MAX_TABLE_ROWS
+    }
+}
+
+/// Removes a row from a table shape at a given index.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeleteRow {
+    slide_id: String,
+    shape_index: usize,
+    index: usize,
+}
+
+impl DeleteRow {
+    /// Creates a new delete-row command.
+    pub fn new(slide_id: impl Into<String>, shape_index: usize, index: usize) -> Self {
+        Self {
+            slide_id: slide_id.into(),
+            shape_index,
+            index,
+        }
+    }
+}
+
+impl Command for DeleteRow {
+    fn apply(&self, deck: &mut Deck) {
+        let Some(slide) = deck.slide_mut(&self.slide_id) else {
+            return;
+        };
+        let Some(shape) = slide.shapes.get_mut(self.shape_index) else {
+            return;
+        };
+        let Shape::Table(table) = shape else {
+            return;
+        };
+        if self.index < table.rows.len() {
+            table.rows.remove(self.index);
+        }
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        let row = deck
+            .slide(&self.slide_id)
+            .and_then(|slide| slide.shapes.get(self.shape_index))
+            .and_then(|shape| match shape {
+                Shape::Table(table) => table.rows.get(self.index).cloned(),
+                _ => None,
+            })
+            .unwrap_or_else(|| TableRow {
+                height: 0.0,
+                cells: Vec::new(),
+            });
+        Box::new(InsertRow::new(
+            self.slide_id.clone(),
+            self.shape_index,
+            self.index,
+            row,
+        ))
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        let Some(slide) = deck.slide(&self.slide_id) else {
+            return false;
+        };
+        let Some(shape) = slide.shapes.get(self.shape_index) else {
+            return false;
+        };
+        let Shape::Table(table) = shape else {
+            return false;
+        };
+        table.row_count() > 1 && self.index < table.row_count()
+    }
+}
+
+/// Inserts a column into a table shape at a given index.
+///
+/// Each row gains a new empty cell at `index`, and `column_widths` gains
+/// `width` at `index`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InsertColumn {
+    slide_id: String,
+    shape_index: usize,
+    index: usize,
+    width: f64,
+}
+
+impl InsertColumn {
+    /// Creates a new insert-column command.
+    pub fn new(slide_id: impl Into<String>, shape_index: usize, index: usize, width: f64) -> Self {
+        Self {
+            slide_id: slide_id.into(),
+            shape_index,
+            index,
+            width,
+        }
+    }
+}
+
+impl Command for InsertColumn {
+    fn apply(&self, deck: &mut Deck) {
+        let Some(slide) = deck.slide_mut(&self.slide_id) else {
+            return;
+        };
+        let Some(shape) = slide.shapes.get_mut(self.shape_index) else {
+            return;
+        };
+        let Shape::Table(table) = shape else {
+            return;
+        };
+        if self.index > table.col_count() {
+            return;
+        }
+        for row in &mut table.rows {
+            if self.index <= row.cells.len() {
+                row.cells.insert(self.index, TableCell::default());
+            }
+        }
+        if self.index <= table.column_widths.len() {
+            table.column_widths.insert(self.index, self.width);
+        }
+    }
+
+    fn inverse(&self, _deck: &Deck) -> Box<dyn Command> {
+        Box::new(DeleteColumn::new(
+            self.slide_id.clone(),
+            self.shape_index,
+            self.index,
+        ))
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        let Some(slide) = deck.slide(&self.slide_id) else {
+            return false;
+        };
+        let Some(shape) = slide.shapes.get(self.shape_index) else {
+            return false;
+        };
+        let Shape::Table(table) = shape else {
+            return false;
+        };
+        self.index <= table.col_count() && table.col_count() < MAX_TABLE_COLS
+    }
+}
+
+/// Removes a column from a table shape at a given index.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeleteColumn {
+    slide_id: String,
+    shape_index: usize,
+    index: usize,
+}
+
+impl DeleteColumn {
+    /// Creates a new delete-column command.
+    pub fn new(slide_id: impl Into<String>, shape_index: usize, index: usize) -> Self {
+        Self {
+            slide_id: slide_id.into(),
+            shape_index,
+            index,
+        }
+    }
+}
+
+impl Command for DeleteColumn {
+    fn apply(&self, deck: &mut Deck) {
+        let Some(slide) = deck.slide_mut(&self.slide_id) else {
+            return;
+        };
+        let Some(shape) = slide.shapes.get_mut(self.shape_index) else {
+            return;
+        };
+        let Shape::Table(table) = shape else {
+            return;
+        };
+        if self.index >= table.col_count() {
+            return;
+        }
+        for row in &mut table.rows {
+            if self.index < row.cells.len() {
+                row.cells.remove(self.index);
+            }
+        }
+        if self.index < table.column_widths.len() {
+            table.column_widths.remove(self.index);
+        }
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        let table = deck
+            .slide(&self.slide_id)
+            .and_then(|slide| slide.shapes.get(self.shape_index))
+            .and_then(|shape| match shape {
+                Shape::Table(table) => Some(table),
+                _ => None,
+            });
+        let (cells, width) = match table {
+            Some(table) if self.index < table.col_count() => {
+                let cells = table
+                    .rows
+                    .iter()
+                    .map(|row| row.cells.get(self.index).cloned().unwrap_or_default())
+                    .collect::<Vec<_>>();
+                let width = table.column_widths.get(self.index).copied().unwrap_or(0.0);
+                (cells, width)
+            }
+            _ => (Vec::new(), 0.0),
+        };
+        Box::new(RestoreColumn {
+            slide_id: self.slide_id.clone(),
+            shape_index: self.shape_index,
+            index: self.index,
+            cells,
+            width,
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        let Some(slide) = deck.slide(&self.slide_id) else {
+            return false;
+        };
+        let Some(shape) = slide.shapes.get(self.shape_index) else {
+            return false;
+        };
+        let Shape::Table(table) = shape else {
+            return false;
+        };
+        table.col_count() > 1 && self.index < table.col_count()
+    }
+}
+
+/// Inverse of [`DeleteColumn`]: re-inserts a captured column (cells plus width)
+/// at a given index.
+///
+/// This carries the exact cells removed by [`DeleteColumn`] so undo restores
+/// the full column, including cell text and style. It is not normally
+/// constructed directly by callers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct RestoreColumn {
+    slide_id: String,
+    shape_index: usize,
+    index: usize,
+    cells: Vec<TableCell>,
+    width: f64,
+}
+
+impl Command for RestoreColumn {
+    fn apply(&self, deck: &mut Deck) {
+        let Some(slide) = deck.slide_mut(&self.slide_id) else {
+            return;
+        };
+        let Some(shape) = slide.shapes.get_mut(self.shape_index) else {
+            return;
+        };
+        let Shape::Table(table) = shape else {
+            return;
+        };
+        if self.index > table.col_count() {
+            return;
+        }
+        for (row, cell) in table.rows.iter_mut().zip(self.cells.iter()) {
+            if self.index <= row.cells.len() {
+                row.cells.insert(self.index, cell.clone());
+            }
+        }
+        if self.index <= table.column_widths.len() {
+            table.column_widths.insert(self.index, self.width);
+        }
+    }
+
+    fn inverse(&self, _deck: &Deck) -> Box<dyn Command> {
+        Box::new(DeleteColumn::new(
+            self.slide_id.clone(),
+            self.shape_index,
+            self.index,
         ))
     }
 
@@ -2732,5 +3695,696 @@ mod tests {
             Err(CommandError::InvalidCommand)
         );
         assert_eq!(bus.undo_len(), 0);
+    }
+
+    fn sample_table() -> TableShape {
+        TableShape::default_grid(3, 3, Rect::new(0.0, 0.0, 9000.0, 6000.0))
+    }
+
+    fn filled_table() -> TableShape {
+        let frame = Rect::new(0.0, 0.0, 914_400.0, 685_800.0);
+        let cell = |text: &str| TableCell {
+            text: text.to_string(),
+            fill: Some(Fill::Solid(Color::rgb(200, 200, 200))),
+            borders: None,
+            align: CellAlign::Left,
+        };
+        let rows = vec![
+            TableRow {
+                height: 200_000.0,
+                cells: vec![cell("A1"), cell("B1"), cell("C1")],
+            },
+            TableRow {
+                height: 200_000.0,
+                cells: vec![cell("A2"), cell("B2"), cell("C2")],
+            },
+        ];
+        TableShape::new(
+            Transform {
+                frame,
+                rotation: 0.0,
+            },
+            rows,
+            vec![300_000.0, 300_000.0, 300_000.0],
+        )
+        .expect("valid table")
+    }
+
+    #[test]
+    fn table_new_validates_invariants() {
+        let row = |cols: usize| TableRow {
+            height: 100.0,
+            cells: (0..cols).map(|_| TableCell::default()).collect(),
+        };
+
+        let ok = TableShape::new(
+            Transform::default(),
+            vec![row(3), row(3), row(3)],
+            vec![10.0, 20.0, 30.0],
+        );
+        let table = ok.expect("valid 3x3 table");
+        assert_eq!(table.row_count(), 3);
+        assert_eq!(table.col_count(), 3);
+        assert!(!table.header_row);
+        assert_eq!(table.default_borders, TableBorders::default());
+        assert!(table.validate());
+
+        assert_eq!(
+            TableShape::new(Transform::default(), Vec::new(), Vec::new()),
+            Err(TableError::Empty)
+        );
+        assert_eq!(
+            TableShape::new(Transform::default(), vec![row(3), row(2)], vec![1.0, 1.0]),
+            Err(TableError::RaggedRows)
+        );
+        assert_eq!(
+            TableShape::new(Transform::default(), vec![row(3)], vec![1.0, 1.0]),
+            Err(TableError::ColumnCountMismatch { got: 2, want: 3 })
+        );
+
+        let big_rows = (0..51).map(|_| row(51)).collect::<Vec<_>>();
+        let big_widths = (0..51).map(|_| 1.0).collect::<Vec<_>>();
+        assert_eq!(
+            TableShape::new(Transform::default(), big_rows, big_widths),
+            Err(TableError::TooLarge { rows: 51, cols: 51 })
+        );
+
+        let max_rows = (0..50).map(|_| row(50)).collect::<Vec<_>>();
+        let max_widths = (0..50).map(|_| 1.0).collect::<Vec<_>>();
+        assert!(TableShape::new(Transform::default(), max_rows, max_widths).is_ok());
+    }
+
+    #[test]
+    fn table_default_grid_builds_equal_grid() {
+        let frame = Rect::new(0.0, 0.0, 9000.0, 6000.0);
+        let table = TableShape::default_grid(3, 3, frame);
+        assert_eq!(table.row_count(), 3);
+        assert_eq!(table.col_count(), 3);
+        assert_eq!(table.transform.frame, frame);
+        assert_eq!(table.transform.rotation, 0.0);
+        assert_eq!(table.column_widths, vec![3000.0, 3000.0, 3000.0]);
+        assert!(table.rows.iter().all(|r| (r.height - 2000.0).abs() < 1e-9));
+        assert!(table.cell(0, 0).unwrap().text.is_empty());
+        assert!(table.validate());
+    }
+
+    #[test]
+    #[should_panic(expected = "default_grid requires at least one row")]
+    fn table_default_grid_panics_on_zero_rows() {
+        let _ = TableShape::default_grid(0, 3, Rect::new(0.0, 0.0, 1.0, 1.0));
+    }
+
+    #[test]
+    fn table_shape_serializes_and_deserializes() {
+        let mut table = filled_table();
+        table.header_row = true;
+        table.default_borders = TableBorders {
+            top: Some(BorderEdge {
+                color: Color::black(),
+                width_emu: 9525.0,
+                dash: DashStyle::Solid,
+            }),
+            bottom: Some(BorderEdge {
+                color: Color::black(),
+                width_emu: 9525.0,
+                dash: DashStyle::Dash,
+            }),
+            left: None,
+            right: None,
+        };
+        table.cell_mut(1, 1).unwrap().align = CellAlign::Center;
+        table.cell_mut(1, 1).unwrap().borders = Some(TableBorders {
+            left: Some(BorderEdge {
+                color: Color::rgb(255, 0, 0),
+                width_emu: 1000.0,
+                dash: DashStyle::Dot,
+            }),
+            ..Default::default()
+        });
+
+        let json = serde_json::to_string(&table).expect("serialize table");
+        let restored: TableShape = serde_json::from_str(&json).expect("deserialize table");
+        assert_eq!(table, restored);
+        assert!(json.contains("\"header_row\":true"));
+        assert!(json.contains("\"center\""));
+        assert!(json.contains("\"dot\""));
+    }
+
+    #[test]
+    fn old_deck_without_table_deserializes() {
+        let mut deck = Deck::new();
+        deck.media.insert("m".to_string(), sample_media_entry());
+        deck.slides.push(slide_with(
+            "s1",
+            vec![
+                Shape::TextBox(TextBox {
+                    frame: Rect::new(0.0, 0.0, 100.0, 100.0),
+                    paragraphs: Vec::new(),
+                }),
+                Shape::Image(ImageShape {
+                    transform: Transform::default(),
+                    media_ref: "m".to_string(),
+                    crop: None,
+                }),
+                geo_rectangle(),
+                Shape::Passthrough(PassthroughObject {
+                    id: "p".to_string(),
+                    label: "p".to_string(),
+                    source_part: "ppt/slides/slide1.xml".to_string(),
+                    raw_bytes: Vec::new(),
+                    frame: None,
+                }),
+            ],
+        ));
+
+        let json = serde_json::to_string(&deck).expect("serialize");
+        let restored: Deck = serde_json::from_str(&json).expect("old deck must load");
+        assert_eq!(deck, restored);
+        assert!(!json.contains("\"table\""));
+        assert_eq!(restored.slides[0].shapes.len(), 4);
+    }
+
+    #[test]
+    fn add_table_applies_and_undoes() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with("s1", Vec::new()));
+        let original = deck.clone();
+
+        let mut bus = CommandBus::default();
+        bus.apply(Box::new(AddTable::new("s1", sample_table())), &mut deck)
+            .expect("apply");
+        assert_eq!(deck.slides[0].shapes.len(), 1);
+        assert!(matches!(deck.slides[0].shapes[0], Shape::Table(_)));
+
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn add_table_rejects_invalid_table_and_missing_slide() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with("s1", Vec::new()));
+
+        let bad = TableShape {
+            transform: Transform::default(),
+            rows: vec![
+                TableRow {
+                    height: 1.0,
+                    cells: vec![TableCell::default()],
+                },
+                TableRow {
+                    height: 1.0,
+                    cells: vec![TableCell::default(), TableCell::default()],
+                },
+            ],
+            column_widths: vec![1.0],
+            default_borders: TableBorders::default(),
+            header_row: false,
+        };
+
+        let mut bus = CommandBus::default();
+        assert_eq!(
+            bus.apply(Box::new(AddTable::new("s1", bad)), &mut deck),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(
+            bus.apply(
+                Box::new(AddTable::new("missing", sample_table())),
+                &mut deck
+            ),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(bus.undo_len(), 0);
+        assert_eq!(deck.slides[0].shapes.len(), 0);
+    }
+
+    #[test]
+    fn set_cell_text_applies_and_undoes() {
+        let mut deck = Deck::new();
+        deck.slides
+            .push(slide_with("s1", vec![Shape::Table(sample_table())]));
+        let original = deck.clone();
+
+        let mut bus = CommandBus::default();
+        bus.apply(
+            Box::new(SetCellText::new("s1", 0, 1, 2, "hello")),
+            &mut deck,
+        )
+        .expect("apply");
+        let Shape::Table(t) = &deck.slides[0].shapes[0] else {
+            panic!("expected table");
+        };
+        assert_eq!(t.cell(1, 2).unwrap().text, "hello");
+
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn set_cell_text_rejects_bad_indices_and_non_table() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with(
+            "s1",
+            vec![Shape::Table(sample_table()), geo_rectangle()],
+        ));
+
+        let mut bus = CommandBus::default();
+        assert_eq!(
+            bus.apply(Box::new(SetCellText::new("s1", 0, 9, 0, "x")), &mut deck),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(
+            bus.apply(Box::new(SetCellText::new("s1", 0, 0, 9, "x")), &mut deck),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(
+            bus.apply(Box::new(SetCellText::new("s1", 9, 0, 0, "x")), &mut deck),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(
+            bus.apply(Box::new(SetCellText::new("s1", 1, 0, 0, "x")), &mut deck),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(
+            bus.apply(
+                Box::new(SetCellText::new("missing", 0, 0, 0, "x")),
+                &mut deck
+            ),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(bus.undo_len(), 0);
+    }
+
+    #[test]
+    fn set_cell_style_merge_preserves_untouched_fields() {
+        let mut deck = Deck::new();
+        let mut table = sample_table();
+        table.cell_mut(0, 0).unwrap().fill = Some(Fill::Solid(Color::rgb(255, 0, 0)));
+        deck.slides
+            .push(slide_with("s1", vec![Shape::Table(table)]));
+        let original = deck.clone();
+
+        let mut bus = CommandBus::default();
+        bus.apply(
+            Box::new(SetCellStyle::new("s1", 0, 0, 0).align(CellAlign::Center)),
+            &mut deck,
+        )
+        .expect("apply");
+
+        let Shape::Table(t) = &deck.slides[0].shapes[0] else {
+            panic!("expected table");
+        };
+        let cell = t.cell(0, 0).unwrap();
+        assert_eq!(cell.align, CellAlign::Center);
+        assert_eq!(cell.fill, Some(Fill::Solid(Color::rgb(255, 0, 0))));
+
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn set_cell_style_sets_and_clears_fields() {
+        let mut deck = Deck::new();
+        let mut table = sample_table();
+        table.cell_mut(0, 0).unwrap().fill = Some(Fill::Solid(Color::rgb(255, 0, 0)));
+        table.cell_mut(0, 0).unwrap().borders = Some(TableBorders {
+            top: Some(BorderEdge {
+                color: Color::black(),
+                width_emu: 1.0,
+                dash: DashStyle::Solid,
+            }),
+            ..Default::default()
+        });
+        deck.slides
+            .push(slide_with("s1", vec![Shape::Table(table)]));
+        let original = deck.clone();
+
+        let mut bus = CommandBus::default();
+        bus.apply(
+            Box::new(
+                SetCellStyle::new("s1", 0, 0, 0)
+                    .fill(None)
+                    .borders(Some(TableBorders::default()))
+                    .align(CellAlign::Right),
+            ),
+            &mut deck,
+        )
+        .expect("apply");
+
+        let Shape::Table(t) = &deck.slides[0].shapes[0] else {
+            panic!("expected table");
+        };
+        let cell = t.cell(0, 0).unwrap();
+        assert!(cell.fill.is_none(), "fill should be cleared");
+        assert_eq!(cell.borders, Some(TableBorders::default()));
+        assert_eq!(cell.align, CellAlign::Right);
+
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn resize_table_applies_and_undoes() {
+        let mut deck = Deck::new();
+        deck.slides
+            .push(slide_with("s1", vec![Shape::Table(sample_table())]));
+        let original = deck.clone();
+
+        let mut bus = CommandBus::default();
+        bus.apply(
+            Box::new(ResizeTable::new(
+                "s1",
+                0,
+                vec![10.0, 20.0, 30.0],
+                vec![5.0, 15.0, 25.0],
+            )),
+            &mut deck,
+        )
+        .expect("apply");
+        let Shape::Table(t) = &deck.slides[0].shapes[0] else {
+            panic!("expected table");
+        };
+        assert_eq!(t.column_widths, vec![10.0, 20.0, 30.0]);
+        assert_eq!(t.rows[0].height, 5.0);
+        assert_eq!(t.rows[2].height, 25.0);
+
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn resize_table_rejects_mismatched_lengths_and_non_table() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with(
+            "s1",
+            vec![Shape::Table(sample_table()), geo_rectangle()],
+        ));
+
+        let mut bus = CommandBus::default();
+        assert_eq!(
+            bus.apply(
+                Box::new(ResizeTable::new("s1", 0, vec![1.0], vec![1.0, 2.0, 3.0])),
+                &mut deck
+            ),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(
+            bus.apply(
+                Box::new(ResizeTable::new("s1", 0, vec![1.0, 2.0, 3.0], vec![1.0])),
+                &mut deck
+            ),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(
+            bus.apply(
+                Box::new(ResizeTable::new("s1", 1, vec![1.0], Vec::new())),
+                &mut deck
+            ),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(bus.undo_len(), 0);
+    }
+
+    #[test]
+    fn insert_row_applies_and_undoes() {
+        let mut deck = Deck::new();
+        deck.slides
+            .push(slide_with("s1", vec![Shape::Table(sample_table())]));
+        let original = deck.clone();
+
+        let new_row = TableRow {
+            height: 999.0,
+            cells: vec![
+                TableCell {
+                    text: "x".to_string(),
+                    ..Default::default()
+                },
+                TableCell {
+                    text: "y".to_string(),
+                    ..Default::default()
+                },
+                TableCell {
+                    text: "z".to_string(),
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let mut bus = CommandBus::default();
+        bus.apply(
+            Box::new(InsertRow::new("s1", 0, 1, new_row.clone())),
+            &mut deck,
+        )
+        .expect("apply");
+        let Shape::Table(t) = &deck.slides[0].shapes[0] else {
+            panic!("expected table");
+        };
+        assert_eq!(t.row_count(), 4);
+        assert_eq!(t.rows[1].height, 999.0);
+        assert_eq!(t.cell(1, 0).unwrap().text, "x");
+
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn insert_row_rejects_bad_width_index_and_cap() {
+        let mut deck = Deck::new();
+        deck.slides
+            .push(slide_with("s1", vec![Shape::Table(sample_table())]));
+
+        let mut bus = CommandBus::default();
+        let wrong_cells = TableRow {
+            height: 1.0,
+            cells: vec![TableCell::default()],
+        };
+        assert_eq!(
+            bus.apply(Box::new(InsertRow::new("s1", 0, 0, wrong_cells)), &mut deck),
+            Err(CommandError::InvalidCommand)
+        );
+        let good_row = TableRow {
+            height: 1.0,
+            cells: vec![TableCell::default(); 3],
+        };
+        assert_eq!(
+            bus.apply(
+                Box::new(InsertRow::new("s1", 0, 9, good_row.clone())),
+                &mut deck
+            ),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(bus.undo_len(), 0);
+
+        let mut big = sample_table();
+        while big.row_count() < MAX_TABLE_ROWS {
+            big.rows.push(TableRow {
+                height: 1.0,
+                cells: vec![TableCell::default(); 3],
+            });
+        }
+        let mut capped_deck = Deck::new();
+        capped_deck
+            .slides
+            .push(slide_with("s1", vec![Shape::Table(big)]));
+        let mut bus2 = CommandBus::default();
+        assert_eq!(
+            bus2.apply(
+                Box::new(InsertRow::new("s1", 0, 0, good_row)),
+                &mut capped_deck
+            ),
+            Err(CommandError::InvalidCommand)
+        );
+    }
+
+    #[test]
+    fn delete_row_applies_and_restores_on_undo() {
+        let mut deck = Deck::new();
+        let mut table = sample_table();
+        table.cell_mut(1, 0).unwrap().text = "row1".to_string();
+        deck.slides
+            .push(slide_with("s1", vec![Shape::Table(table)]));
+        let original = deck.clone();
+
+        let mut bus = CommandBus::default();
+        bus.apply(Box::new(DeleteRow::new("s1", 0, 1)), &mut deck)
+            .expect("apply");
+        let Shape::Table(t) = &deck.slides[0].shapes[0] else {
+            panic!("expected table");
+        };
+        assert_eq!(t.row_count(), 2);
+        assert_eq!(t.cell(1, 0).unwrap().text, "");
+
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn delete_row_keeps_at_least_one_row() {
+        let mut deck = Deck::new();
+        let table = TableShape::default_grid(1, 2, Rect::new(0.0, 0.0, 100.0, 100.0));
+        deck.slides
+            .push(slide_with("s1", vec![Shape::Table(table)]));
+
+        let mut bus = CommandBus::default();
+        assert_eq!(
+            bus.apply(Box::new(DeleteRow::new("s1", 0, 0)), &mut deck),
+            Err(CommandError::InvalidCommand)
+        );
+    }
+
+    #[test]
+    fn insert_column_applies_and_undoes() {
+        let mut deck = Deck::new();
+        deck.slides
+            .push(slide_with("s1", vec![Shape::Table(sample_table())]));
+        let original = deck.clone();
+
+        let mut bus = CommandBus::default();
+        bus.apply(Box::new(InsertColumn::new("s1", 0, 1, 1234.0)), &mut deck)
+            .expect("apply");
+        let Shape::Table(t) = &deck.slides[0].shapes[0] else {
+            panic!("expected table");
+        };
+        assert_eq!(t.col_count(), 4);
+        assert_eq!(t.column_widths[1], 1234.0);
+        assert!(t.cell(0, 1).unwrap().text.is_empty());
+
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn insert_column_rejects_cap() {
+        let mut table = sample_table();
+        while table.col_count() < MAX_TABLE_COLS {
+            for row in &mut table.rows {
+                row.cells.push(TableCell::default());
+            }
+            table.column_widths.push(1.0);
+        }
+        let mut deck = Deck::new();
+        deck.slides
+            .push(slide_with("s1", vec![Shape::Table(table)]));
+
+        let mut bus = CommandBus::default();
+        assert_eq!(
+            bus.apply(Box::new(InsertColumn::new("s1", 0, 0, 1.0)), &mut deck),
+            Err(CommandError::InvalidCommand)
+        );
+    }
+
+    #[test]
+    fn delete_column_restores_full_column_on_undo() {
+        let mut deck = Deck::new();
+        let mut table = sample_table();
+        for r in 0..3 {
+            table.cell_mut(r, 1).unwrap().text = format!("c{r}");
+            table.cell_mut(r, 1).unwrap().fill = Some(Fill::Solid(Color::rgb(r as u8, 0, 0)));
+        }
+        deck.slides
+            .push(slide_with("s1", vec![Shape::Table(table)]));
+        let original = deck.clone();
+
+        let mut bus = CommandBus::default();
+        bus.apply(Box::new(DeleteColumn::new("s1", 0, 1)), &mut deck)
+            .expect("apply");
+        let Shape::Table(t) = &deck.slides[0].shapes[0] else {
+            panic!("expected table");
+        };
+        assert_eq!(t.col_count(), 2);
+
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn delete_column_keeps_at_least_one_column() {
+        let mut deck = Deck::new();
+        let table = TableShape::default_grid(2, 1, Rect::new(0.0, 0.0, 100.0, 100.0));
+        deck.slides
+            .push(slide_with("s1", vec![Shape::Table(table)]));
+
+        let mut bus = CommandBus::default();
+        assert_eq!(
+            bus.apply(Box::new(DeleteColumn::new("s1", 0, 0)), &mut deck),
+            Err(CommandError::InvalidCommand)
+        );
+    }
+
+    #[test]
+    fn insert_column_then_delete_column_round_trips() {
+        let mut deck = Deck::new();
+        deck.slides
+            .push(slide_with("s1", vec![Shape::Table(sample_table())]));
+        let original = deck.clone();
+
+        let table_cols = |deck: &Deck| match &deck.slides[0].shapes[0] {
+            Shape::Table(t) => t.col_count(),
+            _ => panic!("expected table"),
+        };
+
+        let mut bus = CommandBus::default();
+        bus.apply(Box::new(InsertColumn::new("s1", 0, 2, 500.0)), &mut deck)
+            .expect("insert column");
+        assert_eq!(table_cols(&deck), 4);
+
+        bus.apply(Box::new(DeleteColumn::new("s1", 0, 2)), &mut deck)
+            .expect("delete column");
+        assert_eq!(table_cols(&deck), 3);
+
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(table_cols(&deck), 4);
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn delete_shape_of_whole_table_restores_on_undo() {
+        let mut deck = Deck::new();
+        let mut table = filled_table();
+        table.header_row = true;
+        deck.slides
+            .push(slide_with("s1", vec![geo_rectangle(), Shape::Table(table)]));
+        let original = deck.clone();
+
+        let mut bus = CommandBus::default();
+        bus.apply(Box::new(DeleteShape::new("s1", 1)), &mut deck)
+            .expect("apply");
+        assert_eq!(deck.slides[0].shapes.len(), 1);
+        assert!(matches!(deck.slides[0].shapes[0], Shape::Geometric(_)));
+
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+        let Shape::Table(t) = &deck.slides[0].shapes[1] else {
+            panic!("expected restored table");
+        };
+        assert_eq!(t.row_count(), 2);
+        assert_eq!(t.col_count(), 3);
+        assert!(t.header_row);
+        assert_eq!(t.cell(0, 0).unwrap().text, "A1");
+        assert_eq!(t.cell(1, 2).unwrap().text, "C2");
+    }
+
+    #[test]
+    fn move_shape_moves_table_transform() {
+        let mut deck = Deck::new();
+        deck.slides
+            .push(slide_with("s1", vec![Shape::Table(sample_table())]));
+        let original = deck.clone();
+
+        let moved = Transform {
+            frame: Rect::new(50.0, 60.0, 70.0, 80.0),
+            rotation: 12.0,
+        };
+        let mut bus = CommandBus::default();
+        bus.apply(Box::new(MoveShape::new("s1", 0, moved)), &mut deck)
+            .expect("move table");
+        let Shape::Table(t) = &deck.slides[0].shapes[0] else {
+            panic!("expected table");
+        };
+        assert_eq!(t.transform, moved);
+
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
     }
 }
