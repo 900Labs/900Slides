@@ -394,6 +394,65 @@ pub struct PassthroughSnapshot {
     pub frame: Option<RectDto>,
 }
 
+/// Vertical alignment of a run.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VerticalAlignDto {
+    /// Normal baseline alignment.
+    #[default]
+    Baseline,
+    /// Superscript text.
+    Superscript,
+    /// Subscript text.
+    Subscript,
+}
+
+/// Hyperlink attached to a run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkDto {
+    /// URL target of the link.
+    pub url: String,
+    /// Optional display text override.
+    pub display: Option<String>,
+}
+
+/// Heading level for a paragraph style.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeadingLevelDto {
+    /// Heading level 1.
+    H1,
+    /// Heading level 2.
+    H2,
+    /// Heading level 3.
+    H3,
+    /// Heading level 4.
+    H4,
+    /// Heading level 5.
+    H5,
+    /// Heading level 6.
+    H6,
+}
+
+/// Paragraph-level style data transfer object.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParagraphStyleDto {
+    /// Heading level, if this paragraph is a heading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heading: Option<HeadingLevelDto>,
+    /// Whether this paragraph is a block quote.
+    #[serde(default)]
+    pub blockquote: bool,
+    /// Whether this paragraph is a fenced code block.
+    #[serde(default)]
+    pub code_block: bool,
+    /// Indentation level of the paragraph.
+    #[serde(default)]
+    pub indent_level: u32,
+}
+
 /// Paragraph data transfer object.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -402,6 +461,9 @@ pub struct ParagraphDto {
     pub runs: Vec<RunDto>,
     /// List style of the paragraph.
     pub list_style: String,
+    /// Paragraph-level style.
+    #[serde(default)]
+    pub style: ParagraphStyleDto,
 }
 
 /// Inline text run data transfer object.
@@ -416,6 +478,21 @@ pub struct RunDto {
     pub italic: bool,
     /// Underline formatting.
     pub underline: bool,
+    /// Strikethrough formatting.
+    #[serde(default)]
+    pub strikethrough: bool,
+    /// Vertical alignment of the run.
+    #[serde(default)]
+    pub vertical_align: VerticalAlignDto,
+    /// Hyperlink attached to this run.
+    #[serde(default)]
+    pub link: Option<LinkDto>,
+    /// Inline code flag.
+    #[serde(default)]
+    pub code: bool,
+    /// Run-level font family override.
+    #[serde(default)]
+    pub font_family: Option<String>,
 }
 
 /// Loss ledger warning data transfer object.
@@ -565,6 +642,86 @@ pub fn edit_text_box(
         slide_id,
         shape_index,
         core_paragraphs,
+    ));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Merge-patches a run's style flags and returns the updated deck snapshot.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub fn set_run_style(
+    slide_id: String,
+    shape_index: usize,
+    paragraph_index: usize,
+    run_index: usize,
+    bold: Option<bool>,
+    italic: Option<bool>,
+    underline: Option<bool>,
+    strikethrough: Option<bool>,
+    vertical_align: Option<VerticalAlignDto>,
+    code: Option<bool>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let mut command = slides_core::SetRunStyle::new(
+        slide_id,
+        shape_index,
+        paragraph_index,
+        run_index,
+    );
+    if let Some(bold) = bold {
+        command = command.bold(bold);
+    }
+    if let Some(italic) = italic {
+        command = command.italic(italic);
+    }
+    if let Some(underline) = underline {
+        command = command.underline(underline);
+    }
+    if let Some(strikethrough) = strikethrough {
+        command = command.strikethrough(strikethrough);
+    }
+    if let Some(vertical_align) = vertical_align {
+        command = match vertical_align {
+            VerticalAlignDto::Baseline => command.baseline(),
+            VerticalAlignDto::Superscript => command.superscript(),
+            VerticalAlignDto::Subscript => command.subscript(),
+        };
+    }
+    if let Some(code) = code {
+        command = command.code(code);
+    }
+    session.execute(Box::new(command)).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Replaces a paragraph's style and returns the updated deck snapshot.
+#[tauri::command]
+pub fn set_paragraph_style(
+    slide_id: String,
+    shape_index: usize,
+    paragraph_index: usize,
+    style: ParagraphStyleDto,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let core_style = paragraph_style_to_core(&style);
+    let command = Box::new(slides_core::SetParagraphStyle::new(
+        slide_id,
+        shape_index,
+        paragraph_index,
+        core_style,
     ));
     session.execute(command).map_err(|e| e.to_string())?;
     let snapshot = state.snapshot(session.deck());
@@ -1274,6 +1431,23 @@ fn paragraph_to_dto(paragraph: &slides_core::Paragraph) -> ParagraphDto {
             slides_core::ListStyle::Ordered => "ordered".to_string(),
             slides_core::ListStyle::Unordered => "unordered".to_string(),
         },
+        style: paragraph_style_to_dto(&paragraph.style),
+    }
+}
+
+fn paragraph_style_to_dto(style: &slides_core::ParagraphStyle) -> ParagraphStyleDto {
+    ParagraphStyleDto {
+        heading: style.heading.map(|level| match level {
+            slides_core::HeadingLevel::H1 => HeadingLevelDto::H1,
+            slides_core::HeadingLevel::H2 => HeadingLevelDto::H2,
+            slides_core::HeadingLevel::H3 => HeadingLevelDto::H3,
+            slides_core::HeadingLevel::H4 => HeadingLevelDto::H4,
+            slides_core::HeadingLevel::H5 => HeadingLevelDto::H5,
+            slides_core::HeadingLevel::H6 => HeadingLevelDto::H6,
+        }),
+        blockquote: style.blockquote,
+        code_block: style.code_block,
+        indent_level: style.indent_level,
     }
 }
 
@@ -1283,6 +1457,18 @@ fn run_to_dto(run: &slides_core::Run) -> RunDto {
         bold: run.bold,
         italic: run.italic,
         underline: run.underline,
+        strikethrough: run.strikethrough,
+        vertical_align: match run.vertical_align {
+            slides_core::VerticalAlign::Baseline => VerticalAlignDto::Baseline,
+            slides_core::VerticalAlign::Superscript => VerticalAlignDto::Superscript,
+            slides_core::VerticalAlign::Subscript => VerticalAlignDto::Subscript,
+        },
+        link: run.link.as_ref().map(|link| LinkDto {
+            url: link.url.clone(),
+            display: link.display.clone(),
+        }),
+        code: run.code,
+        font_family: run.font_family.clone(),
     }
 }
 
@@ -1292,6 +1478,15 @@ fn run_from_dto(run: &RunDto) -> slides_core::Run {
         bold: run.bold,
         italic: run.italic,
         underline: run.underline,
+        strikethrough: run.strikethrough,
+        vertical_align: match run.vertical_align {
+            VerticalAlignDto::Baseline => slides_core::VerticalAlign::Baseline,
+            VerticalAlignDto::Superscript => slides_core::VerticalAlign::Superscript,
+            VerticalAlignDto::Subscript => slides_core::VerticalAlign::Subscript,
+        },
+        link: run.link.as_ref().map(|link| slides_core::Link::new_unchecked(link.url.clone())),
+        code: run.code,
+        font_family: run.font_family.clone(),
     }
 }
 
@@ -1303,6 +1498,23 @@ fn paragraph_from_dto(dto: &ParagraphDto) -> slides_core::Paragraph {
             "unordered" => slides_core::ListStyle::Unordered,
             _ => slides_core::ListStyle::None,
         },
+        style: paragraph_style_to_core(&dto.style),
+    }
+}
+
+fn paragraph_style_to_core(style: &ParagraphStyleDto) -> slides_core::ParagraphStyle {
+    slides_core::ParagraphStyle {
+        heading: style.heading.map(|level| match level {
+            HeadingLevelDto::H1 => slides_core::HeadingLevel::H1,
+            HeadingLevelDto::H2 => slides_core::HeadingLevel::H2,
+            HeadingLevelDto::H3 => slides_core::HeadingLevel::H3,
+            HeadingLevelDto::H4 => slides_core::HeadingLevel::H4,
+            HeadingLevelDto::H5 => slides_core::HeadingLevel::H5,
+            HeadingLevelDto::H6 => slides_core::HeadingLevel::H6,
+        }),
+        blockquote: style.blockquote,
+        code_block: style.code_block,
+        indent_level: style.indent_level,
     }
 }
 

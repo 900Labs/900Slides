@@ -1,3 +1,6 @@
+/** Vertical alignment of a run. */
+export type VerticalAlignDto = 'baseline' | 'superscript' | 'subscript'
+
 /** RGBA color. */
 export interface ColorDto {
   r: number
@@ -14,18 +17,34 @@ export interface ThemeSnapshot {
   accentColor: ColorDto
 }
 
+/** Heading level for a paragraph style. */
+export type HeadingLevelDto = 'h1' | 'h2' | 'h3' | 'h4' | 'h5' | 'h6'
+
+/** Paragraph-level style. */
+export interface ParagraphStyleDto {
+  heading?: HeadingLevelDto
+  blockquote: boolean
+  codeBlock: boolean
+  indentLevel: number
+}
+
 /** Inline text run. */
 export interface RunDto {
   text: string
   bold: boolean
   italic: boolean
   underline: boolean
+  strikethrough: boolean
+  verticalAlign: VerticalAlignDto
+  code: boolean
+  fontFamily?: string
 }
 
 /** Paragraph inside a text box. */
 export interface ParagraphDto {
   runs: RunDto[]
   listStyle: 'none' | 'ordered' | 'unordered'
+  style: ParagraphStyleDto
 }
 
 /** Bounding rectangle in EMU. */

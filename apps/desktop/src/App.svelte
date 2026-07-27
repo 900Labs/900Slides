@@ -7,9 +7,12 @@
   import RecoveryPrompt from './RecoveryPrompt.svelte'
   import type {
     DeckSnapshot,
+    HeadingLevelDto,
     ParagraphDto,
     RecoverySnapshot,
+    RunDto,
     SlideSnapshot,
+    TextBoxSnapshot,
     WarningDto,
   } from './lib/types'
 
@@ -104,6 +107,144 @@
     })
   }
 
+  /** Finds the run index in a paragraph that contains the given character position. */
+  function runIndexAtPosition(paragraph: ParagraphDto, position: number): number {
+    if (paragraph.runs.length === 0) return 0
+    let offset = 0
+    for (let i = 0; i < paragraph.runs.length; i++) {
+      const run = paragraph.runs[i]
+      if (position <= offset + run.text.length) {
+        return i
+      }
+      offset += run.text.length
+    }
+    return paragraph.runs.length - 1
+  }
+
+  /** Identifies the active text box, paragraph, and run from the focused textarea. */
+  function getTextTarget():
+    | {
+        slideId: string
+        shapeIndex: number
+        paragraphIndex: number
+        runIndex: number
+        run: RunDto
+        paragraph: ParagraphDto
+      }
+    | null {
+    const active = document.activeElement
+    if (!(active instanceof HTMLTextAreaElement)) return null
+    const slideId = active.dataset.slideId
+    const shapeIndexRaw = active.dataset.shapeIndex
+    if (!slideId || shapeIndexRaw === undefined) return null
+    const shapeIndex = Number(shapeIndexRaw)
+    if (!activeSlide) return null
+    const shape = activeSlide.shapes[shapeIndex]
+    if (!shape || shape.kind !== 'text_box') return null
+    const textBox = shape.value as TextBoxSnapshot
+
+    const selection = active.selectionStart ?? 0
+    const text = active.value
+    const linesBefore = text.slice(0, selection).split('\n')
+    const paragraphIndex = Math.max(0, linesBefore.length - 1)
+    const paragraphText = linesBefore[linesBefore.length - 1] ?? ''
+
+    const paragraph = textBox.paragraphs[paragraphIndex]
+    if (!paragraph) return null
+    const paragraphRunsText = paragraph.runs.map((r) => r.text).join('')
+    const position = paragraphText.length
+    const runIndex =
+      paragraphText === paragraphRunsText
+        ? runIndexAtPosition(paragraph, position)
+        : paragraph.runs.length > 0
+          ? 0
+          : 0
+    const run = paragraph.runs[runIndex] ?? {
+      text: '',
+      bold: false,
+      italic: false,
+      underline: false,
+      strikethrough: false,
+      verticalAlign: 'baseline' as const,
+      code: false,
+    }
+    return { slideId, shapeIndex, paragraphIndex, runIndex, run, paragraph }
+  }
+
+  /** Toggles a run-level boolean flag by wrapping SetRunStyle. */
+  async function toggleRunFlag(flag: 'bold' | 'italic' | 'underline' | 'strikethrough' | 'code'): Promise<void> {
+    const target = getTextTarget()
+    if (!target) return
+    const value = !target.run[flag]
+    deck = await invoke<DeckSnapshot>('set_run_style', {
+      slide_id: target.slideId,
+      shape_index: target.shapeIndex,
+      paragraph_index: target.paragraphIndex,
+      run_index: target.runIndex,
+      [flag]: value,
+    })
+  }
+
+  /** Toggles superscript on the active run. */
+  async function toggleSuperscript(): Promise<void> {
+    const target = getTextTarget()
+    if (!target) return
+    const value = target.run.verticalAlign === 'superscript' ? 'baseline' : 'superscript'
+    deck = await invoke<DeckSnapshot>('set_run_style', {
+      slide_id: target.slideId,
+      shape_index: target.shapeIndex,
+      paragraph_index: target.paragraphIndex,
+      run_index: target.runIndex,
+      vertical_align: value,
+    })
+  }
+
+  /** Toggles subscript on the active run. */
+  async function toggleSubscript(): Promise<void> {
+    const target = getTextTarget()
+    if (!target) return
+    const value = target.run.verticalAlign === 'subscript' ? 'baseline' : 'subscript'
+    deck = await invoke<DeckSnapshot>('set_run_style', {
+      slide_id: target.slideId,
+      shape_index: target.shapeIndex,
+      paragraph_index: target.paragraphIndex,
+      run_index: target.runIndex,
+      vertical_align: value,
+    })
+  }
+
+  /** Applies a heading level to the active paragraph. */
+  async function setHeading(level: HeadingLevelDto | null): Promise<void> {
+    const target = getTextTarget()
+    if (!target) return
+    const style = {
+      ...target.paragraph.style,
+      heading: level ?? undefined,
+    }
+    deck = await invoke<DeckSnapshot>('set_paragraph_style', {
+      slide_id: target.slideId,
+      shape_index: target.shapeIndex,
+      paragraph_index: target.paragraphIndex,
+      style,
+    })
+  }
+
+  /** Toggles a paragraph-level boolean flag. */
+  async function toggleParagraphFlag(flag: 'blockquote' | 'codeBlock'): Promise<void> {
+    const target = getTextTarget()
+    if (!target) return
+    const style = {
+      ...target.paragraph.style,
+      [flag]: !target.paragraph.style[flag],
+    }
+    deck = await invoke<DeckSnapshot>('set_paragraph_style', {
+      slide_id: target.slideId,
+      shape_index: target.shapeIndex,
+      paragraph_index: target.paragraphIndex,
+      style,
+    })
+  }
+
   /** Opens the file picker to choose an image to insert onto the active slide. */
   function onInsertImage(): void {
     imageInput?.click()
@@ -180,6 +321,34 @@
         <button onclick={() => onAddShape('rectangle')} type="button">Rectangle</button>
         <button onclick={() => onAddShape('ellipse')} type="button">Ellipse</button>
         <button onclick={() => onAddShape('triangle')} type="button">Triangle</button>
+      </span>
+      <span class="toolbar-divider"></span>
+      <span class="text-group">
+        <span class="shape-label">Text:</span>
+        <button onclick={() => toggleRunFlag('bold')} type="button" title="Bold">B</button>
+        <button onclick={() => toggleRunFlag('italic')} type="button" title="Italic">I</button>
+        <button onclick={() => toggleRunFlag('underline')} type="button" title="Underline">U</button>
+        <button onclick={() => toggleRunFlag('strikethrough')} type="button" title="Strikethrough">S</button>
+        <button onclick={toggleSuperscript} type="button" title="Superscript">x²</button>
+        <button onclick={toggleSubscript} type="button" title="Subscript">x₂</button>
+        <button onclick={() => toggleRunFlag('code')} type="button" title="Inline code">&lt;/&gt;</button>
+        <select
+          onchange={(event) => {
+            const value = (event.target as HTMLSelectElement).value
+            setHeading(value === 'paragraph' ? null : (value as HeadingLevelDto))
+          }}
+          title="Heading"
+        >
+          <option value="paragraph">Paragraph</option>
+          <option value="h1">Heading 1</option>
+          <option value="h2">Heading 2</option>
+          <option value="h3">Heading 3</option>
+          <option value="h4">Heading 4</option>
+          <option value="h5">Heading 5</option>
+          <option value="h6">Heading 6</option>
+        </select>
+        <button onclick={() => toggleParagraphFlag('blockquote')} type="button" title="Blockquote">Quote</button>
+        <button onclick={() => toggleParagraphFlag('codeBlock')} type="button" title="Code block">Block</button>
       </span>
       <input
         bind:this={imageInput}
@@ -279,6 +448,14 @@
     display: flex;
     align-items: center;
     gap: 0.25rem;
+  }
+  .text-group {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+  }
+  .text-group select {
+    padding: 0.3rem 0.4rem;
   }
   .shape-label {
     font-size: 0.85rem;
