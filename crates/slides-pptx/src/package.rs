@@ -22,6 +22,9 @@ pub const REL_TYPE_NOTES_SLIDE: &str =
 /// Relationship type for image (picture) media parts embedded in a slide.
 pub const REL_TYPE_IMAGE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image";
+/// Relationship type for hyperlink relationships on a slide.
+pub const REL_TYPE_HYPERLINK: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink";
 /// 900Slides manifest relationship type.
 pub const REL_TYPE_MANIFEST: &str = "http://900labs.github.io/900Slides/1.0/relationships/manifest";
 

@@ -228,4 +228,6 @@ const A_NS: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
 const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 
 #[cfg(test)]
+mod rich_text_tests;
+#[cfg(test)]
 mod tests;
