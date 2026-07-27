@@ -8,8 +8,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 This section tracks work toward v0.2.0 (editor completeness). See
-[`docs/ROADMAP.md`](docs/ROADMAP.md) and
-[`docs/sprint-records/wave-1.md`](docs/sprint-records/wave-1.md).
+[`docs/ROADMAP.md`](docs/ROADMAP.md),
+[`docs/sprint-records/wave-1.md`](docs/sprint-records/wave-1.md), and
+[`docs/sprint-records/wave-2.md`](docs/sprint-records/wave-2.md).
+
+### Added — Wave 2 (rich text)
+
+- Rich-text runs in `slides-core`: `Run` gains `strikethrough`,
+  `vertical_align` (baseline / superscript / subscript), `link`, `code`
+  (inline monospace), and `font_family`. `Paragraph` gains a `ParagraphStyle`
+  block carrying `heading` (H1-H6), `blockquote`, `code_block`, and
+  `indent_level`. All additive with `#[serde(default)]`; v0.1.0 / Wave 1
+  decks still load unchanged.
+- `Link::new` validates the URL against a scheme allowlist (mailto, tel,
+  fragment, relative paths) and rejects `javascript:`, `vbscript:`, `mocha:`,
+  `livescript:`, `http:`, `https:`, `file:`, `data:`, any unknown scheme, and
+  control characters. `Link::new_unchecked` preserves an existing link for
+  the loader (used with a loss warning when a target fails the allowlist).
+- Two new reversible commands: `SetRunStyle` (merge-patch over a single run's
+  style flags) and `SetParagraphStyle` (replace a paragraph's style block).
+  Each produces a verified inverse.
+- `slides-render` renders every new property to deterministic SVG:
+  strikethrough (combined with underline), super/subscript (`baseline-shift`
+  tspan), links (`<a href>` with escaped URL), inline code (monospace),
+  headings (scaled font sizes), blockquote (vertical bar + italic), code
+  blocks (monospace + background rect), and indent levels.
+- PPTX loader maps OOXML run/paragraph properties onto the new model
+  (`strike`, `baseline` for super/sub, `a:hlinkClick` for links, `a:latin`
+  typeface for code/fonts, `pStyle` for headings, `lvl` for indent) and the
+  saver emits them. Hyperlinks reuse the existing relationship infrastructure
+  with `External` target mode. Disallowed link schemes are preserved
+  unchecked with a per-slide loss warning (transparent fidelity). The
+  lossless-passthrough guarantee is unchanged (untouched parts stay
+  byte-for-byte identical).
+- Two new Tauri commands: `set_run_style` and `set_paragraph_style`, wired
+  through the transactional command bus. The Svelte canvas renders all new
+  rich-text properties via CSS classes; the toolbar exposes strikethrough,
+  superscript, subscript, inline-code toggles, a heading dropdown (H1-H6),
+  and blockquote / code-block paragraph toggles.
+- `docs/sprint-records/wave-2.md` documenting the wave scope, the shared
+  model contract, component specs, and acceptance criteria.
 
 ### Added — Wave 1 (images and geometric shapes, first-class)
 

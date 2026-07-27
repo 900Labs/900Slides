@@ -22,7 +22,8 @@ the deck model, lossless PPTX editing, a basic editor, and recovery.
 What v0.1.0 does:
 
 - Opens `.pptx` files and edits **text boxes**: paragraphs, bold, italic,
-  underline, and ordered or unordered lists.
+  underline, strikethrough, super/subscript, inline code, links, headings
+  (H1-H6), blockquotes, fenced code blocks, and indent levels.
 - Edits **images and geometric shapes** (rectangle, rounded rectangle,
   ellipse, triangle, line, arrow, right-arrow callout, five-point star) with
   fill, outline, shadow, rotation, and crop. Insert an image through the
@@ -159,10 +160,11 @@ Run the complete local gate before opening a pull request:
 ./scripts/verify-local.sh
 ```
 
-The workspace test suite is 90 Rust tests, zero clippy warnings, and a clean
+The workspace test suite is 107 Rust tests, zero clippy warnings, and a clean
 svelte-check. The Rust suite includes generated PPTX round-trip tests that
-assert untouched parts are byte-identical after edits, and determinism tests
-for the renderer.
+assert untouched parts are byte-identical after edits, determinism tests
+for the renderer, and sanitizer/allowlist tests for image ingest and link
+URLs.
 
 ## Contributing and support
 
