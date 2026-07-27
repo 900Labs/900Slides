@@ -7,9 +7,9 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::QName;
 use quick_xml::{Reader, Writer};
 use slides_core::{
-    Color, Crop, DashStyle, Deck, Fill, GeometricShape, ImageShape, ListStyle, MediaEntry,
-    MediaStore, Outline, Paragraph, PassthroughObject, Rect, Run, Shadow, Shape, Slide, Style,
-    TextBox, Theme, Transform,
+    Color, Crop, DashStyle, Deck, Fill, GeometricShape, ImageShape, Link, ListStyle, MediaEntry,
+    MediaStore, Outline, Paragraph, ParagraphStyle, PassthroughObject, Rect, Run, Shadow, Shape,
+    Slide, Style, TextBox, Theme, Transform, VerticalAlign,
 };
 
 use crate::error::{Error, Result};
@@ -17,8 +17,8 @@ use crate::geometry;
 use crate::ledger::{LossLedger, LossWarning};
 use crate::media as pkgmedia;
 use crate::package::{
-    find_rel_by_type, parse_rels, Rel, REL_TYPE_IMAGE, REL_TYPE_MANIFEST, REL_TYPE_NOTES_SLIDE,
-    REL_TYPE_OFFICE_DOCUMENT, REL_TYPE_SLIDE, REL_TYPE_THEME,
+    find_rel_by_type, parse_rels, Rel, REL_TYPE_HYPERLINK, REL_TYPE_IMAGE, REL_TYPE_MANIFEST,
+    REL_TYPE_NOTES_SLIDE, REL_TYPE_OFFICE_DOCUMENT, REL_TYPE_SLIDE, REL_TYPE_THEME,
 };
 
 pub(crate) const SHAPE_ELEMENT_NAMES: &[&str] =
@@ -86,37 +86,46 @@ pub fn read_entry_to_bytes(
     Ok(buf)
 }
 
-/// Resolved media for a slide: a relationship-id view (used while parsing the
-/// slide XML) plus the per-content-key relationship id (used by the saver).
+/// Resolved relationships for a single slide: media embeddings and hyperlinks.
 #[derive(Debug, Default, Clone)]
-pub(crate) struct SlideMedia {
+pub(crate) struct SlideRels {
     /// `r:embed` relationship id -> media content key (into `deck.media`).
-    pub by_rid: HashMap<String, String>,
-    /// media content key -> relationship id (the inverse of [`Self::by_rid`]).
+    pub media_by_rid: HashMap<String, String>,
+    /// media content key -> relationship id (the inverse of [`Self::media_by_rid`]).
     pub rid_by_media: HashMap<String, String>,
+    /// `r:id` -> hyperlink target URL for external hyperlinks on the slide.
+    pub hyperlink_by_rid: HashMap<String, String>,
 }
 
 /// Loads every image referenced by a slide's relationships into the deck media
-/// store, returning the resolved relationship mapping.
+/// store and resolves hyperlink targets, returning the resolved relationship
+/// mapping.
 ///
 /// Each image part is ingested through `slides_media` (MIME sniff, EXIF strip,
 /// size/dimension caps) and stored under a content-addressed key. A failure to
 /// ingest a single part is recorded as a loss warning rather than aborting the
 /// whole load.
-fn load_slide_media(
+fn load_slide_rels(
     archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
     slide_path: &str,
     media: &mut MediaStore,
     ledger: &mut LossLedger,
-) -> Result<SlideMedia> {
+) -> Result<SlideRels> {
     let rels_path = rels_path_for(slide_path);
     let rels_xml = match read_entry_to_string(archive, &rels_path) {
         Ok(xml) => xml,
-        Err(_) => return Ok(SlideMedia::default()),
+        Err(_) => return Ok(SlideRels::default()),
     };
     let rels = parse_rels(&rels_xml)?;
     let base = base_dir(slide_path);
-    let mut out = SlideMedia::default();
+    let mut out = SlideRels::default();
+
+    for rel in &rels {
+        if rel.rel_type == REL_TYPE_HYPERLINK && rel.is_external() {
+            out.hyperlink_by_rid
+                .insert(rel.id.clone(), rel.target.clone());
+        }
+    }
 
     for rel in rels.iter().filter(|r| r.rel_type == REL_TYPE_IMAGE) {
         let Some(part_path) = rel.resolve(&base) else {
@@ -154,7 +163,7 @@ fn load_slide_media(
                 },
             );
         }
-        out.by_rid.insert(rel.id.clone(), key.clone());
+        out.media_by_rid.insert(rel.id.clone(), key.clone());
         out.rid_by_media.insert(key, rel.id.clone());
     }
 
@@ -226,15 +235,15 @@ pub fn load(bytes: &[u8]) -> Result<LoadResult> {
             ));
             continue;
         };
-        let slide_media = load_slide_media(&mut archive, slide_path, &mut deck.media, &mut ledger)?;
+        let slide_rels = load_slide_rels(&mut archive, slide_path, &mut deck.media, &mut ledger)?;
         let slide_xml = read_entry_to_string(&mut archive, slide_path)?;
-        let mut slide = parse_slide(&slide_xml, slide_path, &slide_media.by_rid, &mut ledger)?;
+        let mut slide = parse_slide(&slide_xml, slide_path, &slide_rels, &mut ledger)?;
         slide.id = slide_path.to_string();
         if let Ok(notes) = load_slide_notes(&mut archive, slide_path) {
             slide.notes = notes;
         }
         slide_paths.insert(slide_path.to_string(), slide_path.to_string());
-        slide_media_rids.insert(slide_path.to_string(), slide_media.rid_by_media);
+        slide_media_rids.insert(slide_path.to_string(), slide_rels.rid_by_media);
         deck.slides.push(slide);
     }
 
@@ -299,7 +308,7 @@ fn parse_presentation(xml: &str) -> Result<Vec<String>> {
 fn parse_slide(
     xml: &str,
     slide_id: &str,
-    slide_media: &HashMap<String, String>,
+    slide_rels: &SlideRels,
     ledger: &mut LossLedger,
 ) -> Result<Slide> {
     let mut reader = Reader::from_str(xml);
@@ -322,7 +331,7 @@ fn parse_slide(
                     let captured_str = String::from_utf8_lossy(&captured).into_owned();
 
                     if local == "pic" {
-                        match parse_pic(&captured_str, slide_media) {
+                        match parse_pic(&captured_str, slide_rels) {
                             Some(image) => shapes.push(Shape::Image(image)),
                             None => {
                                 ledger.add(LossWarning::new(
@@ -343,7 +352,7 @@ fn parse_slide(
                         if let Some(geometric) = parse_geometric(&captured_str) {
                             shapes.push(Shape::Geometric(geometric));
                         } else if captured_str.contains("<p:txBody") {
-                            match parse_text_box(&captured_str) {
+                            match parse_text_box(&captured_str, slide_id, slide_rels, ledger) {
                                 Ok(text_box) => shapes.push(Shape::TextBox(text_box)),
                                 Err(err) => {
                                     ledger.add(LossWarning::new(
@@ -456,7 +465,12 @@ where
     Ok(())
 }
 
-fn parse_text_box(xml: &str) -> Result<TextBox> {
+fn parse_text_box(
+    xml: &str,
+    slide_id: &str,
+    slide_rels: &SlideRels,
+    ledger: &mut LossLedger,
+) -> Result<TextBox> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
@@ -464,11 +478,16 @@ fn parse_text_box(xml: &str) -> Result<TextBox> {
     let mut paragraphs = Vec::new();
     let mut frame: Option<Rect> = None;
 
-    let mut current_paragraph: Option<(Vec<Run>, ListStyle)> = None;
+    let mut current_paragraph: Option<(Vec<Run>, ListStyle, u32)> = None;
     let mut current_run_text = String::new();
     let mut current_run_bold = false;
     let mut current_run_italic = false;
     let mut current_run_underline = false;
+    let mut current_run_strikethrough = false;
+    let mut current_run_vertical_align = VerticalAlign::Baseline;
+    let mut current_run_hlink_rid: Option<String> = None;
+    let mut current_run_font: Option<String> = None;
+    let mut current_run_code = false;
 
     let mut in_xfrm = false;
     let mut in_ppr = false;
@@ -495,8 +514,13 @@ fn parse_text_box(xml: &str) -> Result<TextBox> {
                             parse_attr_f64(&e, "cy").unwrap_or(0.0),
                         ));
                     }
-                    "p" => current_paragraph = Some((Vec::new(), ListStyle::None)),
-                    "pPr" => in_ppr = true,
+                    "p" => current_paragraph = Some((Vec::new(), ListStyle::None, 0)),
+                    "pPr" => {
+                        in_ppr = true;
+                        if let Some(ref mut para) = current_paragraph {
+                            para.2 = parse_attr_u32(&e, "lvl").unwrap_or(0);
+                        }
+                    }
                     "buAutoNum" if in_ppr => {
                         if let Some(ref mut para) = current_paragraph {
                             para.1 = ListStyle::Ordered;
@@ -517,11 +541,33 @@ fn parse_text_box(xml: &str) -> Result<TextBox> {
                         current_run_bold = false;
                         current_run_italic = false;
                         current_run_underline = false;
+                        current_run_strikethrough = false;
+                        current_run_vertical_align = VerticalAlign::Baseline;
+                        current_run_hlink_rid = None;
+                        current_run_font = None;
+                        current_run_code = false;
                     }
                     "rPr" => {
                         current_run_bold = parse_bool_attr(&e, "b").unwrap_or(false);
                         current_run_italic = parse_bool_attr(&e, "i").unwrap_or(false);
                         current_run_underline = parse_underline_attr(&e);
+                        current_run_strikethrough = parse_strikethrough_attr(&e);
+                        current_run_vertical_align = parse_vertical_align_attr(&e);
+                    }
+                    "hlinkClick" => {
+                        if let Some(rid) = rel_attribute(&e, "id") {
+                            current_run_hlink_rid = Some(rid);
+                        }
+                    }
+                    "latin" | "cs" | "ea" => {
+                        if let Some(typeface) = attr_by_local_name(&e, "typeface") {
+                            if !typeface.is_empty() && current_run_font.is_none() {
+                                current_run_font = Some(typeface.clone());
+                                if is_code_font(&typeface) {
+                                    current_run_code = true;
+                                }
+                            }
+                        }
                     }
                     "t" => in_text = true,
                     _ => {}
@@ -546,7 +592,13 @@ fn parse_text_box(xml: &str) -> Result<TextBox> {
                         paragraphs.push(Paragraph {
                             runs: Vec::new(),
                             list_style: ListStyle::None,
+                            ..Default::default()
                         });
+                    }
+                    "pPr" => {
+                        if let Some(ref mut para) = current_paragraph {
+                            para.2 = parse_attr_u32(&e, "lvl").unwrap_or(0);
+                        }
                     }
                     "buAutoNum" if in_ppr => {
                         if let Some(ref mut para) = current_paragraph {
@@ -564,22 +616,31 @@ fn parse_text_box(xml: &str) -> Result<TextBox> {
                         }
                     }
                     "r" => {
-                        let bold = parse_bool_attr(&e, "b").unwrap_or(false);
-                        let italic = parse_bool_attr(&e, "i").unwrap_or(false);
-                        let underline = parse_underline_attr(&e);
                         if let Some(ref mut para) = current_paragraph {
-                            para.0.push(Run {
-                                text: String::new(),
-                                bold,
-                                italic,
-                                underline,
-                            });
+                            para.0.push(Run::default());
                         }
                     }
                     "rPr" => {
                         current_run_bold = parse_bool_attr(&e, "b").unwrap_or(false);
                         current_run_italic = parse_bool_attr(&e, "i").unwrap_or(false);
                         current_run_underline = parse_underline_attr(&e);
+                        current_run_strikethrough = parse_strikethrough_attr(&e);
+                        current_run_vertical_align = parse_vertical_align_attr(&e);
+                    }
+                    "hlinkClick" => {
+                        if let Some(rid) = rel_attribute(&e, "id") {
+                            current_run_hlink_rid = Some(rid);
+                        }
+                    }
+                    "latin" | "cs" | "ea" => {
+                        if let Some(typeface) = attr_by_local_name(&e, "typeface") {
+                            if !typeface.is_empty() && current_run_font.is_none() {
+                                current_run_font = Some(typeface.clone());
+                                if is_code_font(&typeface) {
+                                    current_run_code = true;
+                                }
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -601,19 +662,45 @@ fn parse_text_box(xml: &str) -> Result<TextBox> {
                         ext = None;
                     }
                     "p" => {
-                        if let Some((runs, list_style)) = current_paragraph.take() {
-                            paragraphs.push(Paragraph { runs, list_style });
+                        if let Some((runs, list_style, indent_level)) = current_paragraph.take() {
+                            paragraphs.push(Paragraph {
+                                runs,
+                                list_style,
+                                style: ParagraphStyle {
+                                    indent_level,
+                                    ..Default::default()
+                                },
+                            });
                         }
                     }
                     "pPr" => in_ppr = false,
                     "r" => {
                         if let Some(ref mut para) = current_paragraph {
+                            let text = std::mem::take(&mut current_run_text);
+                            let link = resolve_hlink(
+                                current_run_hlink_rid.take().as_deref(),
+                                slide_id,
+                                slide_rels,
+                                ledger,
+                            );
                             para.0.push(Run {
-                                text: std::mem::take(&mut current_run_text),
+                                text,
                                 bold: current_run_bold,
                                 italic: current_run_italic,
                                 underline: current_run_underline,
+                                strikethrough: current_run_strikethrough,
+                                vertical_align: current_run_vertical_align,
+                                link,
+                                code: current_run_code,
+                                font_family: current_run_font.take(),
                             });
+                            current_run_bold = false;
+                            current_run_italic = false;
+                            current_run_underline = false;
+                            current_run_strikethrough = false;
+                            current_run_vertical_align = VerticalAlign::Baseline;
+                            current_run_font = None;
+                            current_run_code = false;
                         }
                     }
                     "t" => in_text = false,
@@ -630,6 +717,30 @@ fn parse_text_box(xml: &str) -> Result<TextBox> {
         frame: frame.unwrap_or_else(|| Rect::new(0.0, 0.0, 0.0, 0.0)),
         paragraphs,
     })
+}
+
+/// Resolves a hyperlink relationship id to a [`Link`], recording a loss warning
+/// when the URL fails the model's safety allowlist.
+fn resolve_hlink(
+    hlink_rid: Option<&str>,
+    slide_id: &str,
+    slide_rels: &SlideRels,
+    ledger: &mut LossLedger,
+) -> Option<Link> {
+    let rid = hlink_rid?;
+    let url = slide_rels.hyperlink_by_rid.get(rid)?;
+    match Link::new(url) {
+        Ok(link) => Some(link),
+        Err(_) => {
+            ledger.add(LossWarning::new(
+                slide_id,
+                format!(
+                    "hyperlink URL '{url}' does not pass the link allowlist; preserved unchecked"
+                ),
+            ));
+            Some(Link::new_unchecked(url))
+        }
+    }
 }
 
 fn parse_frame(xml: &str) -> Option<Rect> {
@@ -971,10 +1082,10 @@ fn find_subslice(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 ///
 /// Returns `None` when the picture has no resolvable `r:embed` relationship
 /// (for example, an empty placeholder), so the caller can preserve it opaquely.
-fn parse_pic(captured: &str, slide_media: &HashMap<String, String>) -> Option<ImageShape> {
+fn parse_pic(captured: &str, slide_rels: &SlideRels) -> Option<ImageShape> {
     let props = parse_shape_props(captured);
     let embed = props.blip_embed.as_deref()?;
-    let media_ref = slide_media.get(embed)?;
+    let media_ref = slide_rels.media_by_rid.get(embed)?;
     Some(ImageShape {
         transform: props.transform.unwrap_or_default(),
         media_ref: media_ref.clone(),
@@ -1254,6 +1365,49 @@ fn parse_underline_attr(e: &BytesStart<'_>) -> bool {
     attr_by_local_name(e, "u")
         .map(|v| !v.eq_ignore_ascii_case("none"))
         .unwrap_or(false)
+}
+
+fn parse_strikethrough_attr(e: &BytesStart<'_>) -> bool {
+    attr_by_local_name(e, "strike")
+        .map(|v| !v.eq_ignore_ascii_case("noStrike") && !v.eq_ignore_ascii_case("none"))
+        .unwrap_or(false)
+}
+
+fn parse_vertical_align_attr(e: &BytesStart<'_>) -> VerticalAlign {
+    attr_by_local_name(e, "baseline")
+        .and_then(|v| v.parse::<i64>().ok())
+        .map(|v| {
+            if v > 0 {
+                VerticalAlign::Superscript
+            } else if v < 0 {
+                VerticalAlign::Subscript
+            } else {
+                VerticalAlign::Baseline
+            }
+        })
+        .unwrap_or_default()
+}
+
+fn parse_attr_u32(e: &BytesStart<'_>, name: &str) -> Option<u32> {
+    attr_by_local_name(e, name)?.parse().ok()
+}
+
+fn is_code_font(typeface: &str) -> bool {
+    let lower = typeface.to_ascii_lowercase();
+    [
+        "consolas",
+        "courier new",
+        "courier",
+        "lucida console",
+        "monaco",
+        "menlo",
+        "monospace",
+        "source code pro",
+        "jetbrains mono",
+        "fira code",
+    ]
+    .iter()
+    .any(|name| lower.contains(name))
 }
 
 fn parse_hex_color(hex: &str) -> Option<Color> {
