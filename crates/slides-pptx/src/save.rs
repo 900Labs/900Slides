@@ -6,8 +6,9 @@ use std::io::{Cursor, Read, Write};
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::{Reader, Writer};
 use slides_core::{
-    Crop, DashStyle, Fill, GeometricShape, Geometry, ImageShape, ListStyle, Outline, Paragraph,
-    Run, Shape, Slide, TextBox, Transform, VerticalAlign,
+    BorderEdge, CellAlign, Crop, DashStyle, Fill, GeometricShape, Geometry, ImageShape, ListStyle,
+    Outline, Paragraph, Run, Shape, Slide, TableCell, TableShape, TextBox, Transform,
+    VerticalAlign,
 };
 use zip::write::{FileOptions, ZipWriter};
 
@@ -481,7 +482,11 @@ fn write_model_shape<W: Write>(
         Shape::Passthrough(object) => {
             writer.get_mut().write_all(&object.raw_bytes)?;
         }
-        Shape::Table(_) => {}
+        Shape::Table(table) => {
+            let name = format!("Table {}", index + 1);
+            let xml = table_graphic_frame_xml(table, id, &name);
+            writer.get_mut().write_all(xml.as_bytes())?;
+        }
     }
     Ok(())
 }
@@ -560,6 +565,17 @@ fn patch_slide_xml(
                                 if matches!(shape, Shape::Geometric(_)) && local == "sp" =>
                             {
                                 patch_shape_xml_into(&mut writer, &captured, shape, rids)?;
+                                Some(shape)
+                            }
+                            Some(shape)
+                                if matches!(shape, Shape::Table(_)) && local == "graphicFrame" =>
+                            {
+                                if let Shape::Table(table) = shape {
+                                    let frame_id = 100_000 + shape_idx as i64;
+                                    let name = format!("Table {}", shape_idx + 1);
+                                    let xml = table_graphic_frame_xml(table, frame_id, &name);
+                                    writer.get_mut().write_all(xml.as_bytes())?;
+                                }
                                 Some(shape)
                             }
                             _ => {
@@ -804,7 +820,11 @@ fn append_shape<W: Write>(
             writer.get_mut().write_all(b"</p:txBody></p:sp>")?;
         }
         Shape::Passthrough(_) => {}
-        Shape::Table(_) => {}
+        Shape::Table(table) => {
+            let name = format!("Table {}", index + 1);
+            let xml = table_graphic_frame_xml(table, id, &name);
+            writer.get_mut().write_all(xml.as_bytes())?;
+        }
     }
     Ok(())
 }
@@ -868,17 +888,22 @@ fn outline_xml(outline: &Option<Outline>) -> String {
     let Some(o) = outline else {
         return String::new();
     };
-    let dash = match o.dash {
+    format!(
+        "<a:ln w=\"{}\"><a:solidFill><a:srgbClr val=\"{}\"/></a:solidFill><a:prstDash val=\"{}\"/></a:ln>",
+        emu(o.width_emu),
+        hex_color(&o.color),
+        dash_prst(&o.dash)
+    )
+}
+
+/// Maps a model [`DashStyle`] to its OOXML `prstDash` value.
+fn dash_prst(dash: &DashStyle) -> &'static str {
+    match dash {
         DashStyle::Solid => "solid",
         DashStyle::Dash => "dash",
         DashStyle::Dot => "dot",
         DashStyle::DashDot => "dashDot",
-    };
-    format!(
-        "<a:ln w=\"{}\"><a:solidFill><a:srgbClr val=\"{}\"/></a:solidFill><a:prstDash val=\"{dash}\"/></a:ln>",
-        emu(o.width_emu),
-        hex_color(&o.color)
-    )
+    }
 }
 
 /// Builds an `<a:effectLst>` with an outer shadow, or an empty string.
@@ -963,6 +988,124 @@ fn sp_element_xml(geo: &GeometricShape, id: i64, name: &str) -> String {
         "<p:sp><p:nvSpPr><p:cNvPr id=\"{id}\" name=\"{name}\"/><p:cNvSpPr><a:spLocks/></p:cNvSpPr><p:nvPr/></p:nvSpPr>{}<p:txBody><a:bodyPr/><a:lstStyle/><a:p/></p:txBody></p:sp>",
         geometric_sp_pr_xml(geo)
     )
+}
+
+const TABLE_GRAPHIC_URI: &str = "http://schemas.openxmlformats.org/drawingml/2006/table";
+
+/// Builds a complete `<p:graphicFrame>` element for a table shape.
+///
+/// The frame carries a `p:xfrm` (off/ext plus rotation), and a `a:graphic`/
+/// `a:graphicData` block containing the full `a:tbl`. Tables are emitted only
+/// for dirty slides, so untouched frames stay byte-for-byte identical (§4.9).
+fn table_graphic_frame_xml(table: &TableShape, id: i64, name: &str) -> String {
+    let f = table.transform.frame;
+    let rot = if table.transform.rotation != 0.0 {
+        format!(
+            " rot=\"{}\"",
+            (table.transform.rotation * 60_000.0).round() as i64
+        )
+    } else {
+        String::new()
+    };
+    let first_row = if table.header_row { "1" } else { "0" };
+
+    let mut grid = String::new();
+    for &w in &table.column_widths {
+        grid.push_str(&format!("<a:gridCol w=\"{}\"/>", emu(w)));
+    }
+
+    let mut rows_xml = String::new();
+    for row in &table.rows {
+        rows_xml.push_str(&format!("<a:tr h=\"{}\">", emu(row.height)));
+        for cell in &row.cells {
+            rows_xml.push_str(&table_cell_xml(cell));
+        }
+        rows_xml.push_str("</a:tr>");
+    }
+
+    format!(
+        "<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id=\"{id}\" name=\"{name}\"/>\
+         <p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr>\
+         <p:xfrm{rot}><a:off x=\"{}\" y=\"{}\"/><a:ext cx=\"{}\" cy=\"{}\"/></p:xfrm>\
+         <a:graphic><a:graphicData uri=\"{TABLE_GRAPHIC_URI}\">\
+         <a:tbl><a:tblPr firstRow=\"{first_row}\"/><a:tblGrid>{grid}</a:tblGrid>{rows_xml}</a:tbl>\
+         </a:graphicData></a:graphic></p:graphicFrame>",
+        emu(f.x),
+        emu(f.y),
+        emu(f.width),
+        emu(f.height)
+    )
+}
+
+/// Builds a single `<a:tc>` element: a plain-text `a:txBody` and an `a:tcPr`
+/// with the cell's fill and per-edge border overrides.
+fn table_cell_xml(cell: &TableCell) -> String {
+    let ppr = match cell.align {
+        CellAlign::Left => String::new(),
+        CellAlign::Center => "<a:pPr algn=\"ctr\"/>".to_string(),
+        CellAlign::Right => "<a:pPr algn=\"r\"/>".to_string(),
+    };
+    let text = escape_xml_text(&cell.text);
+    let txbody = format!(
+        "<a:txBody><a:bodyPr/><a:lstStyle/><a:p>{ppr}\
+         <a:r><a:rPr/><a:t xml:space=\"preserve\">{text}</a:t></a:r></a:p></a:txBody>"
+    );
+    let tcpr = table_tc_pr_xml(cell);
+    format!("<a:tc>{txbody}{tcpr}</a:tc>")
+}
+
+/// Builds the `<a:tcPr>` element for a cell. Schema order is borders first
+/// (`a:lnL`, `a:lnR`, `a:lnT`, `a:lnB`) then the fill (`a:solidFill`). A cell
+/// with no explicit borders omits the border children (inheriting the table
+/// default); a cell with no fill omits the fill.
+fn table_tc_pr_xml(cell: &TableCell) -> String {
+    let mut inner = String::new();
+    if let Some(borders) = &cell.borders {
+        if let Some(e) = &borders.left {
+            inner.push_str(&table_ln_xml("a:lnL", e));
+        }
+        if let Some(e) = &borders.right {
+            inner.push_str(&table_ln_xml("a:lnR", e));
+        }
+        if let Some(e) = &borders.top {
+            inner.push_str(&table_ln_xml("a:lnT", e));
+        }
+        if let Some(e) = &borders.bottom {
+            inner.push_str(&table_ln_xml("a:lnB", e));
+        }
+    }
+    if let Some(Fill::Solid(color)) = &cell.fill {
+        inner.push_str(&format!(
+            "<a:solidFill><a:srgbClr val=\"{}\"/></a:solidFill>",
+            hex_color(color)
+        ));
+    }
+    format!("<a:tcPr>{inner}</a:tcPr>")
+}
+
+/// Builds a single border-edge `<a:lnX>` element for a cell.
+fn table_ln_xml(tag: &str, edge: &BorderEdge) -> String {
+    format!(
+        "<{tag} w=\"{}\"><a:solidFill><a:srgbClr val=\"{}\"/></a:solidFill><a:prstDash val=\"{}\"/></{tag}>",
+        emu(edge.width_emu),
+        hex_color(&edge.color),
+        dash_prst(&edge.dash)
+    )
+}
+
+/// Escapes a text string for inclusion as XML character data.
+fn escape_xml_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 fn write_patched_text_box<W: Write>(

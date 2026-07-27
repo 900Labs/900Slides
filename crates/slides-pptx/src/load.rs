@@ -7,9 +7,10 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::QName;
 use quick_xml::{Reader, Writer};
 use slides_core::{
-    Color, Crop, DashStyle, Deck, Fill, GeometricShape, ImageShape, Link, ListStyle, MediaEntry,
-    MediaStore, Outline, Paragraph, ParagraphStyle, PassthroughObject, Rect, Run, Shadow, Shape,
-    Slide, Style, TextBox, Theme, Transform, VerticalAlign,
+    BorderEdge, CellAlign, Color, Crop, DashStyle, Deck, Fill, GeometricShape, ImageShape, Link,
+    ListStyle, MediaEntry, MediaStore, Outline, Paragraph, ParagraphStyle, PassthroughObject, Rect,
+    Run, Shadow, Shape, Slide, Style, TableBorders, TableCell, TableError, TableRow, TableShape,
+    TextBox, Theme, Transform, VerticalAlign, MAX_TABLE_COLS, MAX_TABLE_ROWS,
 };
 
 use crate::error::{Error, Result};
@@ -369,6 +370,23 @@ fn parse_slide(
                                     }));
                                 }
                             }
+                        } else {
+                            ledger.add(LossWarning::new(
+                                slide_id,
+                                format!("preserved {local} as opaque object; not editable"),
+                            ));
+                            let frame = parse_frame(&captured_str);
+                            shapes.push(Shape::Passthrough(PassthroughObject {
+                                id: extract_id(&captured_str, shapes.len()),
+                                label: local,
+                                source_part: slide_id.to_string(),
+                                raw_bytes: captured,
+                                frame,
+                            }));
+                        }
+                    } else if local == "graphicFrame" {
+                        if let Some(table) = parse_table(&captured_str, slide_id, ledger) {
+                            shapes.push(Shape::Table(table));
                         } else {
                             ledger.add(LossWarning::new(
                                 slide_id,
@@ -1123,6 +1141,346 @@ fn parse_geometric(captured: &str) -> Option<GeometricShape> {
             shadow: props.shadow,
         },
     })
+}
+
+/// Which of a cell's four edges a parsed `<a:lnL/R/T/B>` element targets.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BorderSide {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+/// Accumulator for a single streaming pass over a captured `<p:graphicFrame>`.
+#[derive(Default)]
+struct TableParseState {
+    in_xfrm: bool,
+    off: Option<(f64, f64)>,
+    ext: Option<(f64, f64)>,
+    rot: Option<f64>,
+    found_tbl: bool,
+    in_grid: bool,
+    in_tr: bool,
+    in_tc: bool,
+    in_txbody: bool,
+    in_p: bool,
+    in_r: bool,
+    in_t: bool,
+    in_tcpr: bool,
+    column_widths: Vec<f64>,
+    header_row: bool,
+    rows: Vec<TableRow>,
+    row_height: f64,
+    row_cells: Vec<TableCell>,
+    cell_text: String,
+    cell_fill: Option<Color>,
+    cell_align: CellAlign,
+    cell_align_set: bool,
+    cell_has_rich: bool,
+    edge_left: Option<BorderEdge>,
+    edge_right: Option<BorderEdge>,
+    edge_top: Option<BorderEdge>,
+    edge_bottom: Option<BorderEdge>,
+    run_marks: bool,
+    cur_side: Option<BorderSide>,
+    border_w: f64,
+    border_color: Option<Color>,
+    border_dash: Option<DashStyle>,
+}
+
+/// Handles a start (or empty) element during table parsing.
+fn table_start(e: &BytesStart<'_>, st: &mut TableParseState) {
+    let local = qname_str(e.name());
+    match local.as_str() {
+        "xfrm" => {
+            st.in_xfrm = true;
+            st.rot = parse_attr_f64(e, "rot");
+        }
+        "off" if st.in_xfrm => {
+            st.off = Some((
+                parse_attr_f64(e, "x").unwrap_or(0.0),
+                parse_attr_f64(e, "y").unwrap_or(0.0),
+            ));
+        }
+        "ext" if st.in_xfrm => {
+            st.ext = Some((
+                parse_attr_f64(e, "cx").unwrap_or(0.0),
+                parse_attr_f64(e, "cy").unwrap_or(0.0),
+            ));
+        }
+        "tbl" => st.found_tbl = true,
+        "tblPr" => st.header_row = parse_bool_attr(e, "firstRow").unwrap_or(false),
+        "tblGrid" => st.in_grid = true,
+        "gridCol" if st.in_grid => {
+            st.column_widths.push(parse_attr_f64(e, "w").unwrap_or(0.0));
+        }
+        "tr" if st.found_tbl => {
+            st.in_tr = true;
+            st.row_height = parse_attr_f64(e, "h").unwrap_or(0.0);
+            st.row_cells.clear();
+        }
+        "tc" if st.in_tr => {
+            st.in_tc = true;
+            st.cell_text.clear();
+            st.cell_fill = None;
+            st.cell_align = CellAlign::Left;
+            st.cell_align_set = false;
+            st.cell_has_rich = false;
+            st.edge_left = None;
+            st.edge_right = None;
+            st.edge_top = None;
+            st.edge_bottom = None;
+        }
+        "txBody" if st.in_tc => st.in_txbody = true,
+        "p" if st.in_txbody => st.in_p = true,
+        "pPr" if st.in_p => {
+            if !st.cell_align_set {
+                if let Some(a) = attr_by_local_name(e, "algn") {
+                    st.cell_align = parse_algn(&a);
+                    st.cell_align_set = true;
+                }
+            }
+        }
+        "r" if st.in_p => {
+            st.in_r = true;
+            st.run_marks = false;
+        }
+        "rPr" if st.in_r => {
+            let b = parse_bool_attr(e, "b").unwrap_or(false);
+            let i = parse_bool_attr(e, "i").unwrap_or(false);
+            let u = parse_underline_attr(e);
+            let s = parse_strikethrough_attr(e);
+            let va = !matches!(parse_vertical_align_attr(e), VerticalAlign::Baseline);
+            if b || i || u || s || va {
+                st.run_marks = true;
+            }
+        }
+        "t" if st.in_r => st.in_t = true,
+        "tcPr" if st.in_tc => st.in_tcpr = true,
+        "lnL" if st.in_tcpr => {
+            st.cur_side = Some(BorderSide::Left);
+            st.border_w = parse_attr_f64(e, "w").unwrap_or(9525.0);
+            st.border_color = None;
+            st.border_dash = None;
+        }
+        "lnR" if st.in_tcpr => {
+            st.cur_side = Some(BorderSide::Right);
+            st.border_w = parse_attr_f64(e, "w").unwrap_or(9525.0);
+            st.border_color = None;
+            st.border_dash = None;
+        }
+        "lnT" if st.in_tcpr => {
+            st.cur_side = Some(BorderSide::Top);
+            st.border_w = parse_attr_f64(e, "w").unwrap_or(9525.0);
+            st.border_color = None;
+            st.border_dash = None;
+        }
+        "lnB" if st.in_tcpr => {
+            st.cur_side = Some(BorderSide::Bottom);
+            st.border_w = parse_attr_f64(e, "w").unwrap_or(9525.0);
+            st.border_color = None;
+            st.border_dash = None;
+        }
+        "prstDash" if st.cur_side.is_some() => {
+            if let Some(v) = attr_by_local_name(e, "val") {
+                st.border_dash = Some(parse_dash(&v));
+            }
+        }
+        "srgbClr" if st.in_tcpr => {
+            if let Some(hex) = attr_by_local_name(e, "val") {
+                if let Some(color) = parse_hex_color(&hex) {
+                    if st.cur_side.is_some() {
+                        st.border_color = Some(color);
+                    } else {
+                        st.cell_fill = Some(color);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Handles an end element during table parsing, finalizing rows, cells, and
+/// border edges. A rich-text run inside a cell records a loss warning.
+fn table_end(local: &str, st: &mut TableParseState, ledger: &mut LossLedger, slide_id: &str) {
+    match local {
+        "xfrm" => st.in_xfrm = false,
+        "tblGrid" => st.in_grid = false,
+        "tr" if st.in_tr => {
+            st.in_tr = false;
+            st.rows.push(TableRow {
+                height: st.row_height,
+                cells: std::mem::take(&mut st.row_cells),
+            });
+        }
+        "tc" if st.in_tc => {
+            st.in_tc = false;
+            let borders = if st.edge_left.is_none()
+                && st.edge_right.is_none()
+                && st.edge_top.is_none()
+                && st.edge_bottom.is_none()
+            {
+                None
+            } else {
+                Some(TableBorders {
+                    top: st.edge_top.take(),
+                    bottom: st.edge_bottom.take(),
+                    left: st.edge_left.take(),
+                    right: st.edge_right.take(),
+                })
+            };
+            if st.cell_has_rich {
+                ledger.add(LossWarning::new(
+                    slide_id,
+                    "table cell rich text collapsed to plain text".to_string(),
+                ));
+            }
+            st.row_cells.push(TableCell {
+                text: std::mem::take(&mut st.cell_text),
+                fill: st.cell_fill.take().map(Fill::Solid),
+                borders,
+                align: st.cell_align,
+            });
+        }
+        "txBody" => st.in_txbody = false,
+        "p" => st.in_p = false,
+        "r" if st.in_r => {
+            st.in_r = false;
+            if st.run_marks {
+                st.cell_has_rich = true;
+            }
+        }
+        "t" => st.in_t = false,
+        "tcPr" => st.in_tcpr = false,
+        "lnL" | "lnR" | "lnT" | "lnB" if st.cur_side.is_some() => {
+            if let Some(side) = st.cur_side.take() {
+                if let Some(color) = st.border_color.take() {
+                    let edge = BorderEdge {
+                        color,
+                        width_emu: st.border_w,
+                        dash: st.border_dash.take().unwrap_or_default(),
+                    };
+                    match side {
+                        BorderSide::Left => st.edge_left = Some(edge),
+                        BorderSide::Right => st.edge_right = Some(edge),
+                        BorderSide::Top => st.edge_top = Some(edge),
+                        BorderSide::Bottom => st.edge_bottom = Some(edge),
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Maps an OOXML `@algn` value to a [`CellAlign`].
+fn parse_algn(val: &str) -> CellAlign {
+    match val {
+        "ctr" => CellAlign::Center,
+        "r" => CellAlign::Right,
+        _ => CellAlign::Left,
+    }
+}
+
+/// Parses a captured `<p:graphicFrame>` element into a [`TableShape`].
+///
+/// Returns `Some(table)` when the frame carries a `<a:tbl>` and it can be
+/// modeled (clamping + warning when it exceeds the 50x50 cap). Returns `None`
+/// when the frame has no `<a:tbl>` (e.g. a chart or SmartArt) or is malformed,
+/// so the caller preserves it as an opaque passthrough object.
+fn parse_table(captured: &str, slide_id: &str, ledger: &mut LossLedger) -> Option<TableShape> {
+    let mut reader = Reader::from_str(captured);
+    reader.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+    let mut st = TableParseState::default();
+
+    while let Ok(ev) = reader.read_event_into(&mut buf) {
+        match ev {
+            Event::Start(ref e) => table_start(e, &mut st),
+            Event::Empty(ref e) => {
+                table_start(e, &mut st);
+                let local = qname_str(e.name());
+                table_end(&local, &mut st, ledger, slide_id);
+            }
+            Event::End(ref e) => {
+                let local = qname_str(e.name());
+                table_end(&local, &mut st, ledger, slide_id);
+            }
+            Event::Text(ref t) => {
+                if st.in_t {
+                    st.cell_text.push_str(&t.unescape().unwrap_or_default());
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    if !st.found_tbl {
+        return None;
+    }
+
+    let transform = match (st.off, st.ext) {
+        (Some((x, y)), Some((cx, cy))) => Transform {
+            frame: Rect::new(x, y, cx, cy),
+            rotation: st.rot.map(|r| r / 60_000.0).unwrap_or(0.0),
+        },
+        _ => Transform::default(),
+    };
+
+    let TableParseState {
+        mut rows,
+        mut column_widths,
+        header_row,
+        ..
+    } = st;
+
+    // Enforce the 50x50 cap (PRODUCT_SPEC.md §5.2): truncate rows/columns and
+    // warn rather than rejecting the whole table.
+    let too_large =
+        rows.len() > MAX_TABLE_ROWS || rows.first().is_some_and(|r| r.cells.len() > MAX_TABLE_COLS);
+    if too_large {
+        ledger.add(LossWarning::new(
+            slide_id,
+            format!(
+                "table exceeds the 50x50 cell limit ({}x{}); truncated",
+                rows.len(),
+                rows.first().map_or(0, |r| r.cells.len())
+            ),
+        ));
+        rows.truncate(MAX_TABLE_ROWS);
+        for r in &mut rows {
+            r.cells.truncate(MAX_TABLE_COLS);
+        }
+        if column_widths.len() > MAX_TABLE_COLS {
+            column_widths.truncate(MAX_TABLE_COLS);
+        }
+    }
+
+    match TableShape::new(transform, rows, column_widths) {
+        Ok(mut table) => {
+            table.header_row = header_row;
+            Some(table)
+        }
+        Err(TableError::TooLarge { rows, cols }) => {
+            // Pre-clamping should have prevented this; guard anyway.
+            ledger.add(LossWarning::new(
+                slide_id,
+                format!("table exceeds the 50x50 cell limit ({rows}x{cols}); preserved as opaque"),
+            ));
+            None
+        }
+        Err(err) => {
+            ledger.add(LossWarning::new(
+                slide_id,
+                format!("malformed table preserved as opaque object: {err}"),
+            ));
+            None
+        }
+    }
 }
 
 /// Extracts the `r:embed` relationship id from a captured picture element.
