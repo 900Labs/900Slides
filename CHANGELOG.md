@@ -11,8 +11,44 @@ This section tracks work toward v0.2.0 (editor completeness). See
 [`docs/ROADMAP.md`](docs/ROADMAP.md),
 [`docs/sprint-records/wave-1.md`](docs/sprint-records/wave-1.md),
 [`docs/sprint-records/wave-2.md`](docs/sprint-records/wave-2.md),
-[`docs/sprint-records/wave-3.md`](docs/sprint-records/wave-3.md), and
-[`docs/sprint-records/wave-4.md`](docs/sprint-records/wave-4.md).
+[`docs/sprint-records/wave-3.md`](docs/sprint-records/wave-3.md),
+[`docs/sprint-records/wave-4.md`](docs/sprint-records/wave-4.md), and
+[`docs/sprint-records/wave-5.md`](docs/sprint-records/wave-5.md).
+
+### Added — Wave 5 (animations and transitions)
+
+- Animations and transitions are now first-class. The reserved
+  `Option<Animation>` and `Option<Transition>` fields on `Slide` are filled
+  with real types: `Transition` (kind + duration), `TransitionKind` (none,
+  fade, slide, push, wipe), `Animation` (ordered build step sequence),
+  `BuildStep` (shape index + effect + duration), and `BuildEffect` (fade,
+  slide-in left/right/top/bottom, appear, disappear). All additive; old
+  decks deserialize unchanged (`None` by default).
+- Five reversible commands: `SetTransition`, `SetSlideAnimation`,
+  `AddBuildStep`, `RemoveBuildStepAt`, `MoveBuildStep`. Each produces a
+  verified inverse; shape indices are validated at apply time.
+- New `slides-animation` crate (no longer a stub) computes a deterministic
+  timeline from the model (`build_timeline`) and exposes CSS class/keyframe
+  helpers. Same input always yields identical output — no `HashMap`
+  iteration. This satisfies the ROADMAP risk-register determinism
+  requirement.
+- `slides-render` wraps animated shapes in tagged `<g>` groups and emits a
+  `<style>` block of `@keyframes`; the hooks are inert in the static editor
+  SVG and activated by the presenter via CSS.
+- PPTX loader parses `p:transition` (fade, push, wipe, slide, cut) and the
+  simple `p:timing` build-in subset (`p:animEffect` with `filter`), mapping
+  OOXML shape ids back to model indices. Complex or unrecognized timing
+  falls back to passthrough with a loss warning (no panic). The saver
+  patches `p:transition` and regenerates `p:timing` for dirty slides;
+  untouched slides and all non-slide parts stay byte-for-byte identical.
+- Five new Tauri commands (`set_transition`, `set_slide_animation`,
+  `add_build_step`, `remove_build_step`, `move_build_step`). The Svelte
+  editor has a transition picker, per-shape build-in menu, and a build-order
+  list. The presenter advances build steps on click and plays transitions
+  between slides.
+- `docs/sprint-records/wave-5.md` documenting the wave scope, the shape
+  identity decision (index-based for v0.2.0; stable IDs deferred to v0.3.0),
+  and acceptance criteria.
 
 ### Added — Wave 4 (charts)
 

@@ -51,10 +51,13 @@ What v0.1.0 does:
 - Recovers work after a crash or accidental quit via debounced autosave
   snapshots and a startup recovery prompt.
 - Undoes every edit through a transactional command bus with bounded history.
+- Animates **build-ins** (fade, slide-in from any edge, appear, disappear)
+  with an ordered build-sequence editor, and plays **transitions** (none,
+  fade, slide, push, wipe) between slides. The presenter reveals shapes
+  step-by-step on each click.
 
 What v0.1.0 does **not** do yet:
 
-- Animate builds or transitions.
 - Export to PDF, PNG, SVG, or ODP.
 - Spell-check.
 - Support aspect ratios other than 16:9.
@@ -147,7 +150,7 @@ crates/slides-pptx/       PPTX load and save (native format)
 crates/slides-odp/        ODP import / export conversion boundary (stub)
 crates/slides-pdf/        PDF export and image-per-page import (stub)
 crates/slides-render/     Deterministic slide rendering to SVG
-crates/slides-animation/  Deterministic build and transition playback (stub)
+crates/slides-animation/  Deterministic build-in timeline and CSS playback
 crates/slides-chart/      Chart data model and deterministic SVG previews
 crates/slides-spell/      Spell-check dictionary boundary (stub)
 crates/slides-media/      Image ingest, EXIF strip, MIME allowlist, SVG sanitize
