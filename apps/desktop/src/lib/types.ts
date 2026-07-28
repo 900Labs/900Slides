@@ -137,14 +137,56 @@ export interface GeometricShapeSnapshot {
   style: StyleDto
 }
 
+/** Horizontal alignment of cell text. */
+export type CellAlignDto = 'left' | 'center' | 'right'
+
+/** A single border edge: color, width, and dash style. */
+export interface BorderEdgeDto {
+  color: ColorDto
+  widthEmu: number
+  dash: DashStyleDto
+}
+
+/** The four borders of a cell (or the table default). */
+export interface TableBordersDto {
+  top?: BorderEdgeDto
+  bottom?: BorderEdgeDto
+  left?: BorderEdgeDto
+  right?: BorderEdgeDto
+}
+
+/** A single cell in a table. */
+export interface TableCellDto {
+  text: string
+  fill?: FillDto
+  borders?: TableBordersDto
+  align: CellAlignDto
+}
+
+/** A single row of cells in a table. */
+export interface TableRowDto {
+  height: number
+  cells: TableCellDto[]
+}
+
+/** Table shape snapshot: a grid of editable cells. */
+export interface TableShapeSnapshot {
+  transform: TransformDto
+  rows: TableRowDto[]
+  columnWidths: number[]
+  defaultBorders: TableBordersDto
+  headerRow: boolean
+}
+
 /** Shape snapshot union. */
 export interface ShapeSnapshot {
-  kind: 'text_box' | 'passthrough' | 'image' | 'geometric'
+  kind: 'text_box' | 'passthrough' | 'image' | 'geometric' | 'table'
   value:
     | TextBoxSnapshot
     | PassthroughSnapshot
     | ImageShapeSnapshot
     | GeometricShapeSnapshot
+    | TableShapeSnapshot
 }
 
 /** Slide snapshot. */
