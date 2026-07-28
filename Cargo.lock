@@ -1273,6 +1273,9 @@ version = "0.1.0"
 [[package]]
 name = "slides-chart"
 version = "0.1.0"
+dependencies = [
+ "slides-core",
+]
 
 [[package]]
 name = "slides-core"
