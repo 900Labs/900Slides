@@ -6,9 +6,9 @@ use std::io::{Cursor, Read, Write};
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::{Reader, Writer};
 use slides_core::{
-    BorderEdge, CellAlign, Crop, DashStyle, Fill, GeometricShape, Geometry, ImageShape, ListStyle,
-    Outline, Paragraph, Run, Shape, Slide, TableCell, TableShape, TextBox, Transform,
-    VerticalAlign,
+    Animation, BorderEdge, BuildEffect, BuildStep, CellAlign, Crop, DashStyle, Fill,
+    GeometricShape, Geometry, ImageShape, ListStyle, Outline, Paragraph, Run, Shape, Slide,
+    TableCell, TableShape, TextBox, Transform, Transition, TransitionKind, VerticalAlign,
 };
 use zip::write::{FileOptions, ZipWriter};
 
@@ -18,7 +18,9 @@ use crate::chart::{
 };
 use crate::error::{Error, Result};
 use crate::geometry;
-use crate::load::{copy_element, extract_blip_embed, rels_path_for, SHAPE_ELEMENT_NAMES};
+use crate::load::{
+    attr_by_local_name, copy_element, extract_blip_embed, rels_path_for, SHAPE_ELEMENT_NAMES,
+};
 use crate::media as pkgmedia;
 use crate::package::{
     parse_rels, write_content_types, write_rels, Rel, CT_MANIFEST, REL_TYPE_CHART,
@@ -671,12 +673,300 @@ fn patch_chart_frame_xml<W: Write>(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Transition and animation patching (Wave 5 component 5)
+// ---------------------------------------------------------------------------
+
+/// Returns the generated `p:cNvPr` id for a model shape at `index`.
 ///
-/// Editable text boxes have their paragraphs rewritten; modeled images and
-/// geometric shapes have their `<p:spPr>` (and `<p:blipFill>` for pictures)
-/// regenerated from the model while every other element on the slide —
-/// pictures, transitions, timing, backgrounds, non-editable shapes — is copied
-/// through untouched. Shapes added since load are appended to the shape tree.
+/// The saver emits all model shapes with ids starting at `100_000`, so the
+/// generated timing XML targets the same ids to keep the loader's document-
+/// order resolution self-consistent.
+fn shape_id_for_index(index: usize) -> String {
+    (100_000 + index as i64).to_string()
+}
+
+/// Maps a model [`BuildEffect`] to the `filter` value used inside `p:animEffect`.
+fn filter_for_effect(effect: BuildEffect) -> &'static str {
+    match effect {
+        BuildEffect::Fade => "fade",
+        BuildEffect::SlideInLeft => "wipe(left)",
+        BuildEffect::SlideInRight => "wipe(right)",
+        BuildEffect::SlideInTop => "wipe(up)",
+        BuildEffect::SlideInBottom => "wipe(down)",
+        BuildEffect::Appear => "appear",
+        BuildEffect::Disappear => "disappear",
+    }
+}
+
+/// Returns true when the model transition differs from the original XML.
+fn transition_changed(slide: &Slide, original_xml: &str) -> bool {
+    slide.transition != extract_original_transition(original_xml)
+}
+
+/// Returns true when the model animation differs from the original XML.
+fn animation_changed(slide: &Slide, original_xml: &str) -> bool {
+    slide.animation != extract_original_animation(original_xml)
+}
+
+/// Extracts the first `p:transition` element from `xml` and parses it with the
+/// loader's transition parser.
+fn extract_original_transition(xml: &str) -> Option<Transition> {
+    let transition_xml = capture_element_xml(xml, "transition")?;
+    let mut ledger = crate::ledger::LossLedger::new();
+    crate::transition::parse_transition(&transition_xml, "", &mut ledger)
+}
+
+/// Extracts the first `p:timing` element from `xml` and parses it with the
+/// loader's simple build-in parser, resolving original `p:cNvPr` ids to
+/// original shape indices.
+fn extract_original_animation(xml: &str) -> Option<Animation> {
+    let timing_xml = capture_element_xml(xml, "timing")?;
+    let id_to_index = build_original_id_to_index(xml);
+    let mut ledger = crate::ledger::LossLedger::new();
+    crate::transition::parse_animation(&timing_xml, &id_to_index, "", &mut ledger)
+}
+
+/// Finds the first element with local name `target_local` and returns its raw
+/// XML string.
+fn capture_element_xml(xml: &str, target_local: &str) -> Option<String> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf).ok()? {
+            Event::Start(e) if qname_str(e.name()) == target_local => {
+                let start = e.into_owned();
+                let mut captured = Vec::new();
+                let mut writer = Writer::new(&mut captured);
+                copy_element(&mut reader, &start, &mut writer, &mut buf).ok()?;
+                return Some(String::from_utf8_lossy(&captured).into_owned());
+            }
+            Event::Empty(e) if qname_str(e.name()) == target_local => {
+                let mut captured = Vec::new();
+                let mut writer = Writer::new(&mut captured);
+                writer.write_event(Event::Empty(e)).ok()?;
+                return Some(String::from_utf8_lossy(&captured).into_owned());
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    None
+}
+
+/// Builds a map from original `p:cNvPr` id to original shape index (document
+/// order) by scanning the original `p:spTree`.
+fn build_original_id_to_index(xml: &str) -> HashMap<String, usize> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+    let mut ids: Vec<String> = Vec::new();
+    let mut in_sp_tree = false;
+    let mut sp_tree_depth = 0usize;
+    let mut depth = 0usize;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let local = qname_str(e.name());
+                if local == "spTree" {
+                    in_sp_tree = true;
+                    sp_tree_depth = depth + 1;
+                } else if in_sp_tree
+                    && depth == sp_tree_depth
+                    && SHAPE_ELEMENT_NAMES.contains(&local.as_str())
+                {
+                    let start = e.into_owned();
+                    let mut captured = Vec::new();
+                    let mut writer = Writer::new(&mut captured);
+                    if copy_element(&mut reader, &start, &mut writer, &mut buf).is_ok() {
+                        let captured_str = String::from_utf8_lossy(&captured);
+                        ids.push(
+                            extract_shape_id(&captured_str)
+                                .unwrap_or_else(|| ids.len().to_string()),
+                        );
+                    }
+                    buf.clear();
+                    continue;
+                }
+                depth += 1;
+            }
+            Ok(Event::End(e)) => {
+                if qname_str(e.name()) == "spTree" {
+                    in_sp_tree = false;
+                }
+                depth = depth.saturating_sub(1);
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    ids.into_iter().enumerate().map(|(i, id)| (id, i)).collect()
+}
+
+/// Extracts the first `id` attribute from a `<p:cNvPr>` (or similar non-visual
+/// properties) element inside a captured shape.
+fn extract_shape_id(xml: &str) -> Option<String> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e) | Event::Empty(e)) => {
+                let local = qname_str(e.name());
+                if matches!(
+                    local.as_str(),
+                    "cNvPr" | "cNvPicPr" | "cNvGraphicFramePr" | "cNvCxnSpPr" | "cNvGrpSpPr"
+                ) {
+                    if let Some(id) = attr_by_local_name(&e, "id") {
+                        return Some(id);
+                    }
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    None
+}
+
+/// Emits a fresh `p:transition` element from a model [`Transition`].
+fn emit_transition_xml(transition: &Transition) -> String {
+    let child = match transition.kind {
+        TransitionKind::Fade => "p:fade",
+        TransitionKind::Push => "p:push",
+        TransitionKind::Wipe => "p:wipe",
+        TransitionKind::Slide => "p:slide",
+        TransitionKind::None => return String::new(),
+    };
+    format!(
+        r#"<p:transition spd="{}"><{}/></p:transition>"#,
+        transition.duration_ms, child
+    )
+}
+
+/// Emits a fresh `p:timing` element from a model [`Animation`].
+fn emit_timing_xml(animation: &Animation) -> String {
+    let mut steps = String::new();
+    let mut next_id = 3u32;
+    for step in &animation.steps {
+        let step_xml = build_step_xml(step, next_id);
+        next_id += 4;
+        steps.push_str(&step_xml);
+    }
+    format!(
+        r#"<p:timing><p:tnLst><p:par><p:cTn id="1" dur="indefinite" restart="never" nodeType="tmRoot"><p:childTnLst><p:seq concurrent="1" nextAc="seek"><p:cTn id="2" dur="indefinite" nodeType="mainSeq"><p:childTnLst>{steps}</p:childTnLst></p:cTn></p:seq></p:childTnLst></p:cTn></p:par></p:tnLst></p:timing>"#
+    )
+}
+
+/// Emits the nested `p:par`/`p:cTn` structure for a single build step.
+fn build_step_xml(step: &BuildStep, id_base: u32) -> String {
+    let spid = shape_id_for_index(step.shape_index);
+    let filter = filter_for_effect(step.effect);
+    let dur = step.duration_ms;
+    let id_a = id_base;
+    let id_b = id_base + 1;
+    let id_c = id_base + 2;
+    let id_d = id_base + 3;
+    format!(
+        r#"<p:par><p:cTn id="{id_a}" fill="hold"><p:stCondLst><p:cond delay="indefinite"/></p:stCondLst><p:childTnLst><p:par><p:cTn id="{id_b}" fill="hold"><p:stCondLst><p:cond delay="0"/></p:stCondLst><p:childTnLst><p:par><p:cTn id="{id_c}" presetID="10" presetClass="entr" presetSubtype="0" fill="hold" grpId="0" nodeType="clickEffect"><p:stCondLst><p:cond delay="0"/></p:stCondLst><p:childTnLst><p:animEffect transition="in" filter="{filter}"><p:cBhvr><p:cTn id="{id_d}" dur="{dur}"/><p:tgtEl><p:spTgt spid="{spid}"/></p:tgtEl></p:cBhvr></p:animEffect></p:childTnLst></p:cTn></p:par></p:childTnLst></p:cTn></p:par></p:childTnLst></p:cTn></p:par>"#
+    )
+}
+
+/// Replaces or inserts `p:transition` and `p:timing` in `xml` when they differ
+/// from the model, and removes them when the model clears them.
+fn patch_transition_and_timing(
+    xml: &str,
+    slide: &Slide,
+    patch_transition: bool,
+    patch_animation: bool,
+) -> Result<String> {
+    let mut out = Vec::new();
+    {
+        let mut writer = Writer::new(&mut out);
+        let mut reader = Reader::from_str(xml);
+        reader.config_mut().trim_text(false);
+        let mut buf = Vec::new();
+
+        let mut in_sp_tree = false;
+        let mut original_had_transition = false;
+        let mut original_had_timing = false;
+
+        loop {
+            let event = reader.read_event_into(&mut buf)?;
+            match &event {
+                Event::Start(e) => {
+                    let local = qname_str(e.name());
+                    if local == "spTree" {
+                        in_sp_tree = true;
+                    } else if !in_sp_tree && local == "transition" {
+                        original_had_transition = true;
+                        if patch_transition {
+                            let start = e.clone().into_owned();
+                            let mut captured = Vec::new();
+                            let mut capture_writer = Writer::new(&mut captured);
+                            copy_element(&mut reader, &start, &mut capture_writer, &mut buf)?;
+                            if let Some(ref transition) = slide.transition {
+                                writer
+                                    .get_mut()
+                                    .write_all(emit_transition_xml(transition).as_bytes())?;
+                            }
+                            buf.clear();
+                            continue;
+                        }
+                    } else if !in_sp_tree && local == "timing" {
+                        original_had_timing = true;
+                        if patch_animation {
+                            let start = e.clone().into_owned();
+                            let mut captured = Vec::new();
+                            let mut capture_writer = Writer::new(&mut captured);
+                            copy_element(&mut reader, &start, &mut capture_writer, &mut buf)?;
+                            if let Some(ref animation) = slide.animation {
+                                writer
+                                    .get_mut()
+                                    .write_all(emit_timing_xml(animation).as_bytes())?;
+                            }
+                            buf.clear();
+                            continue;
+                        }
+                    }
+                    writer.write_event(event)?;
+                }
+                Event::End(e) => {
+                    let local = qname_str(e.name());
+                    if local == "spTree" {
+                        in_sp_tree = false;
+                    }
+                    if local == "cSld" && patch_transition && !original_had_transition {
+                        if let Some(ref transition) = slide.transition {
+                            writer
+                                .get_mut()
+                                .write_all(emit_transition_xml(transition).as_bytes())?;
+                        }
+                    }
+                    if local == "sld" && patch_animation && !original_had_timing {
+                        if let Some(ref animation) = slide.animation {
+                            writer
+                                .get_mut()
+                                .write_all(emit_timing_xml(animation).as_bytes())?;
+                        }
+                    }
+                    writer.write_event(event)?;
+                }
+                Event::Eof => break,
+                _ => writer.write_event(event)?,
+            }
+            buf.clear();
+        }
+    }
+    String::from_utf8(out).map_err(|e| Error::Save(e.to_string()))
+}
+
 /// Patches a single slide XML document in place.
 ///
 /// Editable text boxes have their paragraphs rewritten; modeled images,
@@ -685,6 +975,10 @@ fn patch_chart_frame_xml<W: Write>(
 /// transform updated while the chart relationship id is preserved so the chart
 /// XML part can be patched separately. Shapes added since load are appended to
 /// the shape tree.
+///
+/// For dirty slides, `p:transition` and `p:timing` are regenerated when the
+/// model differs from the original XML, removed when the model clears them, and
+/// copied through verbatim when unchanged.
 fn patch_slide_xml(
     slide: &Slide,
     original_xml: &str,
@@ -692,18 +986,26 @@ fn patch_slide_xml(
     link_rids: &HashMap<String, String>,
     chart_rids: &HashMap<usize, String>,
 ) -> Result<Vec<u8>> {
+    let patch_transition = transition_changed(slide, original_xml);
+    let patch_animation = animation_changed(slide, original_xml);
+    let xml = if patch_transition || patch_animation {
+        patch_transition_and_timing(original_xml, slide, patch_transition, patch_animation)?
+    } else {
+        original_xml.to_string()
+    };
+
     // If the model has fewer shapes than the original slide XML, a shape was
     // deleted. The positional patch below cannot represent a deletion (it would
     // misalign every following shape and leave the deleted element in place), so
     // fall back to regenerating the entire shape tree from the model.
-    if count_top_level_shapes(original_xml)? > slide.shapes.len() {
-        return regenerate_sp_tree(slide, original_xml, rids, link_rids, chart_rids);
+    if count_top_level_shapes(&xml)? > slide.shapes.len() {
+        return regenerate_sp_tree(slide, &xml, rids, link_rids, chart_rids);
     }
 
     let mut out = Vec::new();
     {
         let mut writer = Writer::new(&mut out);
-        let mut reader = Reader::from_str(original_xml);
+        let mut reader = Reader::from_str(&xml);
         reader.config_mut().trim_text(false);
         let mut buf = Vec::new();
 
