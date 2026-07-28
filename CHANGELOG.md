@@ -9,8 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 This section tracks work toward v0.2.0 (editor completeness). See
 [`docs/ROADMAP.md`](docs/ROADMAP.md),
-[`docs/sprint-records/wave-1.md`](docs/sprint-records/wave-1.md), and
-[`docs/sprint-records/wave-2.md`](docs/sprint-records/wave-2.md).
+[`docs/sprint-records/wave-1.md`](docs/sprint-records/wave-1.md),
+[`docs/sprint-records/wave-2.md`](docs/sprint-records/wave-2.md), and
+[`docs/sprint-records/wave-3.md`](docs/sprint-records/wave-3.md).
+
+### Added — Wave 3 (tables)
+
+- Tables are now first-class in `slides-core`: `Shape` gains a `Table`
+  variant with `TableShape`, `TableRow`, `TableCell`, `TableBorders`,
+  `BorderEdge`, and `CellAlign` types. Tables cap at 50 rows × 50 columns
+  (`PRODUCT_SPEC.md` §5.2) with structural invariants enforced (non-empty,
+  uniform column count, matched `column_widths`). All additive; old decks
+  deserialize unchanged.
+- Eight reversible commands: `AddTable`, `SetCellText`, `SetCellStyle`
+  (double-Option merge-patch over fill/borders/align), `ResizeTable`,
+  `InsertRow`, `InsertColumn`, `DeleteRow`, `DeleteColumn`. Each produces a
+  verified inverse; deleting a whole table and undoing restores every cell.
+- `slides-render` renders tables as a deterministic SVG grid: cell
+  backgrounds, border edges (with dash styles), header row (bold + distinct
+  fill), cell alignment (left/center/right), vertical centering, and rotation.
+  Empty tables render a frame rect without panicking.
+- PPTX loader maps `p:graphicFrame`/`a:tbl` to `TableShape`, parsing
+  `tblGrid` (column widths), `tr`/`tc` (rows/cells), `tcPr` (fills, borders
+  via `lnL`/`lnR`/`lnT`/`lnB`, alignment), and `tblPr` (header row). Rich
+  text inside cells collapses to plain text with a loss warning. Tables
+  exceeding the 50×50 cap clamp and warn. Graphic frames without `a:tbl`
+  (charts, SmartArt) stay passthrough. The saver emits a full
+  `p:graphicFrame`/`a:tbl` for dirty slides only; untouched parts stay
+  byte-for-byte identical.
+- Seven new Tauri commands (`add_table`, `set_cell_text`, `set_cell_style`,
+  `insert_row`, `insert_column`, `delete_row`, `delete_column`) wired through
+  the transactional command bus. The Svelte canvas renders tables with cell
+  backgrounds, borders, alignment, and editable cell text (click to edit,
+  blur to commit). The toolbar has a table button with a size-picker grid
+  and insert/delete row/column buttons.
+- `docs/sprint-records/wave-3.md` documenting the wave scope and acceptance
+  criteria.
 
 ### Added — Wave 2 (rich text)
 

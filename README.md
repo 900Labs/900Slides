@@ -28,6 +28,9 @@ What v0.1.0 does:
   ellipse, triangle, line, arrow, right-arrow callout, five-point star) with
   fill, outline, shadow, rotation, and crop. Insert an image through the
   toolbar or a shape through the shape menu.
+- Edits **tables** up to 50 rows × 50 columns with cell text, fills, borders,
+  column/row resize, header rows, and cell alignment. Insert a table through
+  the toolbar, click cells to edit, and add or remove rows and columns.
 - Sanitizes every image on the way in: EXIF and other metadata are stripped by
   default, only allowlisted image formats are accepted, and embedded SVG is
   scrubbed of scripts, event handlers, and unsafe URL references.
@@ -47,8 +50,8 @@ What v0.1.0 does:
 
 What v0.1.0 does **not** do yet:
 
-- Edit tables or charts (they are preserved on save but shown as
-  non-editable placeholders in the editor).
+- Edit charts (they are preserved on save but shown as non-editable
+  placeholders in the editor).
 - Animate builds or transitions.
 - Export to PDF, PNG, SVG, or ODP.
 - Spell-check.
@@ -160,11 +163,11 @@ Run the complete local gate before opening a pull request:
 ./scripts/verify-local.sh
 ```
 
-The workspace test suite is 107 Rust tests, zero clippy warnings, and a clean
+The workspace test suite is 152 Rust tests, zero clippy warnings, and a clean
 svelte-check. The Rust suite includes generated PPTX round-trip tests that
 assert untouched parts are byte-identical after edits, determinism tests
-for the renderer, and sanitizer/allowlist tests for image ingest and link
-URLs.
+for the renderer, sanitizer/allowlist tests for image ingest and link
+URLs, and table invariant + command round-trip tests.
 
 ## Contributing and support
 
