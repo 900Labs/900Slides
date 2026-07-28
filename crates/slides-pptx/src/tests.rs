@@ -346,6 +346,7 @@ fn deck_round_trip_serialization() {
         })],
         animation: None,
         transition: None,
+        rich_notes: None,
     });
 
     let json = serde_json::to_string(&deck).expect("serialize");
@@ -1353,6 +1354,8 @@ fn session_from_slide_xml(slide_xml: &str, slide: Slide) -> Session {
             id: "fixture-deck-id".to_string(),
             theme: Theme::default(),
             slides: vec![slide],
+            slide_size: None,
+            sections: Vec::new(),
             media: MediaStore::default(),
         },
         original,
@@ -1377,6 +1380,7 @@ fn save_no_edit_keeps_byte_identical() {
         shapes: vec![passthrough_shape()],
         animation: None,
         transition: Some(Transition::new(TransitionKind::Fade, 500)),
+        rich_notes: None,
     };
     let session = session_from_slide_xml(&slide_xml, slide);
     let saved = save(&session).expect("save should succeed");
@@ -1409,6 +1413,7 @@ fn save_edits_transition_preserves_other_parts() {
         shapes: vec![passthrough_shape()],
         animation: None,
         transition: Some(Transition::new(TransitionKind::Push, 750)),
+        rich_notes: None,
     };
     let mut session = session_from_slide_xml(&slide_xml, slide);
     session.mark_slide_dirty("ppt/slides/slide1.xml");
@@ -1465,6 +1470,7 @@ fn save_edits_animation_patches_timing() {
             500,
         )])),
         transition: None,
+        rich_notes: None,
     };
     let mut session = session_from_slide_xml(&slide_xml, slide);
     session.mark_slide_dirty("ppt/slides/slide1.xml");
@@ -1497,6 +1503,7 @@ fn clear_transition_then_save() {
         shapes: vec![passthrough_shape()],
         animation: None,
         transition: None,
+        rich_notes: None,
     };
     let mut session = session_from_slide_xml(&slide_xml, slide);
     session.mark_slide_dirty("ppt/slides/slide1.xml");

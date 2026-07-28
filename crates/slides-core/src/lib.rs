@@ -19,6 +19,16 @@ pub struct Deck {
     pub theme: Theme,
     /// Ordered list of slides.
     pub slides: Vec<Slide>,
+    /// Fixed slide dimensions (aspect ratio), if any. Defaults to `None`
+    /// (`#[serde(default)]`) so decks serialized before this field existed
+    /// deserialize unchanged — a non-breaking, additive change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slide_size: Option<SlideSize>,
+    /// Named slide sections, in slide order. Defaults to empty
+    /// (`#[serde(default)]`) so decks serialized before this field existed
+    /// deserialize unchanged — a non-breaking, additive change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sections: Vec<SlideSection>,
     /// Key-addressed store of image bytes referenced by image shapes.
     #[serde(default)]
     pub media: MediaStore,
@@ -31,6 +41,8 @@ impl Default for Deck {
             id: String::new(),
             theme: Theme::default(),
             slides: Vec::new(),
+            slide_size: None,
+            sections: Vec::new(),
             media: MediaStore::default(),
         }
     }
@@ -56,6 +68,55 @@ impl Deck {
     }
 }
 
+/// Fixed slide dimensions, in EMU, used to pin the deck's aspect ratio.
+///
+/// The `Option<SlideSize>` on [`Deck`] defaults to `None`
+/// (`#[serde(default)]`) so decks serialized before this field existed
+/// deserialize unchanged — a non-breaking, additive change.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SlideSize {
+    /// Slide width, in EMU.
+    pub width_emu: f64,
+    /// Slide height, in EMU.
+    pub height_emu: f64,
+}
+
+impl SlideSize {
+    /// 16:9 widescreen (12,192,000 x 6,858,000 EMU) — the PPTX default.
+    pub fn widescreen_16_9() -> Self {
+        Self {
+            width_emu: 12_192_000.0,
+            height_emu: 6_858_000.0,
+        }
+    }
+
+    /// 4:3 standard (9,144,000 x 6,858,000 EMU).
+    pub fn standard_4_3() -> Self {
+        Self {
+            width_emu: 9_144_000.0,
+            height_emu: 6_858_000.0,
+        }
+    }
+
+    /// 16:10 widescreen (12,149,333 x 7,593,333 EMU).
+    pub fn widescreen_16_10() -> Self {
+        Self {
+            width_emu: 12_149_333.0,
+            height_emu: 7_593_333.0,
+        }
+    }
+}
+
+/// A named section that starts at `start_slide_id` and spans the slides that
+/// follow it, up to the next section.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SlideSection {
+    /// Human-readable section name.
+    pub name: String,
+    /// Id of the first slide in this section.
+    pub start_slide_id: String,
+}
+
 /// Theme applied to a deck.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Theme {
@@ -67,6 +128,11 @@ pub struct Theme {
     pub body_font: String,
     /// Accent color.
     pub accent_color: Color,
+    /// High-contrast accessibility mode. Defaults to `false`
+    /// (`#[serde(default)]`) so decks serialized before this field existed
+    /// deserialize unchanged — a non-breaking, additive change.
+    #[serde(default)]
+    pub high_contrast: bool,
 }
 
 impl Default for Theme {
@@ -76,6 +142,7 @@ impl Default for Theme {
             heading_font: String::from("Calibri"),
             body_font: String::from("Calibri"),
             accent_color: Color::rgb(0, 112, 192),
+            high_contrast: false,
         }
     }
 }
@@ -191,6 +258,12 @@ pub struct Slide {
     /// `None` (`#[serde(default)]`) so old decks deserialize unchanged.
     #[serde(default)]
     pub transition: Option<Transition>,
+    /// Rich-text speaker notes, as paragraphs. When `Some`, the editor uses
+    /// these; otherwise it falls back to the plain [`Slide::notes`] field.
+    /// Defaults to `None` (`#[serde(default)]`) so old decks deserialize
+    /// unchanged — a non-breaking, additive change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rich_notes: Option<Vec<Paragraph>>,
 }
 
 /// A shape or content object placed on a slide.
@@ -3614,6 +3687,169 @@ impl Command for MoveBuildStep {
         self.from < animation.steps.len() && self.to < animation.steps.len()
     }
 }
+
+/// Sets or clears the deck's slide size (aspect ratio).
+///
+/// This is a deck-level command: it affects the whole deck rather than a
+/// single slide, so `affected_slide_ids` is left at the trait default (no
+/// specific slide). Inverse snapshots the deck's prior `Option<SlideSize>`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetSlideSize {
+    slide_size: Option<SlideSize>,
+}
+
+impl SetSlideSize {
+    /// Creates a new set-slide-size command. Pass `None` to clear the size.
+    pub fn new(slide_size: Option<SlideSize>) -> Self {
+        Self { slide_size }
+    }
+}
+
+impl Command for SetSlideSize {
+    fn apply(&self, deck: &mut Deck) {
+        deck.slide_size = self.slide_size.clone();
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        Box::new(Self {
+            slide_size: deck.slide_size.clone(),
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn validate(&self, _deck: &Deck) -> bool {
+        true
+    }
+}
+
+/// Replaces the deck's entire slide-section list.
+///
+/// This is a deck-level command: it affects the whole deck rather than a
+/// single slide, so `affected_slide_ids` is left at the trait default (no
+/// specific slide). Inverse snapshots the deck's prior `Vec<SlideSection>`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetSections {
+    sections: Vec<SlideSection>,
+}
+
+impl SetSections {
+    /// Creates a new set-sections command that replaces the whole list.
+    pub fn new(sections: Vec<SlideSection>) -> Self {
+        Self { sections }
+    }
+}
+
+impl Command for SetSections {
+    fn apply(&self, deck: &mut Deck) {
+        deck.sections = self.sections.clone();
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        Box::new(Self {
+            sections: deck.sections.clone(),
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn validate(&self, _deck: &Deck) -> bool {
+        true
+    }
+}
+
+/// Sets or clears the rich-text speaker notes for a slide.
+///
+/// When `rich_notes` is `Some`, the editor uses it; otherwise it uses the
+/// slide's plain [`Slide::notes`] field. Inverse snapshots the slide's prior
+/// `Option<Vec<Paragraph>>`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetRichNotes {
+    slide_id: String,
+    rich_notes: Option<Vec<Paragraph>>,
+}
+
+impl SetRichNotes {
+    /// Creates a new set-rich-notes command. Pass `None` to clear rich notes.
+    pub fn new(slide_id: impl Into<String>, rich_notes: Option<Vec<Paragraph>>) -> Self {
+        Self {
+            slide_id: slide_id.into(),
+            rich_notes,
+        }
+    }
+}
+
+impl Command for SetRichNotes {
+    fn apply(&self, deck: &mut Deck) {
+        if let Some(slide) = deck.slide_mut(&self.slide_id) {
+            slide.rich_notes = self.rich_notes.clone();
+        }
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        let prior = deck
+            .slide(&self.slide_id)
+            .and_then(|slide| slide.rich_notes.clone());
+        Box::new(Self {
+            slide_id: self.slide_id.clone(),
+            rich_notes: prior,
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        deck.slide(&self.slide_id).is_some()
+    }
+}
+
+/// Sets the deck theme's high-contrast accessibility mode.
+///
+/// This is a deck-level command: it affects the whole deck's theme rather than
+/// a single slide, so `affected_slide_ids` is left at the trait default (no
+/// specific slide). Inverse snapshots the theme's prior `high_contrast` bool.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetHighContrast {
+    high_contrast: bool,
+}
+
+impl SetHighContrast {
+    /// Creates a new set-high-contrast command.
+    pub fn new(high_contrast: bool) -> Self {
+        Self { high_contrast }
+    }
+}
+
+impl Command for SetHighContrast {
+    fn apply(&self, deck: &mut Deck) {
+        deck.theme.high_contrast = self.high_contrast;
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        Box::new(Self {
+            high_contrast: deck.theme.high_contrast,
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn validate(&self, _deck: &Deck) -> bool {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3648,6 +3884,7 @@ mod tests {
             })],
             animation: None,
             transition: None,
+            rich_notes: None,
         });
 
         let json = serde_json::to_string(&deck).expect("serialize deck");
@@ -3671,6 +3908,7 @@ mod tests {
             })],
             animation: None,
             transition: None,
+            rich_notes: None,
         });
 
         let mut bus = CommandBus::default();
@@ -3707,6 +3945,7 @@ mod tests {
             })],
             animation: None,
             transition: None,
+            rich_notes: None,
         });
 
         let mut bus = CommandBus::default();
@@ -3740,6 +3979,7 @@ mod tests {
             })],
             animation: None,
             transition: None,
+            rich_notes: None,
         });
 
         let mut bus = CommandBus::default();
@@ -3777,6 +4017,7 @@ mod tests {
             })],
             animation: None,
             transition: None,
+            rich_notes: None,
         });
 
         let mut bus = CommandBus::default();
@@ -3827,6 +4068,7 @@ mod tests {
             shapes,
             animation: None,
             transition: None,
+            rich_notes: None,
         }
     }
 
@@ -4395,6 +4637,7 @@ mod tests {
             })],
             animation: None,
             transition: None,
+            rich_notes: None,
         });
 
         let mut value = serde_json::to_value(&deck).expect("serialize to value");
@@ -4514,6 +4757,7 @@ mod tests {
             })],
             animation: None,
             transition: None,
+            rich_notes: None,
         });
         let original = deck.clone();
 
@@ -4564,6 +4808,7 @@ mod tests {
             })],
             animation: None,
             transition: None,
+            rich_notes: None,
         });
 
         let mut bus = CommandBus::default();
@@ -4604,6 +4849,7 @@ mod tests {
             ],
             animation: None,
             transition: None,
+            rich_notes: None,
         });
 
         let mut bus = CommandBus::default();
@@ -6482,5 +6728,374 @@ mod tests {
         let steps = &deck.slides[0].animation.as_ref().expect("animation").steps;
         assert_eq!(steps.len(), 2);
         assert!(steps.iter().all(|s| s.shape_index == 0));
+    }
+
+    #[test]
+    fn old_deck_without_wave7_fields_deserializes() {
+        // A deck serialized by an older library (before Wave 7) carries none
+        // of the new fields. Every new field is additive (#[serde(default)])
+        // and must round-trip into its default value.
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with("s1", vec![geo_rectangle()]));
+        deck.slides.push(slide_with("s2", vec![geo_rectangle()]));
+
+        // Start from the current JSON, then strip every Wave 7 field to mimic
+        // a snapshot produced before they existed.
+        let mut value = serde_json::to_value(&deck).expect("serialize to value");
+        let object = value.as_object_mut().expect("deck is an object");
+        object.remove("slide_size");
+        object.remove("sections");
+        object
+            .get_mut("theme")
+            .expect("theme")
+            .as_object_mut()
+            .expect("theme object")
+            .remove("high_contrast");
+        for slide in object
+            .get_mut("slides")
+            .expect("slides")
+            .as_array_mut()
+            .expect("slides array")
+        {
+            slide
+                .as_object_mut()
+                .expect("slide object")
+                .remove("rich_notes");
+        }
+
+        let old_json = serde_json::to_string(&value).expect("reserialize without wave7 fields");
+        let restored: Deck = serde_json::from_str(&old_json).expect("old deck must load");
+
+        assert_eq!(restored.slide_size, None);
+        assert!(restored.sections.is_empty());
+        assert!(!restored.theme.high_contrast);
+        assert!(restored.slides.iter().all(|s| s.rich_notes.is_none()));
+        assert_eq!(restored.schema_version, SCHEMA_VERSION);
+        // The defaults match a freshly-built deck's defaults.
+        assert_eq!(restored.slide_size, deck.slide_size);
+        assert_eq!(restored.sections, deck.sections);
+        assert_eq!(restored.theme.high_contrast, deck.theme.high_contrast);
+    }
+
+    #[test]
+    fn slide_size_constructors() {
+        assert_eq!(
+            SlideSize::widescreen_16_9(),
+            SlideSize {
+                width_emu: 12_192_000.0,
+                height_emu: 6_858_000.0,
+            }
+        );
+        assert_eq!(
+            SlideSize::standard_4_3(),
+            SlideSize {
+                width_emu: 9_144_000.0,
+                height_emu: 6_858_000.0,
+            }
+        );
+        assert_eq!(
+            SlideSize::widescreen_16_10(),
+            SlideSize {
+                width_emu: 12_149_333.0,
+                height_emu: 7_593_333.0,
+            }
+        );
+    }
+
+    #[test]
+    fn set_slide_size_applies_and_undoes() {
+        let mut deck = Deck::new();
+        let original = deck.clone();
+
+        let mut bus = CommandBus::default();
+        // None -> Some; undo restores None.
+        bus.apply(
+            Box::new(SetSlideSize::new(Some(SlideSize::widescreen_16_9()))),
+            &mut deck,
+        )
+        .expect("set 16:9");
+        assert_eq!(deck.slide_size, Some(SlideSize::widescreen_16_9()));
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck.slide_size, None);
+        assert_eq!(deck, original);
+
+        // Some -> different Some; undo restores the first Some, then None.
+        bus.apply(
+            Box::new(SetSlideSize::new(Some(SlideSize::standard_4_3()))),
+            &mut deck,
+        )
+        .expect("set 4:3");
+        bus.apply(
+            Box::new(SetSlideSize::new(Some(SlideSize::widescreen_16_10()))),
+            &mut deck,
+        )
+        .expect("set 16:10");
+        assert_eq!(deck.slide_size, Some(SlideSize::widescreen_16_10()));
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck.slide_size, Some(SlideSize::standard_4_3()));
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck.slide_size, None);
+        assert_eq!(deck, original);
+
+        // Clearing (Some -> None) is reversible too.
+        bus.apply(
+            Box::new(SetSlideSize::new(Some(SlideSize::widescreen_16_9()))),
+            &mut deck,
+        )
+        .expect("set before clear");
+        bus.apply(Box::new(SetSlideSize::new(None)), &mut deck)
+            .expect("clear");
+        assert_eq!(deck.slide_size, None);
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck.slide_size, Some(SlideSize::widescreen_16_9()));
+    }
+
+    #[test]
+    fn set_sections_applies_and_undoes() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with("s1", vec![geo_rectangle()]));
+        deck.slides.push(slide_with("s2", vec![geo_rectangle()]));
+        let original = deck.clone();
+
+        let intro = vec![SlideSection {
+            name: "Intro".to_string(),
+            start_slide_id: "s1".to_string(),
+        }];
+        let demo = vec![
+            SlideSection {
+                name: "Intro".to_string(),
+                start_slide_id: "s1".to_string(),
+            },
+            SlideSection {
+                name: "Demo".to_string(),
+                start_slide_id: "s2".to_string(),
+            },
+        ];
+
+        let mut bus = CommandBus::default();
+        bus.apply(Box::new(SetSections::new(intro.clone())), &mut deck)
+            .expect("set intro");
+        assert_eq!(deck.sections, intro);
+
+        bus.apply(Box::new(SetSections::new(demo.clone())), &mut deck)
+            .expect("set demo");
+        assert_eq!(deck.sections, demo);
+
+        // Undo restores the prior list, then the empty default.
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck.sections, intro);
+        assert!(bus.undo(&mut deck).is_some());
+        assert!(deck.sections.is_empty());
+        assert_eq!(deck, original);
+
+        // Clearing to empty is reversible.
+        bus.apply(Box::new(SetSections::new(demo.clone())), &mut deck)
+            .expect("set before clear");
+        bus.apply(Box::new(SetSections::new(Vec::new())), &mut deck)
+            .expect("clear");
+        assert!(deck.sections.is_empty());
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck.sections, demo);
+    }
+
+    #[test]
+    fn set_rich_notes_applies_and_undoes() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with("s1", vec![geo_rectangle()]));
+        let original = deck.clone();
+
+        let first = vec![Paragraph {
+            runs: vec![Run::new("note one").bold()],
+            list_style: ListStyle::None,
+            ..Default::default()
+        }];
+        let second = vec![
+            Paragraph {
+                runs: vec![Run::new("note two")],
+                list_style: ListStyle::Ordered,
+                ..Default::default()
+            },
+            Paragraph {
+                runs: vec![Run::new("more")],
+                list_style: ListStyle::Unordered,
+                ..Default::default()
+            },
+        ];
+
+        let mut bus = CommandBus::default();
+        bus.apply(
+            Box::new(SetRichNotes::new("s1", Some(first.clone()))),
+            &mut deck,
+        )
+        .expect("set first");
+        assert_eq!(deck.slides[0].rich_notes.as_ref(), Some(&first));
+
+        bus.apply(
+            Box::new(SetRichNotes::new("s1", Some(second.clone()))),
+            &mut deck,
+        )
+        .expect("set second");
+        assert_eq!(deck.slides[0].rich_notes.as_ref(), Some(&second));
+
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck.slides[0].rich_notes.as_ref(), Some(&first));
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck.slides[0].rich_notes, None);
+        assert_eq!(deck, original);
+
+        // Clearing (Some -> None) is reversible.
+        bus.apply(
+            Box::new(SetRichNotes::new("s1", Some(first.clone()))),
+            &mut deck,
+        )
+        .expect("set before clear");
+        bus.apply(Box::new(SetRichNotes::new("s1", None)), &mut deck)
+            .expect("clear");
+        assert_eq!(deck.slides[0].rich_notes, None);
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck.slides[0].rich_notes.as_ref(), Some(&first));
+    }
+
+    #[test]
+    fn set_rich_notes_rejects_missing_slide() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with("s1", vec![geo_rectangle()]));
+
+        let notes = Some(vec![Paragraph {
+            runs: vec![Run::new("x")],
+            list_style: ListStyle::None,
+            ..Default::default()
+        }]);
+
+        let mut bus = CommandBus::default();
+        assert_eq!(
+            bus.apply(
+                Box::new(SetRichNotes::new("missing", notes.clone())),
+                &mut deck
+            ),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(bus.undo_len(), 0);
+        assert_eq!(deck.slides[0].rich_notes, None);
+    }
+
+    #[test]
+    fn set_high_contrast_applies_and_undoes() {
+        let mut deck = Deck::new();
+        let original = deck.clone();
+
+        let mut bus = CommandBus::default();
+        // false -> true; undo restores false.
+        bus.apply(Box::new(SetHighContrast::new(true)), &mut deck)
+            .expect("enable");
+        assert!(deck.theme.high_contrast);
+        assert!(bus.undo(&mut deck).is_some());
+        assert!(!deck.theme.high_contrast);
+        assert_eq!(deck, original);
+
+        // true -> false -> true; undo restores each prior state.
+        bus.apply(Box::new(SetHighContrast::new(true)), &mut deck)
+            .expect("enable 2");
+        bus.apply(Box::new(SetHighContrast::new(false)), &mut deck)
+            .expect("disable");
+        assert!(!deck.theme.high_contrast);
+        assert!(bus.undo(&mut deck).is_some());
+        assert!(deck.theme.high_contrast);
+        assert!(bus.undo(&mut deck).is_some());
+        assert!(!deck.theme.high_contrast);
+        assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn deck_with_all_wave7_fields_round_trips() {
+        let mut deck = Deck::new();
+        deck.slide_size = Some(SlideSize::widescreen_16_9());
+        deck.sections = vec![
+            SlideSection {
+                name: "Intro".to_string(),
+                start_slide_id: "s1".to_string(),
+            },
+            SlideSection {
+                name: "Details".to_string(),
+                start_slide_id: "s2".to_string(),
+            },
+        ];
+        deck.theme.high_contrast = true;
+        let mut slide = slide_with("s1", vec![geo_rectangle()]);
+        slide.rich_notes = Some(vec![Paragraph {
+            runs: vec![Run::new("rich note").italic()],
+            list_style: ListStyle::None,
+            ..Default::default()
+        }]);
+        deck.slides.push(slide);
+        deck.slides.push(slide_with("s2", vec![geo_rectangle()]));
+
+        let json = serde_json::to_string(&deck).expect("serialize deck");
+        let restored: Deck = serde_json::from_str(&json).expect("deserialize deck");
+        assert_eq!(deck, restored);
+        assert_eq!(restored.slide_size, Some(SlideSize::widescreen_16_9()));
+        assert_eq!(restored.sections.len(), 2);
+        assert!(restored.theme.high_contrast);
+        assert_eq!(
+            restored.slides[0].rich_notes.as_ref().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(restored.schema_version, SCHEMA_VERSION);
+        assert!(json.contains("\"slide_size\""));
+        assert!(json.contains("\"sections\""));
+        assert!(json.contains("\"high_contrast\":true"));
+        assert!(json.contains("\"rich_notes\""));
+    }
+
+    #[test]
+    fn slide_size_and_sections_and_rich_notes_serialize_and_deserialize() {
+        let size = SlideSize::widescreen_16_10();
+        let sj = serde_json::to_string(&size).expect("serialize slide size");
+        let sr: SlideSize = serde_json::from_str(&sj).expect("deserialize slide size");
+        assert_eq!(size, sr);
+        assert!(sj.contains("\"width_emu\""));
+        assert!(sj.contains("\"height_emu\""));
+
+        let sections = vec![
+            SlideSection {
+                name: "A".to_string(),
+                start_slide_id: "s1".to_string(),
+            },
+            SlideSection {
+                name: "B".to_string(),
+                start_slide_id: "s4".to_string(),
+            },
+        ];
+        let secj = serde_json::to_string(&sections).expect("serialize sections");
+        let secr: Vec<SlideSection> = serde_json::from_str(&secj).expect("deserialize sections");
+        assert_eq!(sections, secr);
+        assert!(secj.contains("\"name\""));
+        assert!(secj.contains("\"start_slide_id\""));
+
+        let rich = vec![Paragraph {
+            runs: vec![Run::new("speaker").bold()],
+            list_style: ListStyle::Unordered,
+            ..Default::default()
+        }];
+        let rj = serde_json::to_string(&rich).expect("serialize rich notes");
+        let rr: Vec<Paragraph> = serde_json::from_str(&rj).expect("deserialize rich notes");
+        assert_eq!(rich, rr);
+
+        // The new commands round-trip too.
+        let cmd_size = SetSlideSize::new(Some(SlideSize::standard_4_3()));
+        let csj = serde_json::to_string(&cmd_size).expect("serialize set-slide-size");
+        let csr: SetSlideSize = serde_json::from_str(&csj).expect("deserialize set-slide-size");
+        assert_eq!(cmd_size, csr);
+
+        let cmd_sec = SetSections::new(sections);
+        let csecj = serde_json::to_string(&cmd_sec).expect("serialize set-sections");
+        let csecr: SetSections = serde_json::from_str(&csecj).expect("deserialize set-sections");
+        assert_eq!(cmd_sec, csecr);
+
+        let cmd_hc = SetHighContrast::new(true);
+        let chj = serde_json::to_string(&cmd_hc).expect("serialize set-high-contrast");
+        let chr: SetHighContrast =
+            serde_json::from_str(&chj).expect("deserialize set-high-contrast");
+        assert_eq!(cmd_hc, chr);
     }
 }
