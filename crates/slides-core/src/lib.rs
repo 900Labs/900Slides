@@ -182,9 +182,14 @@ pub struct Slide {
     pub notes: String,
     /// Shapes placed on this slide.
     pub shapes: Vec<Shape>,
-    /// Reserved animation field for future use.
+    /// Per-slide build-in animation sequence, if any. Defaults to `None`
+    /// (`#[serde(default)]`) so decks serialized before this field existed
+    /// deserialize unchanged — a non-breaking, additive change.
+    #[serde(default)]
     pub animation: Option<Animation>,
-    /// Reserved transition field for future use.
+    /// Transition played when advancing to this slide, if any. Defaults to
+    /// `None` (`#[serde(default)]`) so old decks deserialize unchanged.
+    #[serde(default)]
     pub transition: Option<Transition>,
 }
 
@@ -1119,13 +1124,105 @@ pub struct PassthroughObject {
     pub frame: Option<Rect>,
 }
 
-/// Reserved animation field for future use.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct Animation;
+/// Maximum duration of a slide transition, in milliseconds (PRODUCT_SPEC.md §5.2).
+pub const MAX_TRANSITION_MS: u32 = 5000;
+/// Maximum duration of a single build-in effect, in milliseconds (PRODUCT_SPEC.md §5.2).
+pub const MAX_BUILD_STEP_MS: u32 = 3000;
 
-/// Reserved transition field for future use.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct Transition;
+/// A transition played when advancing TO this slide.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Transition {
+    /// Kind of transition.
+    pub kind: TransitionKind,
+    /// Duration in milliseconds. Deterministic. Clamped to `0..=MAX_TRANSITION_MS`.
+    pub duration_ms: u32,
+}
+
+impl Transition {
+    /// Creates a transition, clamping `duration_ms` into `0..=MAX_TRANSITION_MS`.
+    pub fn new(kind: TransitionKind, duration_ms: u32) -> Self {
+        Self {
+            kind,
+            duration_ms: duration_ms.min(MAX_TRANSITION_MS),
+        }
+    }
+}
+
+/// The kind of slide-to-slide transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitionKind {
+    /// No transition.
+    None,
+    /// Cross-fade between slides.
+    Fade,
+    /// Slide the new slide in.
+    Slide,
+    /// Push the old slide out as the new one enters.
+    Push,
+    /// Wipe reveal.
+    Wipe,
+}
+
+/// A build-in animation sequence for a slide: an ordered list of steps.
+///
+/// Each step reveals (or hides) one shape with an effect. Steps fire in order
+/// (one presenter click per step), per the v0.2.0 constrained model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Animation {
+    /// Ordered build steps. Step 0 fires on the first build click.
+    pub steps: Vec<BuildStep>,
+}
+
+impl Animation {
+    /// Creates an animation sequence from an ordered list of steps.
+    pub fn new(steps: Vec<BuildStep>) -> Self {
+        Self { steps }
+    }
+}
+
+/// One build-in step targeting a single shape by index.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BuildStep {
+    /// Index into `slide.shapes` of the shape this step reveals (or hides).
+    pub shape_index: usize,
+    /// The reveal or hide effect.
+    pub effect: BuildEffect,
+    /// Duration of the effect in milliseconds. Deterministic. Clamped to
+    /// `0..=MAX_BUILD_STEP_MS`.
+    pub duration_ms: u32,
+}
+
+impl BuildStep {
+    /// Creates a build step, clamping `duration_ms` into `0..=MAX_BUILD_STEP_MS`.
+    pub fn new(shape_index: usize, effect: BuildEffect, duration_ms: u32) -> Self {
+        Self {
+            shape_index,
+            effect,
+            duration_ms: duration_ms.min(MAX_BUILD_STEP_MS),
+        }
+    }
+}
+
+/// The reveal or hide effect for a build step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildEffect {
+    /// Fade the shape in (opacity 0 -> 1).
+    Fade,
+    /// Slide the shape in from the left.
+    SlideInLeft,
+    /// Slide the shape in from the right.
+    SlideInRight,
+    /// Slide the shape in from the top.
+    SlideInTop,
+    /// Slide the shape in from the bottom.
+    SlideInBottom,
+    /// Toggle visibility hidden -> visible instantly.
+    Appear,
+    /// Hide a shape that was already visible (opacity 1 -> 0).
+    Disappear,
+}
 
 /// A reversible command that mutates a [`Deck`].
 pub trait Command: std::fmt::Debug + Send {
@@ -3158,6 +3255,365 @@ pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// Sets or clears the transition played when advancing to a slide.
+///
+/// Inverse snapshots the slide's prior `Option<Transition>`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetTransition {
+    slide_id: String,
+    transition: Option<Transition>,
+}
+
+impl SetTransition {
+    /// Creates a new set-transition command. Pass `None` to clear the transition.
+    pub fn new(slide_id: impl Into<String>, transition: Option<Transition>) -> Self {
+        Self {
+            slide_id: slide_id.into(),
+            transition,
+        }
+    }
+}
+
+impl Command for SetTransition {
+    fn apply(&self, deck: &mut Deck) {
+        if let Some(slide) = deck.slide_mut(&self.slide_id) {
+            slide.transition = self.transition.clone();
+        }
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        let prior = deck
+            .slide(&self.slide_id)
+            .and_then(|slide| slide.transition.clone());
+        Box::new(Self {
+            slide_id: self.slide_id.clone(),
+            transition: prior,
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        deck.slide(&self.slide_id).is_some()
+    }
+}
+
+/// Replaces or clears the entire build-in animation sequence for a slide.
+///
+/// Inverse snapshots the slide's prior `Option<Animation>`. If the supplied
+/// animation is `Some`, every step's `shape_index` must target an existing
+/// shape, or the whole command is rejected.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetSlideAnimation {
+    slide_id: String,
+    animation: Option<Animation>,
+}
+
+impl SetSlideAnimation {
+    /// Creates a new set-animation command. Pass `None` to clear the sequence.
+    pub fn new(slide_id: impl Into<String>, animation: Option<Animation>) -> Self {
+        Self {
+            slide_id: slide_id.into(),
+            animation,
+        }
+    }
+}
+
+impl Command for SetSlideAnimation {
+    fn apply(&self, deck: &mut Deck) {
+        if let Some(slide) = deck.slide_mut(&self.slide_id) {
+            slide.animation = self.animation.clone();
+        }
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        let prior = deck
+            .slide(&self.slide_id)
+            .and_then(|slide| slide.animation.clone());
+        Box::new(Self {
+            slide_id: self.slide_id.clone(),
+            animation: prior,
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        let Some(slide) = deck.slide(&self.slide_id) else {
+            return false;
+        };
+        let Some(animation) = &self.animation else {
+            return true;
+        };
+        animation
+            .steps
+            .iter()
+            .all(|step| step.shape_index < slide.shapes.len())
+    }
+}
+
+/// Appends a single build step to a slide's animation sequence.
+///
+/// If the slide has no animation yet, one is created. The inverse is
+/// [`RemoveBuildStepAt`] at the appended position.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AddBuildStep {
+    slide_id: String,
+    step: BuildStep,
+}
+
+impl AddBuildStep {
+    /// Creates a new add-build-step command.
+    pub fn new(slide_id: impl Into<String>, step: BuildStep) -> Self {
+        Self {
+            slide_id: slide_id.into(),
+            step,
+        }
+    }
+}
+
+impl Command for AddBuildStep {
+    fn apply(&self, deck: &mut Deck) {
+        let Some(slide) = deck.slide_mut(&self.slide_id) else {
+            return;
+        };
+        let animation = slide
+            .animation
+            .get_or_insert_with(|| Animation::new(Vec::new()));
+        animation.steps.push(self.step.clone());
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        // Computed before apply: the appended position is the current length.
+        let index = deck
+            .slide(&self.slide_id)
+            .and_then(|slide| slide.animation.as_ref())
+            .map_or(0, |animation| animation.steps.len());
+        Box::new(RemoveBuildStepAt::new(self.slide_id.clone(), index))
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        let Some(slide) = deck.slide(&self.slide_id) else {
+            return false;
+        };
+        self.step.shape_index < slide.shapes.len()
+    }
+}
+
+/// Removes a build step from a slide's animation by position.
+///
+/// When the last step is removed, the slide's animation is reset to `None`
+/// (the canonical "no steps ⟺ `None`" form), which keeps [`AddBuildStep`]
+/// fully reversible. Inverse is [`InsertBuildStepAt`], restoring the removed
+/// step at the same position.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RemoveBuildStepAt {
+    slide_id: String,
+    index: usize,
+}
+
+impl RemoveBuildStepAt {
+    /// Creates a new remove-build-step command.
+    pub fn new(slide_id: impl Into<String>, index: usize) -> Self {
+        Self {
+            slide_id: slide_id.into(),
+            index,
+        }
+    }
+}
+
+impl Command for RemoveBuildStepAt {
+    fn apply(&self, deck: &mut Deck) {
+        let Some(slide) = deck.slide_mut(&self.slide_id) else {
+            return;
+        };
+        let Some(animation) = slide.animation.as_mut() else {
+            return;
+        };
+        if self.index < animation.steps.len() {
+            animation.steps.remove(self.index);
+            if animation.steps.is_empty() {
+                slide.animation = None;
+            }
+        }
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        // Computed before apply: the step at `index` is still present.
+        let step = deck
+            .slide(&self.slide_id)
+            .and_then(|slide| slide.animation.as_ref())
+            .and_then(|animation| animation.steps.get(self.index).cloned());
+        let step = step.unwrap_or_else(|| BuildStep::new(0, BuildEffect::Appear, 0));
+        Box::new(InsertBuildStepAt::new(
+            self.slide_id.clone(),
+            self.index,
+            step,
+        ))
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        let Some(slide) = deck.slide(&self.slide_id) else {
+            return false;
+        };
+        let Some(animation) = slide.animation.as_ref() else {
+            return false;
+        };
+        self.index < animation.steps.len()
+    }
+}
+
+/// Inserts a build step into a slide's animation at a given position.
+///
+/// Primarily the inverse of [`RemoveBuildStepAt`]. If the slide has no
+/// animation yet, one is created. Inverse is [`RemoveBuildStepAt`] at the
+/// same position.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InsertBuildStepAt {
+    slide_id: String,
+    index: usize,
+    step: BuildStep,
+}
+
+impl InsertBuildStepAt {
+    /// Creates a new insert-build-step command.
+    pub fn new(slide_id: impl Into<String>, index: usize, step: BuildStep) -> Self {
+        Self {
+            slide_id: slide_id.into(),
+            index,
+            step,
+        }
+    }
+}
+
+impl Command for InsertBuildStepAt {
+    fn apply(&self, deck: &mut Deck) {
+        let Some(slide) = deck.slide_mut(&self.slide_id) else {
+            return;
+        };
+        let animation = slide
+            .animation
+            .get_or_insert_with(|| Animation::new(Vec::new()));
+        let at = self.index.min(animation.steps.len());
+        animation.steps.insert(at, self.step.clone());
+    }
+
+    fn inverse(&self, _deck: &Deck) -> Box<dyn Command> {
+        Box::new(RemoveBuildStepAt::new(self.slide_id.clone(), self.index))
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        let Some(slide) = deck.slide(&self.slide_id) else {
+            return false;
+        };
+        let steps_len = slide
+            .animation
+            .as_ref()
+            .map_or(0, |animation| animation.steps.len());
+        self.index <= steps_len && self.step.shape_index < slide.shapes.len()
+    }
+}
+
+/// Reorders a build step within a slide's animation sequence.
+///
+/// The step at `from` is removed and re-inserted at `to` (shifting the
+/// intervening steps). Inverse moves it back — a [`MoveBuildStep`] with
+/// `from` and `to` swapped.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MoveBuildStep {
+    slide_id: String,
+    from: usize,
+    to: usize,
+}
+
+impl MoveBuildStep {
+    /// Creates a new move-build-step command.
+    pub fn new(slide_id: impl Into<String>, from: usize, to: usize) -> Self {
+        Self {
+            slide_id: slide_id.into(),
+            from,
+            to,
+        }
+    }
+}
+
+impl Command for MoveBuildStep {
+    fn apply(&self, deck: &mut Deck) {
+        let Some(slide) = deck.slide_mut(&self.slide_id) else {
+            return;
+        };
+        let Some(animation) = slide.animation.as_mut() else {
+            return;
+        };
+        let steps = &mut animation.steps;
+        if self.from < steps.len() && self.to < steps.len() {
+            let step = steps.remove(self.from);
+            steps.insert(self.to, step);
+        }
+    }
+
+    fn inverse(&self, _deck: &Deck) -> Box<dyn Command> {
+        Box::new(MoveBuildStep::new(
+            self.slide_id.clone(),
+            self.to,
+            self.from,
+        ))
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        let Some(slide) = deck.slide(&self.slide_id) else {
+            return false;
+        };
+        let Some(animation) = slide.animation.as_ref() else {
+            return false;
+        };
+        self.from < animation.steps.len() && self.to < animation.steps.len()
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5426,5 +5882,605 @@ mod tests {
             panic!("expected restored chart");
         };
         assert_eq!(c.chart_type, ChartType::Scatter);
+    }
+
+    #[test]
+    fn old_deck_without_animation_deserializes() {
+        // A deck serialized before animation/transition existed has neither key.
+        // The Option fields (with #[serde(default)]) must deserialize to None.
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with("s1", vec![geo_rectangle()]));
+        let original = deck.clone();
+
+        let json = serde_json::to_string(&deck).expect("serialize deck");
+        let mut value: serde_json::Value = serde_json::from_str(&json).expect("parse json");
+        let slide = value
+            .get_mut("slides")
+            .expect("slides")
+            .get_mut(0)
+            .expect("slide 0")
+            .as_object_mut()
+            .expect("slide object");
+        assert!(slide.remove("animation").is_some());
+        assert!(slide.remove("transition").is_some());
+        let stripped = serde_json::to_string(&value).expect("reserialize");
+
+        let restored: Deck = serde_json::from_str(&stripped).expect("deserialize old deck");
+        assert_eq!(restored.slides[0].animation, None);
+        assert_eq!(restored.slides[0].transition, None);
+        assert_eq!(restored, original);
+        assert_eq!(restored.schema_version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn transition_new_clamps_duration() {
+        assert_eq!(Transition::new(TransitionKind::Fade, 0).duration_ms, 0);
+        assert_eq!(
+            Transition::new(TransitionKind::Fade, MAX_TRANSITION_MS).duration_ms,
+            MAX_TRANSITION_MS
+        );
+        assert_eq!(
+            Transition::new(TransitionKind::Fade, MAX_TRANSITION_MS + 1).duration_ms,
+            MAX_TRANSITION_MS
+        );
+        assert_eq!(
+            Transition::new(TransitionKind::Fade, u32::MAX).duration_ms,
+            MAX_TRANSITION_MS
+        );
+        assert_eq!(
+            Transition::new(TransitionKind::Push, 1234).kind,
+            TransitionKind::Push
+        );
+    }
+
+    #[test]
+    fn build_step_new_clamps_duration() {
+        assert_eq!(BuildStep::new(0, BuildEffect::Fade, 0).duration_ms, 0);
+        assert_eq!(
+            BuildStep::new(0, BuildEffect::Fade, MAX_BUILD_STEP_MS).duration_ms,
+            MAX_BUILD_STEP_MS
+        );
+        assert_eq!(
+            BuildStep::new(0, BuildEffect::Fade, MAX_BUILD_STEP_MS + 1).duration_ms,
+            MAX_BUILD_STEP_MS
+        );
+        assert_eq!(
+            BuildStep::new(7, BuildEffect::Appear, u32::MAX).duration_ms,
+            MAX_BUILD_STEP_MS
+        );
+        assert_eq!(BuildStep::new(7, BuildEffect::Appear, 10).shape_index, 7);
+    }
+
+    #[test]
+    fn set_transition_applies_and_undoes() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with("s1", vec![geo_rectangle()]));
+        let original = deck.clone();
+
+        let mut bus = CommandBus::default();
+        // None -> Some.
+        bus.apply(
+            Box::new(SetTransition::new(
+                "s1",
+                Some(Transition::new(TransitionKind::Fade, 400)),
+            )),
+            &mut deck,
+        )
+        .expect("set");
+        assert_eq!(
+            deck.slides[0].transition,
+            Some(Transition::new(TransitionKind::Fade, 400))
+        );
+        // Undo restores None.
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+
+        // Some -> different Some; undo restores the first Some, then None.
+        bus.apply(
+            Box::new(SetTransition::new(
+                "s1",
+                Some(Transition::new(TransitionKind::Push, 600)),
+            )),
+            &mut deck,
+        )
+        .expect("set push");
+        bus.apply(
+            Box::new(SetTransition::new(
+                "s1",
+                Some(Transition::new(TransitionKind::Wipe, 800)),
+            )),
+            &mut deck,
+        )
+        .expect("set wipe");
+        assert_eq!(
+            deck.slides[0].transition,
+            Some(Transition::new(TransitionKind::Wipe, 800))
+        );
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(
+            deck.slides[0].transition,
+            Some(Transition::new(TransitionKind::Push, 600))
+        );
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn set_transition_rejects_missing_slide() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with("s1", Vec::new()));
+        let mut bus = CommandBus::default();
+        assert_eq!(
+            bus.apply(
+                Box::new(SetTransition::new(
+                    "missing",
+                    Some(Transition::new(TransitionKind::Fade, 400))
+                )),
+                &mut deck
+            ),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(bus.undo_len(), 0);
+        assert_eq!(deck.slides[0].transition, None);
+    }
+
+    #[test]
+    fn set_slide_animation_applies_and_undoes() {
+        let mut deck = Deck::new();
+        deck.slides
+            .push(slide_with("s1", vec![geo_rectangle(), geo_rectangle()]));
+        let original = deck.clone();
+
+        let animation = Animation::new(vec![
+            BuildStep::new(0, BuildEffect::Fade, 200),
+            BuildStep::new(1, BuildEffect::Appear, 100),
+        ]);
+        let mut bus = CommandBus::default();
+        bus.apply(
+            Box::new(SetSlideAnimation::new("s1", Some(animation.clone()))),
+            &mut deck,
+        )
+        .expect("set");
+        assert_eq!(deck.slides[0].animation, Some(animation));
+
+        // Clearing is also reversible.
+        bus.apply(Box::new(SetSlideAnimation::new("s1", None)), &mut deck)
+            .expect("clear");
+        assert_eq!(deck.slides[0].animation, None);
+
+        assert!(bus.undo(&mut deck).is_some());
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn set_slide_animation_rejects_bad_shape_index_and_missing_slide() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with("s1", vec![geo_rectangle()])); // one shape, index 0
+        let mut bus = CommandBus::default();
+        // shape_index 1 is out of range.
+        let bad = Animation::new(vec![BuildStep::new(1, BuildEffect::Fade, 100)]);
+        assert_eq!(
+            bus.apply(Box::new(SetSlideAnimation::new("s1", Some(bad))), &mut deck),
+            Err(CommandError::InvalidCommand)
+        );
+        // Missing slide.
+        assert_eq!(
+            bus.apply(Box::new(SetSlideAnimation::new("missing", None)), &mut deck),
+            Err(CommandError::InvalidCommand)
+        );
+        // A valid animation is accepted; one bad step rejects the whole sequence.
+        let mixed = Animation::new(vec![
+            BuildStep::new(0, BuildEffect::Fade, 100),
+            BuildStep::new(9, BuildEffect::Appear, 100),
+        ]);
+        assert_eq!(
+            bus.apply(
+                Box::new(SetSlideAnimation::new("s1", Some(mixed))),
+                &mut deck
+            ),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(bus.undo_len(), 0);
+        assert_eq!(deck.slides[0].animation, None);
+    }
+
+    #[test]
+    fn add_build_step_applies_and_undoes() {
+        let mut deck = Deck::new();
+        deck.slides
+            .push(slide_with("s1", vec![geo_rectangle(), geo_rectangle()]));
+        let original = deck.clone();
+
+        let mut bus = CommandBus::default();
+        bus.apply(
+            Box::new(AddBuildStep::new(
+                "s1",
+                BuildStep::new(0, BuildEffect::Fade, 200),
+            )),
+            &mut deck,
+        )
+        .expect("add");
+        assert_eq!(
+            deck.slides[0]
+                .animation
+                .as_ref()
+                .expect("animation")
+                .steps
+                .len(),
+            1
+        );
+        bus.apply(
+            Box::new(AddBuildStep::new(
+                "s1",
+                BuildStep::new(1, BuildEffect::Appear, 100),
+            )),
+            &mut deck,
+        )
+        .expect("add 2");
+        let steps = &deck.slides[0].animation.as_ref().expect("animation").steps;
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].shape_index, 0);
+        assert_eq!(steps[1].shape_index, 1);
+
+        // Undoing both restores None (no leftover empty Some).
+        assert!(bus.undo(&mut deck).is_some());
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck.slides[0].animation, None);
+        assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn add_build_step_rejects_bad_shape_index_and_missing_slide() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with("s1", vec![geo_rectangle()]));
+        let mut bus = CommandBus::default();
+        assert_eq!(
+            bus.apply(
+                Box::new(AddBuildStep::new(
+                    "s1",
+                    BuildStep::new(5, BuildEffect::Appear, 100)
+                )),
+                &mut deck
+            ),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(
+            bus.apply(
+                Box::new(AddBuildStep::new(
+                    "missing",
+                    BuildStep::new(0, BuildEffect::Appear, 100)
+                )),
+                &mut deck
+            ),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(bus.undo_len(), 0);
+        assert_eq!(deck.slides[0].animation, None);
+    }
+
+    #[test]
+    fn remove_build_step_at_applies_and_undoes() {
+        let mut deck = Deck::new();
+        deck.slides
+            .push(slide_with("s1", vec![geo_rectangle(), geo_rectangle()]));
+        let mut bus = CommandBus::default();
+        bus.apply(
+            Box::new(AddBuildStep::new(
+                "s1",
+                BuildStep::new(0, BuildEffect::Fade, 200),
+            )),
+            &mut deck,
+        )
+        .expect("seed 0");
+        bus.apply(
+            Box::new(AddBuildStep::new(
+                "s1",
+                BuildStep::new(1, BuildEffect::Appear, 100),
+            )),
+            &mut deck,
+        )
+        .expect("seed 1");
+        let original = deck.clone();
+
+        // Remove the first step; the remaining one is shape_index 1.
+        bus.apply(Box::new(RemoveBuildStepAt::new("s1", 0)), &mut deck)
+            .expect("remove");
+        let steps = &deck.slides[0].animation.as_ref().expect("animation").steps;
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].shape_index, 1);
+
+        // Undo restores the removed step at position 0.
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn remove_build_step_at_clears_animation_when_empty() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with("s1", vec![geo_rectangle()]));
+        let mut bus = CommandBus::default();
+        bus.apply(
+            Box::new(AddBuildStep::new(
+                "s1",
+                BuildStep::new(0, BuildEffect::Fade, 200),
+            )),
+            &mut deck,
+        )
+        .expect("seed");
+        assert!(deck.slides[0].animation.is_some());
+
+        // Removing the only step resets animation to None.
+        bus.apply(Box::new(RemoveBuildStepAt::new("s1", 0)), &mut deck)
+            .expect("remove");
+        assert_eq!(deck.slides[0].animation, None);
+        // Undo restores it.
+        assert!(bus.undo(&mut deck).is_some());
+        assert!(deck.slides[0].animation.is_some());
+    }
+
+    #[test]
+    fn insert_build_step_applies_and_undoes() {
+        let mut deck = Deck::new();
+        deck.slides
+            .push(slide_with("s1", vec![geo_rectangle(), geo_rectangle()]));
+        let original = deck.clone();
+
+        let mut bus = CommandBus::default();
+        // Inserting creates the animation if absent.
+        bus.apply(
+            Box::new(InsertBuildStepAt::new(
+                "s1",
+                0,
+                BuildStep::new(1, BuildEffect::Fade, 200),
+            )),
+            &mut deck,
+        )
+        .expect("insert");
+        let steps = &deck.slides[0].animation.as_ref().expect("animation").steps;
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].shape_index, 1);
+
+        // Undo removes the (only) step and clears animation back to None.
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn move_build_step_applies_and_undoes() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with(
+            "s1",
+            vec![geo_rectangle(), geo_rectangle(), geo_rectangle()],
+        ));
+        let mut bus = CommandBus::default();
+        bus.apply(
+            Box::new(AddBuildStep::new(
+                "s1",
+                BuildStep::new(0, BuildEffect::Fade, 100),
+            )),
+            &mut deck,
+        )
+        .expect("seed 0");
+        bus.apply(
+            Box::new(AddBuildStep::new(
+                "s1",
+                BuildStep::new(1, BuildEffect::Appear, 100),
+            )),
+            &mut deck,
+        )
+        .expect("seed 1");
+        bus.apply(
+            Box::new(AddBuildStep::new(
+                "s1",
+                BuildStep::new(2, BuildEffect::Disappear, 100),
+            )),
+            &mut deck,
+        )
+        .expect("seed 2");
+        let original = deck.clone();
+
+        // Move the first step (shape_index 0) to the end.
+        bus.apply(Box::new(MoveBuildStep::new("s1", 0, 2)), &mut deck)
+            .expect("move");
+        let steps = &deck.slides[0].animation.as_ref().expect("animation").steps;
+        assert_eq!(
+            steps.iter().map(|s| s.shape_index).collect::<Vec<_>>(),
+            vec![1, 2, 0]
+        );
+
+        // Undo restores the original order.
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn remove_and_move_build_step_reject_bad_index_and_missing_slide() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with("s1", vec![geo_rectangle()]));
+        let mut bus = CommandBus::default();
+        bus.apply(
+            Box::new(AddBuildStep::new(
+                "s1",
+                BuildStep::new(0, BuildEffect::Fade, 100),
+            )),
+            &mut deck,
+        )
+        .expect("seed 0");
+        bus.apply(
+            Box::new(AddBuildStep::new(
+                "s1",
+                BuildStep::new(0, BuildEffect::Appear, 100),
+            )),
+            &mut deck,
+        )
+        .expect("seed 1");
+        // Two steps now.
+
+        let mut rejections = CommandBus::default();
+        // Remove out of range.
+        assert_eq!(
+            rejections.apply(Box::new(RemoveBuildStepAt::new("s1", 9)), &mut deck),
+            Err(CommandError::InvalidCommand)
+        );
+        // Remove from a missing slide.
+        assert_eq!(
+            rejections.apply(Box::new(RemoveBuildStepAt::new("missing", 0)), &mut deck),
+            Err(CommandError::InvalidCommand)
+        );
+        // Move out of range (both ends).
+        assert_eq!(
+            rejections.apply(Box::new(MoveBuildStep::new("s1", 0, 9)), &mut deck),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(
+            rejections.apply(Box::new(MoveBuildStep::new("s1", 9, 0)), &mut deck),
+            Err(CommandError::InvalidCommand)
+        );
+        // Move on a missing slide.
+        assert_eq!(
+            rejections.apply(Box::new(MoveBuildStep::new("missing", 0, 1)), &mut deck),
+            Err(CommandError::InvalidCommand)
+        );
+        // A slide with no animation rejects remove/move.
+        deck.slides.push(slide_with("s2", vec![geo_rectangle()]));
+        assert_eq!(
+            rejections.apply(Box::new(RemoveBuildStepAt::new("s2", 0)), &mut deck),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(
+            rejections.apply(Box::new(MoveBuildStep::new("s2", 0, 0)), &mut deck),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(rejections.undo_len(), 0);
+        // Seed data untouched.
+        assert_eq!(
+            deck.slides[0]
+                .animation
+                .as_ref()
+                .expect("animation")
+                .steps
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn animation_and_transition_serialize_and_deserialize() {
+        let transition = Transition::new(TransitionKind::Fade, 750);
+        let tj = serde_json::to_string(&transition).expect("serialize transition");
+        let tr: Transition = serde_json::from_str(&tj).expect("deserialize transition");
+        assert_eq!(transition, tr);
+        assert!(tj.contains("\"kind\":\"fade\""));
+        assert!(tj.contains("\"duration_ms\":750"));
+
+        let animation = Animation::new(vec![
+            BuildStep::new(2, BuildEffect::SlideInLeft, 300),
+            BuildStep::new(0, BuildEffect::Disappear, 150),
+        ]);
+        let aj = serde_json::to_string(&animation).expect("serialize animation");
+        let ar: Animation = serde_json::from_str(&aj).expect("deserialize animation");
+        assert_eq!(animation, ar);
+        assert!(aj.contains("\"slide_in_left\""));
+        assert!(aj.contains("\"disappear\""));
+        assert!(aj.contains("\"shape_index\""));
+        assert!(aj.contains("\"effect\""));
+        assert!(aj.contains("\"duration_ms\""));
+
+        // Every enum variant round-trips through its snake_case tag.
+        for effect in [
+            BuildEffect::Fade,
+            BuildEffect::SlideInLeft,
+            BuildEffect::SlideInRight,
+            BuildEffect::SlideInTop,
+            BuildEffect::SlideInBottom,
+            BuildEffect::Appear,
+            BuildEffect::Disappear,
+        ] {
+            let j = serde_json::to_string(&effect).expect("serialize effect");
+            let r: BuildEffect = serde_json::from_str(&j).expect("deserialize effect");
+            assert_eq!(effect, r);
+        }
+        for kind in [
+            TransitionKind::None,
+            TransitionKind::Fade,
+            TransitionKind::Slide,
+            TransitionKind::Push,
+            TransitionKind::Wipe,
+        ] {
+            let j = serde_json::to_string(&kind).expect("serialize kind");
+            let r: TransitionKind = serde_json::from_str(&j).expect("deserialize kind");
+            assert_eq!(kind, r);
+        }
+        // The TransitionKind::Slide tag is "slide"; BuildEffect's is "slide_in_left".
+        assert_eq!(
+            serde_json::to_string(&TransitionKind::Slide).expect("serialize"),
+            "\"slide\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BuildEffect::SlideInLeft).expect("serialize"),
+            "\"slide_in_left\""
+        );
+    }
+
+    #[test]
+    fn deck_with_animation_and_transition_round_trips() {
+        let mut deck = Deck::new();
+        let mut slide = slide_with("s1", vec![geo_rectangle(), geo_rectangle()]);
+        slide.animation = Some(Animation::new(vec![
+            BuildStep::new(0, BuildEffect::Fade, 250),
+            BuildStep::new(1, BuildEffect::Appear, 120),
+        ]));
+        slide.transition = Some(Transition::new(TransitionKind::Push, 900));
+        deck.slides.push(slide);
+
+        let json = serde_json::to_string(&deck).expect("serialize deck");
+        let restored: Deck = serde_json::from_str(&json).expect("deserialize deck");
+        assert_eq!(deck, restored);
+        assert_eq!(restored.schema_version, SCHEMA_VERSION);
+        assert_eq!(
+            restored.slides[0].transition,
+            Some(Transition::new(TransitionKind::Push, 900))
+        );
+        assert_eq!(
+            restored.slides[0]
+                .animation
+                .as_ref()
+                .expect("animation")
+                .steps
+                .len(),
+            2
+        );
+        assert!(json.contains("\"animation\""));
+        assert!(json.contains("\"transition\""));
+        assert!(json.contains("\"push\""));
+        assert!(json.contains("\"fade\""));
+    }
+
+    #[test]
+    fn duplicate_shape_indices_are_allowed() {
+        // The same shape can have multiple steps (e.g. appear then disappear).
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with("s1", vec![geo_rectangle()]));
+        let mut bus = CommandBus::default();
+        bus.apply(
+            Box::new(AddBuildStep::new(
+                "s1",
+                BuildStep::new(0, BuildEffect::Appear, 100),
+            )),
+            &mut deck,
+        )
+        .expect("appear");
+        bus.apply(
+            Box::new(AddBuildStep::new(
+                "s1",
+                BuildStep::new(0, BuildEffect::Disappear, 100),
+            )),
+            &mut deck,
+        )
+        .expect("disappear");
+        let steps = &deck.slides[0].animation.as_ref().expect("animation").steps;
+        assert_eq!(steps.len(), 2);
+        assert!(steps.iter().all(|s| s.shape_index == 0));
     }
 }
