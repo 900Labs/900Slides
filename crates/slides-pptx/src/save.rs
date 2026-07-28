@@ -487,6 +487,7 @@ fn write_model_shape<W: Write>(
             let xml = table_graphic_frame_xml(table, id, &name);
             writer.get_mut().write_all(xml.as_bytes())?;
         }
+        Shape::Chart(_) => {}
     }
     Ok(())
 }
@@ -825,6 +826,7 @@ fn append_shape<W: Write>(
             let xml = table_graphic_frame_xml(table, id, &name);
             writer.get_mut().write_all(xml.as_bytes())?;
         }
+        Shape::Chart(_) => {}
     }
     Ok(())
 }

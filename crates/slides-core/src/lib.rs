@@ -202,6 +202,8 @@ pub enum Shape {
     Geometric(GeometricShape),
     /// A table: a grid of cells with per-column widths and per-row heights.
     Table(TableShape),
+    /// A chart: a plotted data series.
+    Chart(ChartShape),
 }
 
 /// An editable text box shape.
@@ -459,6 +461,240 @@ pub struct BorderEdge {
     /// Dash pattern of the edge.
     #[serde(default)]
     pub dash: DashStyle,
+}
+
+/// Maximum number of data series in a chart (PRODUCT_SPEC.md §5.2).
+pub const MAX_CHART_SERIES: usize = 50;
+/// Maximum number of data points per series in a chart (PRODUCT_SPEC.md §5.2).
+pub const MAX_CHART_POINTS: usize = 1000;
+
+/// Errors returned by [`ChartShape::new`] and [`ChartShape::validate`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ChartError {
+    /// The chart must have at least one series.
+    #[error("chart must have at least one series")]
+    Empty,
+    /// The chart exceeds the series cap.
+    #[error("chart exceeds the {max} series limit ({got})")]
+    TooManySeries {
+        /// The number of series in the offending chart.
+        got: usize,
+        /// The configured series cap ([`MAX_CHART_SERIES`]).
+        max: usize,
+    },
+    /// A series exceeds the per-series point cap.
+    #[error("series {index} exceeds the {max} point limit ({got})")]
+    TooManyPoints {
+        /// Index of the offending series.
+        index: usize,
+        /// The number of points in the offending series.
+        got: usize,
+        /// The configured per-series point cap ([`MAX_CHART_POINTS`]).
+        max: usize,
+    },
+    /// A category series must have one value per category.
+    #[error("series {index} has {got} values but there are {want} categories")]
+    SeriesCategoryMismatch {
+        /// Index of the offending series.
+        index: usize,
+        /// The number of values the series carries.
+        got: usize,
+        /// The number of categories the chart defines.
+        want: usize,
+    },
+    /// The chart data kind does not match the chart type.
+    #[error("chart data kind does not match chart type")]
+    DataTypeMismatch,
+}
+
+/// The kind of chart, mirroring PRODUCT_SPEC.md §5.2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChartType {
+    /// Horizontal bars.
+    Bar,
+    /// Vertical columns.
+    Column,
+    /// Connected line segments.
+    Line,
+    /// Filled area below a line.
+    Area,
+    /// Pie slices.
+    Pie,
+    /// Scatter (XY) points.
+    Scatter,
+}
+
+impl ChartType {
+    /// Returns `true` if this type is driven by category data.
+    pub fn is_category(&self) -> bool {
+        matches!(
+            self,
+            ChartType::Bar | ChartType::Column | ChartType::Line | ChartType::Area | ChartType::Pie
+        )
+    }
+
+    /// Returns `true` if this type is driven by XY data.
+    pub fn is_xy(&self) -> bool {
+        matches!(self, ChartType::Scatter)
+    }
+}
+
+/// The data backing a chart.
+///
+/// Category charts ([`ChartType::is_category`]) take [`ChartData::Category`];
+/// scatter charts take [`ChartData::XY`]. The two kinds cannot be mixed with a
+/// single chart type.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum ChartData {
+    /// Category-aligned data for bar, column, line, area, and pie charts.
+    Category {
+        /// Category labels, shared across every series.
+        categories: Vec<String>,
+        /// One or more value series, each aligned with `categories`.
+        series: Vec<CategorySeries>,
+    },
+    /// XY (scatter) data.
+    #[serde(rename = "xy")]
+    XY {
+        /// One or more point series.
+        series: Vec<XYSeries>,
+    },
+}
+
+/// A value series aligned with a set of categories.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CategorySeries {
+    /// Series name, shown in the legend.
+    #[serde(default)]
+    pub name: String,
+    /// One numeric value per category.
+    pub values: Vec<f64>,
+}
+
+/// A series of (x, y) points for scatter charts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct XYSeries {
+    /// Series name, shown in the legend.
+    #[serde(default)]
+    pub name: String,
+    /// Ordered (x, y) pairs.
+    pub points: Vec<XYPoint>,
+}
+
+/// A single (x, y) point in an [`XYSeries`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct XYPoint {
+    /// Horizontal coordinate.
+    pub x: f64,
+    /// Vertical coordinate.
+    pub y: f64,
+}
+
+impl XYPoint {
+    /// Creates a new (x, y) point.
+    pub const fn new(x: f64, y: f64) -> Self {
+        Self { x, y }
+    }
+}
+
+/// A chart shape placed on a slide.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChartShape {
+    /// Position, size, and rotation of the chart.
+    pub transform: Transform,
+    /// Kind of chart.
+    pub chart_type: ChartType,
+    /// Data plotted by the chart.
+    pub data: ChartData,
+    /// Optional chart title.
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+impl ChartShape {
+    /// Constructs a chart, validating its structural invariants.
+    ///
+    /// Returns [`ChartError`] if the data has no series, exceeds the series or
+    /// per-series point caps, has a category series that does not align with its
+    /// categories, or whose kind does not match `chart_type`.
+    pub fn new(
+        transform: Transform,
+        chart_type: ChartType,
+        data: ChartData,
+        title: Option<String>,
+    ) -> Result<Self, ChartError> {
+        Self::validate_parts(chart_type, &data)?;
+        Ok(Self {
+            transform,
+            chart_type,
+            data,
+            title,
+        })
+    }
+
+    fn validate_parts(chart_type: ChartType, data: &ChartData) -> Result<(), ChartError> {
+        match data {
+            ChartData::Category { categories, series } => {
+                if !chart_type.is_category() {
+                    return Err(ChartError::DataTypeMismatch);
+                }
+                Self::check_series_cap(series.len())?;
+                let want = categories.len();
+                for (index, s) in series.iter().enumerate() {
+                    Self::check_point_cap(index, s.values.len())?;
+                    if s.values.len() != want {
+                        return Err(ChartError::SeriesCategoryMismatch {
+                            index,
+                            got: s.values.len(),
+                            want,
+                        });
+                    }
+                }
+            }
+            ChartData::XY { series } => {
+                if !chart_type.is_xy() {
+                    return Err(ChartError::DataTypeMismatch);
+                }
+                Self::check_series_cap(series.len())?;
+                for (index, s) in series.iter().enumerate() {
+                    Self::check_point_cap(index, s.points.len())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn check_series_cap(len: usize) -> Result<(), ChartError> {
+        if len == 0 {
+            Err(ChartError::Empty)
+        } else if len > MAX_CHART_SERIES {
+            Err(ChartError::TooManySeries {
+                got: len,
+                max: MAX_CHART_SERIES,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn check_point_cap(index: usize, len: usize) -> Result<(), ChartError> {
+        if len > MAX_CHART_POINTS {
+            Err(ChartError::TooManyPoints {
+                index,
+                got: len,
+                max: MAX_CHART_POINTS,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Returns `true` if the chart satisfies the same invariants as [`new`].
+    pub fn validate(&self) -> bool {
+        Self::validate_parts(self.chart_type, &self.data).is_ok()
+    }
 }
 
 /// A rectangle in EMU (English Metric Units; 914400 EMU per inch).
@@ -1676,6 +1912,7 @@ impl Command for MoveShape {
             Shape::Image(image) => image.transform = self.transform,
             Shape::Geometric(geometric) => geometric.transform = self.transform,
             Shape::Table(table) => table.transform = self.transform,
+            Shape::Chart(chart) => chart.transform = self.transform,
             Shape::Passthrough(_) => {}
         };
     }
@@ -1692,6 +1929,7 @@ impl Command for MoveShape {
                 Shape::Image(image) => Some(image.transform),
                 Shape::Geometric(geometric) => Some(geometric.transform),
                 Shape::Table(table) => Some(table.transform),
+                Shape::Chart(chart) => Some(chart.transform),
                 Shape::Passthrough(_) => None,
             })
             .unwrap_or_default();
@@ -2658,6 +2896,260 @@ impl Command for RestoreColumn {
 
     fn validate(&self, _deck: &Deck) -> bool {
         true
+    }
+}
+
+/// Appends a [`Shape::Chart`] onto the end of a slide's shape list.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AddChart {
+    slide_id: String,
+    chart: ChartShape,
+}
+
+impl AddChart {
+    /// Creates a new add-chart command.
+    pub fn new(slide_id: impl Into<String>, chart: ChartShape) -> Self {
+        Self {
+            slide_id: slide_id.into(),
+            chart,
+        }
+    }
+}
+
+impl Command for AddChart {
+    fn apply(&self, deck: &mut Deck) {
+        if let Some(slide) = deck.slide_mut(&self.slide_id) {
+            slide.shapes.push(Shape::Chart(self.chart.clone()));
+        }
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        let shape_index = deck
+            .slide(&self.slide_id)
+            .map_or(0, |slide| slide.shapes.len());
+        Box::new(DeleteShape::new(self.slide_id.clone(), shape_index))
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        deck.slide(&self.slide_id).is_some() && self.chart.validate()
+    }
+}
+
+/// Sets the [`ChartType`] of a chart shape.
+///
+/// Validation rejects a type whose data kind does not match the chart's
+/// existing data (for example, switching a category chart to scatter without
+/// also swapping its data).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetChartType {
+    slide_id: String,
+    shape_index: usize,
+    chart_type: ChartType,
+}
+
+impl SetChartType {
+    /// Creates a new set-chart-type command.
+    pub fn new(slide_id: impl Into<String>, shape_index: usize, chart_type: ChartType) -> Self {
+        Self {
+            slide_id: slide_id.into(),
+            shape_index,
+            chart_type,
+        }
+    }
+}
+
+impl Command for SetChartType {
+    fn apply(&self, deck: &mut Deck) {
+        let Some(slide) = deck.slide_mut(&self.slide_id) else {
+            return;
+        };
+        let Some(shape) = slide.shapes.get_mut(self.shape_index) else {
+            return;
+        };
+        if let Shape::Chart(chart) = shape {
+            chart.chart_type = self.chart_type;
+        }
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        let prior = deck
+            .slide(&self.slide_id)
+            .and_then(|slide| slide.shapes.get(self.shape_index))
+            .and_then(|shape| match shape {
+                Shape::Chart(chart) => Some(chart.chart_type),
+                _ => None,
+            })
+            .unwrap_or(self.chart_type);
+        Box::new(Self {
+            slide_id: self.slide_id.clone(),
+            shape_index: self.shape_index,
+            chart_type: prior,
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        let Some(slide) = deck.slide(&self.slide_id) else {
+            return false;
+        };
+        let Some(shape) = slide.shapes.get(self.shape_index) else {
+            return false;
+        };
+        let Shape::Chart(chart) = shape else {
+            return false;
+        };
+        ChartShape::validate_parts(self.chart_type, &chart.data).is_ok()
+    }
+}
+
+/// Replaces the [`ChartData`] of a chart shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetChartData {
+    slide_id: String,
+    shape_index: usize,
+    data: ChartData,
+}
+
+impl SetChartData {
+    /// Creates a new set-chart-data command.
+    pub fn new(slide_id: impl Into<String>, shape_index: usize, data: ChartData) -> Self {
+        Self {
+            slide_id: slide_id.into(),
+            shape_index,
+            data,
+        }
+    }
+}
+
+impl Command for SetChartData {
+    fn apply(&self, deck: &mut Deck) {
+        let Some(slide) = deck.slide_mut(&self.slide_id) else {
+            return;
+        };
+        let Some(shape) = slide.shapes.get_mut(self.shape_index) else {
+            return;
+        };
+        if let Shape::Chart(chart) = shape {
+            chart.data = self.data.clone();
+        }
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        let prior = deck
+            .slide(&self.slide_id)
+            .and_then(|slide| slide.shapes.get(self.shape_index))
+            .and_then(|shape| match shape {
+                Shape::Chart(chart) => Some(chart.data.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| self.data.clone());
+        Box::new(Self {
+            slide_id: self.slide_id.clone(),
+            shape_index: self.shape_index,
+            data: prior,
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        let Some(slide) = deck.slide(&self.slide_id) else {
+            return false;
+        };
+        let Some(shape) = slide.shapes.get(self.shape_index) else {
+            return false;
+        };
+        let Shape::Chart(chart) = shape else {
+            return false;
+        };
+        ChartShape::validate_parts(chart.chart_type, &self.data).is_ok()
+    }
+}
+
+/// Sets the optional title of a chart shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetChartTitle {
+    slide_id: String,
+    shape_index: usize,
+    title: Option<String>,
+}
+
+impl SetChartTitle {
+    /// Creates a new set-chart-title command.
+    pub fn new(slide_id: impl Into<String>, shape_index: usize, title: Option<String>) -> Self {
+        Self {
+            slide_id: slide_id.into(),
+            shape_index,
+            title,
+        }
+    }
+}
+
+impl Command for SetChartTitle {
+    fn apply(&self, deck: &mut Deck) {
+        let Some(slide) = deck.slide_mut(&self.slide_id) else {
+            return;
+        };
+        let Some(shape) = slide.shapes.get_mut(self.shape_index) else {
+            return;
+        };
+        if let Shape::Chart(chart) = shape {
+            chart.title = self.title.clone();
+        }
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        let prior = deck
+            .slide(&self.slide_id)
+            .and_then(|slide| slide.shapes.get(self.shape_index))
+            .and_then(|shape| match shape {
+                Shape::Chart(chart) => chart.title.clone(),
+                _ => None,
+            });
+        Box::new(Self {
+            slide_id: self.slide_id.clone(),
+            shape_index: self.shape_index,
+            title: prior,
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        let Some(slide) = deck.slide(&self.slide_id) else {
+            return false;
+        };
+        let Some(shape) = slide.shapes.get(self.shape_index) else {
+            return false;
+        };
+        matches!(shape, Shape::Chart(_))
     }
 }
 
@@ -4386,5 +4878,553 @@ mod tests {
 
         assert!(bus.undo(&mut deck).is_some());
         assert_eq!(deck, original);
+    }
+
+    fn sample_category_chart() -> ChartShape {
+        ChartShape::new(
+            Transform {
+                frame: Rect::new(0.0, 0.0, 914_400.0, 685_800.0),
+                rotation: 0.0,
+            },
+            ChartType::Column,
+            ChartData::Category {
+                categories: vec!["Q1".to_string(), "Q2".to_string(), "Q3".to_string()],
+                series: vec![
+                    CategorySeries {
+                        name: "2023".to_string(),
+                        values: vec![10.0, 20.0, 30.0],
+                    },
+                    CategorySeries {
+                        name: "2024".to_string(),
+                        values: vec![15.0, 25.0, 35.0],
+                    },
+                ],
+            },
+            Some("Revenue".to_string()),
+        )
+        .expect("valid category chart")
+    }
+
+    fn sample_xy_chart() -> ChartShape {
+        ChartShape::new(
+            Transform::default(),
+            ChartType::Scatter,
+            ChartData::XY {
+                series: vec![XYSeries {
+                    name: "Run A".to_string(),
+                    points: vec![XYPoint::new(0.0, 1.0), XYPoint::new(1.0, 2.0)],
+                }],
+            },
+            None,
+        )
+        .expect("valid xy chart")
+    }
+
+    #[test]
+    fn chart_type_classification() {
+        for t in [
+            ChartType::Bar,
+            ChartType::Column,
+            ChartType::Line,
+            ChartType::Area,
+            ChartType::Pie,
+        ] {
+            assert!(t.is_category(), "{:?} should be category", t);
+            assert!(!t.is_xy(), "{:?} should not be xy", t);
+        }
+        assert!(ChartType::Scatter.is_xy());
+        assert!(!ChartType::Scatter.is_category());
+    }
+
+    #[test]
+    fn chart_new_validates_invariants() {
+        let cat = |vals: Vec<f64>| CategorySeries {
+            name: "s".to_string(),
+            values: vals,
+        };
+
+        let ok = ChartShape::new(
+            Transform::default(),
+            ChartType::Bar,
+            ChartData::Category {
+                categories: vec!["a".to_string(), "b".to_string()],
+                series: vec![cat(vec![1.0, 2.0]), cat(vec![3.0, 4.0])],
+            },
+            None,
+        );
+        let chart = ok.expect("valid category chart");
+        assert_eq!(chart.title, None);
+        assert!(chart.validate());
+
+        // Empty (no series).
+        assert_eq!(
+            ChartShape::new(
+                Transform::default(),
+                ChartType::Column,
+                ChartData::Category {
+                    categories: vec!["a".to_string()],
+                    series: Vec::new(),
+                },
+                None,
+            ),
+            Err(ChartError::Empty)
+        );
+
+        // Ragged: the first series that does not align with categories is
+        // reported (here, index 0 has 1 value but there are 2 categories).
+        assert_eq!(
+            ChartShape::new(
+                Transform::default(),
+                ChartType::Line,
+                ChartData::Category {
+                    categories: vec!["a".to_string(), "b".to_string()],
+                    series: vec![cat(vec![1.0]), cat(vec![1.0, 2.0, 3.0])],
+                },
+                None,
+            ),
+            Err(ChartError::SeriesCategoryMismatch {
+                index: 0,
+                got: 1,
+                want: 2,
+            })
+        );
+
+        // Series cap.
+        let over_series = (0..MAX_CHART_SERIES + 1)
+            .map(|_| cat(vec![1.0]))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ChartShape::new(
+                Transform::default(),
+                ChartType::Column,
+                ChartData::Category {
+                    categories: vec!["a".to_string()],
+                    series: over_series,
+                },
+                None,
+            ),
+            Err(ChartError::TooManySeries {
+                got: MAX_CHART_SERIES + 1,
+                max: MAX_CHART_SERIES,
+            })
+        );
+
+        // Point cap (per series).
+        let over_points = cat(vec![1.0; MAX_CHART_POINTS + 1]);
+        assert_eq!(
+            ChartShape::new(
+                Transform::default(),
+                ChartType::Column,
+                ChartData::Category {
+                    categories: vec!["x".to_string(); MAX_CHART_POINTS + 1],
+                    series: vec![over_points],
+                },
+                None,
+            ),
+            Err(ChartError::TooManyPoints {
+                index: 0,
+                got: MAX_CHART_POINTS + 1,
+                max: MAX_CHART_POINTS,
+            })
+        );
+
+        // Type/data mismatch: scatter needs XY data.
+        assert_eq!(
+            ChartShape::new(
+                Transform::default(),
+                ChartType::Scatter,
+                ChartData::Category {
+                    categories: vec!["a".to_string()],
+                    series: vec![cat(vec![1.0])],
+                },
+                None,
+            ),
+            Err(ChartError::DataTypeMismatch)
+        );
+
+        // Type/data mismatch: category type needs category data.
+        assert_eq!(
+            ChartShape::new(
+                Transform::default(),
+                ChartType::Pie,
+                ChartData::XY {
+                    series: vec![XYSeries {
+                        name: "s".to_string(),
+                        points: vec![XYPoint::new(0.0, 0.0)],
+                    }],
+                },
+                None,
+            ),
+            Err(ChartError::DataTypeMismatch)
+        );
+
+        // Max series / points are accepted at the boundary.
+        let max_series = (0..MAX_CHART_SERIES)
+            .map(|_| cat(vec![1.0]))
+            .collect::<Vec<_>>();
+        assert!(ChartShape::new(
+            Transform::default(),
+            ChartType::Column,
+            ChartData::Category {
+                categories: vec!["a".to_string()],
+                series: max_series,
+            },
+            None,
+        )
+        .is_ok());
+
+        // XY validation.
+        let xy = ChartShape::new(
+            Transform::default(),
+            ChartType::Scatter,
+            ChartData::XY {
+                series: vec![XYSeries {
+                    name: "s".to_string(),
+                    points: vec![XYPoint::new(1.0, 2.0); MAX_CHART_POINTS],
+                }],
+            },
+            None,
+        );
+        assert!(xy.is_ok());
+        assert!(xy.unwrap().validate());
+    }
+
+    #[test]
+    fn chart_shape_serializes_and_deserializes() {
+        let mut chart = sample_category_chart();
+        chart.title = Some("Sales by Quarter".to_string());
+        let json = serde_json::to_string(&chart).expect("serialize chart");
+        let restored: ChartShape = serde_json::from_str(&json).expect("deserialize chart");
+        assert_eq!(chart, restored);
+        assert!(json.contains("\"kind\":\"category\""));
+        assert!(json.contains("\"column\""));
+
+        let xy = sample_xy_chart();
+        let xy_json = serde_json::to_string(&xy).expect("serialize xy chart");
+        let xy_restored: ChartShape = serde_json::from_str(&xy_json).expect("deserialize xy chart");
+        assert_eq!(xy, xy_restored);
+        assert!(xy_json.contains("\"kind\":\"xy\""));
+        assert!(xy_json.contains("\"scatter\""));
+    }
+
+    #[test]
+    fn deck_with_chart_round_trips() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with(
+            "s1",
+            vec![Shape::Chart(sample_category_chart())],
+        ));
+
+        let json = serde_json::to_string(&deck).expect("serialize deck");
+        let restored: Deck = serde_json::from_str(&json).expect("deserialize deck");
+        assert_eq!(deck, restored);
+        assert!(json.contains("\"chart\""));
+        assert!(matches!(restored.slides[0].shapes[0], Shape::Chart(_)));
+    }
+
+    #[test]
+    fn add_chart_applies_and_undoes() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with("s1", Vec::new()));
+        let original = deck.clone();
+
+        let mut bus = CommandBus::default();
+        bus.apply(
+            Box::new(AddChart::new("s1", sample_category_chart())),
+            &mut deck,
+        )
+        .expect("apply");
+        assert_eq!(deck.slides[0].shapes.len(), 1);
+        assert!(matches!(deck.slides[0].shapes[0], Shape::Chart(_)));
+
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn add_chart_rejects_invalid_chart_and_missing_slide() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with("s1", Vec::new()));
+
+        let bad = ChartShape {
+            transform: Transform::default(),
+            chart_type: ChartType::Column,
+            data: ChartData::Category {
+                categories: vec!["a".to_string()],
+                series: Vec::new(),
+            },
+            title: None,
+        };
+
+        let mut bus = CommandBus::default();
+        assert_eq!(
+            bus.apply(Box::new(AddChart::new("s1", bad)), &mut deck),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(
+            bus.apply(
+                Box::new(AddChart::new("missing", sample_category_chart())),
+                &mut deck
+            ),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(bus.undo_len(), 0);
+        assert_eq!(deck.slides[0].shapes.len(), 0);
+    }
+
+    #[test]
+    fn set_chart_type_applies_and_undoes() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with(
+            "s1",
+            vec![Shape::Chart(sample_category_chart())],
+        ));
+        let original = deck.clone();
+
+        let mut bus = CommandBus::default();
+        bus.apply(
+            Box::new(SetChartType::new("s1", 0, ChartType::Line)),
+            &mut deck,
+        )
+        .expect("apply");
+        let Shape::Chart(c) = &deck.slides[0].shapes[0] else {
+            panic!("expected chart");
+        };
+        assert_eq!(c.chart_type, ChartType::Line);
+
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn set_chart_type_rejects_incompatible_type_and_non_chart() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with(
+            "s1",
+            vec![Shape::Chart(sample_category_chart()), geo_rectangle()],
+        ));
+
+        let mut bus = CommandBus::default();
+        // Scatter is incompatible with category data.
+        assert_eq!(
+            bus.apply(
+                Box::new(SetChartType::new("s1", 0, ChartType::Scatter)),
+                &mut deck
+            ),
+            Err(CommandError::InvalidCommand)
+        );
+        // Non-chart shape.
+        assert_eq!(
+            bus.apply(
+                Box::new(SetChartType::new("s1", 1, ChartType::Line)),
+                &mut deck
+            ),
+            Err(CommandError::InvalidCommand)
+        );
+        // Out of range and missing slide.
+        assert_eq!(
+            bus.apply(
+                Box::new(SetChartType::new("s1", 9, ChartType::Line)),
+                &mut deck
+            ),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(
+            bus.apply(
+                Box::new(SetChartType::new("missing", 0, ChartType::Line)),
+                &mut deck
+            ),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(bus.undo_len(), 0);
+
+        // Switching between two category types is allowed.
+        let mut bus2 = CommandBus::default();
+        bus2.apply(
+            Box::new(SetChartType::new("s1", 0, ChartType::Pie)),
+            &mut deck,
+        )
+        .expect("compatible type change");
+        let Shape::Chart(c) = &deck.slides[0].shapes[0] else {
+            panic!("expected chart");
+        };
+        assert_eq!(c.chart_type, ChartType::Pie);
+    }
+
+    #[test]
+    fn set_chart_data_applies_and_undoes() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with(
+            "s1",
+            vec![Shape::Chart(sample_category_chart())],
+        ));
+        let original = deck.clone();
+
+        let new_data = ChartData::Category {
+            categories: vec!["A".to_string(), "B".to_string()],
+            series: vec![CategorySeries {
+                name: "only".to_string(),
+                values: vec![1.0, 2.0],
+            }],
+        };
+        let mut bus = CommandBus::default();
+        bus.apply(
+            Box::new(SetChartData::new("s1", 0, new_data.clone())),
+            &mut deck,
+        )
+        .expect("apply");
+        let Shape::Chart(c) = &deck.slides[0].shapes[0] else {
+            panic!("expected chart");
+        };
+        assert_eq!(c.data, new_data);
+
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn set_chart_data_rejects_incompatible_data_and_non_chart() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with(
+            "s1",
+            vec![Shape::Chart(sample_category_chart()), geo_rectangle()],
+        ));
+
+        let xy_data = ChartData::XY {
+            series: vec![XYSeries {
+                name: "s".to_string(),
+                points: vec![XYPoint::new(0.0, 0.0)],
+            }],
+        };
+        let ragged_data = ChartData::Category {
+            categories: vec!["a".to_string(), "b".to_string()],
+            series: vec![CategorySeries {
+                name: "s".to_string(),
+                values: vec![1.0],
+            }],
+        };
+
+        let mut bus = CommandBus::default();
+        assert_eq!(
+            bus.apply(Box::new(SetChartData::new("s1", 0, xy_data)), &mut deck),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(
+            bus.apply(Box::new(SetChartData::new("s1", 0, ragged_data)), &mut deck),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(
+            bus.apply(
+                Box::new(SetChartData::new("s1", 1, sample_xy_chart().data)),
+                &mut deck
+            ),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(bus.undo_len(), 0);
+    }
+
+    #[test]
+    fn set_chart_title_applies_and_undoes() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with(
+            "s1",
+            vec![Shape::Chart(sample_category_chart())],
+        ));
+        let original = deck.clone();
+
+        let mut bus = CommandBus::default();
+        bus.apply(
+            Box::new(SetChartTitle::new("s1", 0, Some("New Title".to_string()))),
+            &mut deck,
+        )
+        .expect("apply");
+        let Shape::Chart(c) = &deck.slides[0].shapes[0] else {
+            panic!("expected chart");
+        };
+        assert_eq!(c.title.as_deref(), Some("New Title"));
+
+        // Clearing the title (None) is also reversible.
+        bus.apply(Box::new(SetChartTitle::new("s1", 0, None)), &mut deck)
+            .expect("clear");
+        let Shape::Chart(c) = &deck.slides[0].shapes[0] else {
+            panic!("expected chart");
+        };
+        assert_eq!(c.title, None);
+
+        assert!(bus.undo(&mut deck).is_some());
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn set_chart_title_rejects_non_chart() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with(
+            "s1",
+            vec![Shape::Chart(sample_category_chart()), geo_rectangle()],
+        ));
+
+        let mut bus = CommandBus::default();
+        assert_eq!(
+            bus.apply(Box::new(SetChartTitle::new("s1", 1, None)), &mut deck),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(
+            bus.apply(Box::new(SetChartTitle::new("missing", 0, None)), &mut deck),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(
+            bus.apply(Box::new(SetChartTitle::new("s1", 9, None)), &mut deck),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(bus.undo_len(), 0);
+    }
+
+    #[test]
+    fn move_shape_moves_chart_transform() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with(
+            "s1",
+            vec![Shape::Chart(sample_category_chart())],
+        ));
+        let original = deck.clone();
+
+        let moved = Transform {
+            frame: Rect::new(50.0, 60.0, 70.0, 80.0),
+            rotation: 12.0,
+        };
+        let mut bus = CommandBus::default();
+        bus.apply(Box::new(MoveShape::new("s1", 0, moved)), &mut deck)
+            .expect("move chart");
+        let Shape::Chart(c) = &deck.slides[0].shapes[0] else {
+            panic!("expected chart");
+        };
+        assert_eq!(c.transform, moved);
+
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn delete_chart_restores_on_undo() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with(
+            "s1",
+            vec![geo_rectangle(), Shape::Chart(sample_xy_chart())],
+        ));
+        let original = deck.clone();
+
+        let mut bus = CommandBus::default();
+        bus.apply(Box::new(DeleteShape::new("s1", 1)), &mut deck)
+            .expect("delete chart");
+        assert_eq!(deck.slides[0].shapes.len(), 1);
+        assert!(matches!(deck.slides[0].shapes[0], Shape::Geometric(_)));
+
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+        let Shape::Chart(c) = &deck.slides[0].shapes[1] else {
+            panic!("expected restored chart");
+        };
+        assert_eq!(c.chart_type, ChartType::Scatter);
     }
 }
