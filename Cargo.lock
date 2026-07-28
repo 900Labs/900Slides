@@ -1335,6 +1335,7 @@ name = "slides-render"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "slides-animation",
  "slides-chart",
  "slides-core",
  "twox-hash",
