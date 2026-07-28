@@ -10,6 +10,7 @@ use std::io::Write;
 
 use zip::write::{FileOptions, ZipWriter};
 
+mod chart;
 mod error;
 mod geometry;
 mod ledger;
@@ -38,13 +39,16 @@ pub fn load(bytes: &[u8]) -> Result<Session> {
         let xml = load::read_entry_to_string(&mut archive, "[Content_Types].xml")?;
         package::parse_content_types(&xml)?
     };
-    Ok(Session::new(
+    Ok(Session::new_with_charts(
         result.deck,
         bytes.to_vec(),
         result.package_rels,
         content_types,
         result.slide_paths,
         result.slide_media_rids,
+        result.chart_source_parts,
+        result.original_chart_bytes,
+        result.slide_chart_rids,
         result.manifest_path,
         result.loss_ledger,
     ))
@@ -227,6 +231,8 @@ const P_NS: &str = "http://schemas.openxmlformats.org/presentationml/2006/main";
 const A_NS: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
 const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 
+#[cfg(test)]
+mod chart_tests;
 #[cfg(test)]
 mod rich_text_tests;
 #[cfg(test)]
