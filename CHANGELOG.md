@@ -14,7 +14,33 @@ This section tracks work toward v0.2.0 (editor completeness). See
 [`docs/sprint-records/wave-3.md`](docs/sprint-records/wave-3.md),
 [`docs/sprint-records/wave-4.md`](docs/sprint-records/wave-4.md), and
 [`docs/sprint-records/wave-5.md`](docs/sprint-records/wave-5.md), and
-[`docs/sprint-records/wave-6.md`](docs/sprint-records/wave-6.md).
+[`docs/sprint-records/wave-6.md`](docs/sprint-records/wave-6.md), and
+[`docs/sprint-records/wave-7.md`](docs/sprint-records/wave-7.md).
+
+### Added — Wave 7 (deck structure & editor completeness)
+
+- **Aspect ratios**: decks can now be 4:3, 16:10, or custom. `Deck` gains a
+  `slide_size: Option<SlideSize>` field (additive, defaults to 16:9). The
+  canvas and renderer respect the chosen dimensions. An aspect-ratio picker
+  in the toolbar switches between presets.
+- **Slide sections**: `Deck.sections` groups slides into named, collapsible
+  sections. A new `SetSections` command replaces the section list (with a
+  verified inverse). The thumbnail sidebar renders collapsible section
+  headers.
+- **Rich-text speaker notes**: `Slide.rich_notes: Option<Vec<Paragraph>>`
+  augments the existing plain-text `notes` field. When set, the editor shows
+  a rich-text notes panel reusing the existing formatting toolbar. A
+  `SetRichNotes` command sets or clears it.
+- **Find and replace**: a dialog (Cmd/Ctrl+F, Cmd/Ctrl+H) searches across
+  all slides' text boxes and replaces matches through the command bus.
+- **Shortcuts dialog**: a modal (`?` or menu) listing keyboard shortcuts.
+- **High-contrast theme**: `Theme.high_contrast: bool` toggles a
+  high-contrast palette for accessibility. A `SetHighContrast` command
+  flips it with a verified inverse.
+- Four reversible commands (`SetSlideSize`, `SetSections`, `SetRichNotes`,
+  `SetHighContrast`). All additive; old decks deserialize unchanged.
+- `docs/sprint-records/wave-7.md` documenting the wave scope and acceptance
+  criteria.
 
 ### Added — Wave 6 (spell-check)
 

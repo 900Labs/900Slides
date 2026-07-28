@@ -54,6 +54,12 @@ What v0.1.0 does:
 - **Spell-checks** text as you type (en-US, offline). Misspelled words get
   red squiggles; right-click for correction suggestions or to add a word to
   your personal dictionary, which persists across sessions.
+- Supports **16:9, 4:3, and 16:10** aspect ratios, with a picker in the
+  toolbar. Slides are grouped into **named, collapsible sections** in the
+  sidebar.
+- Provides a **rich-text speaker notes** editor, **find and replace**
+  (Cmd/Ctrl+F), a **keyboard-shortcuts dialog** (`?`), and a
+  **high-contrast theme** toggle for accessibility.
 - Animates **build-ins** (fade, slide-in from any edge, appear, disappear)
   with an ordered build-sequence editor, and plays **transitions** (none,
   fade, slide, push, wipe) between slides. The presenter reveals shapes
@@ -62,7 +68,6 @@ What v0.1.0 does:
 What v0.1.0 does **not** do yet:
 
 - Export to PDF, PNG, SVG, or ODP.
-- Support aspect ratios other than 16:9.
 - Ship a signed or notarized installer on any platform.
 
 ## Build from source

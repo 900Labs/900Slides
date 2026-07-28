@@ -545,6 +545,7 @@ fn parse_slide(
         shapes,
         animation,
         transition,
+        rich_notes: None,
     })
 }
 
@@ -1763,6 +1764,7 @@ fn parse_theme(xml: &str) -> Result<Theme> {
         heading_font: major_font.unwrap_or_else(|| "Calibri".to_string()),
         body_font: minor_font.unwrap_or_else(|| "Calibri".to_string()),
         accent_color: accent,
+        high_contrast: false,
     })
 }
 
