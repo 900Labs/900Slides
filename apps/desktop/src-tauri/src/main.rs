@@ -2,11 +2,20 @@
 
 mod commands;
 
+use tauri::Manager;
+
 fn main() {
     let _version = slides_core::version();
     tauri::Builder::default()
         .manage(commands::AppState::new())
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            // Load any persisted user-dictionary words into the spell checker
+            // before the UI is interactive. Missing file -> empty user dict.
+            let state = app.state::<commands::AppState>();
+            state.load_user_dictionary();
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::new_deck,
             commands::open_deck,
@@ -47,6 +56,9 @@ fn main() {
             commands::list_recovery_snapshots,
             commands::restore_recovery,
             commands::discard_recovery,
+            commands::spell_check,
+            commands::spell_suggest,
+            commands::spell_add_word,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -322,3 +322,10 @@ export interface RecoverySnapshot {
   timestamp: string
   deckId: string
 }
+
+/** A misspelled word with its byte span within the checked text. */
+export interface MisspellingDto {
+  word: string
+  byteStart: number
+  byteEnd: number
+}
