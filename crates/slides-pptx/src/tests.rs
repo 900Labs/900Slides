@@ -1,15 +1,19 @@
 //! Tests for the PPTX load/save boundary.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 
 use slides_core::{
-    AddShape, Color, DashStyle, Deck, DeleteShape, EditText, Fill, GeometricShape, Geometry,
-    InsertImage, ListStyle, MediaEntry, MoveShape, Outline, Paragraph, Rect, Run, SetShapeStyle,
-    Shape, Style, TextBox, Transform,
+    AddShape, Animation, BuildEffect, BuildStep, Color, DashStyle, Deck, DeleteShape, EditText,
+    Fill, GeometricShape, Geometry, InsertImage, ListStyle, MediaEntry, MediaStore, MoveShape,
+    Outline, Paragraph, PassthroughObject, Rect, Run, SetShapeStyle, Shape, Slide, Style, TextBox,
+    Theme, Transform, Transition, TransitionKind,
 };
 use zip::write::{FileOptions, ZipWriter};
 
+use crate::ledger::LossLedger;
+use crate::package::{ContentTypes, Rel};
+use crate::session::Session;
 use crate::{load, save};
 
 const P_NS: &str = "http://schemas.openxmlformats.org/presentationml/2006/main";
@@ -1252,4 +1256,255 @@ fn delete_shape_then_undo_round_trips() {
     let saved = save(&session).expect("save");
     let again = load(&saved).expect("reload");
     assert_eq!(again.deck().slides[0].shapes.len(), 5);
+}
+
+// ---------------------------------------------------------------------------
+// Wave 5 — transition and animation saver (Component 5)
+// ---------------------------------------------------------------------------
+
+const ORIGINAL_SHAPE_XML: &str = r#"<p:sp>
+  <p:nvSpPr>
+    <p:cNvPr id="2" name="Shape 1"/>
+    <p:cNvSpPr/>
+    <p:nvPr/>
+  </p:nvSpPr>
+  <p:spPr>
+    <a:xfrm>
+      <a:off x="100000" y="100000"/>
+      <a:ext cx="1000000" cy="1000000"/>
+    </a:xfrm>
+  </p:spPr>
+</p:sp>"#;
+
+fn slide_with_transition_and_timing(
+    transition_xml: Option<&str>,
+    timing_xml: Option<&str>,
+) -> String {
+    let transition = transition_xml.unwrap_or("");
+    let timing = timing_xml.unwrap_or("");
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sld xmlns:p="{P_NS}" xmlns:a="{A_NS}" xmlns:r="{R_NS}">
+  <p:cSld>
+    <p:spTree>
+      <p:nvGrpSpPr>
+        <p:cNvPr id="0" name=""/>
+        <p:cNvGrpSpPr/>
+        <p:nvPr/>
+      </p:nvGrpSpPr>
+      <p:grpSpPr/>
+      {ORIGINAL_SHAPE_XML}
+    </p:spTree>
+    {transition}
+  </p:cSld>
+  {timing}
+</p:sld>"#
+    )
+}
+
+fn passthrough_shape() -> Shape {
+    Shape::Passthrough(PassthroughObject {
+        id: "2".to_string(),
+        label: "sp".to_string(),
+        source_part: "ppt/slides/slide1.xml".to_string(),
+        raw_bytes: ORIGINAL_SHAPE_XML.as_bytes().to_vec(),
+        frame: Some(Rect::new(100000.0, 100000.0, 1000000.0, 1000000.0)),
+    })
+}
+
+fn session_from_slide_xml(slide_xml: &str, slide: Slide) -> Session {
+    let original = build_pptx(slide_xml, None, &[]);
+    let mut slide_paths = HashMap::new();
+    slide_paths.insert(slide.id.clone(), slide.id.clone());
+    let package_rels = vec![Rel {
+        id: "rId2".to_string(),
+        rel_type: REL_TYPE_MANIFEST.to_string(),
+        target: "customXml/item1.xml".to_string(),
+        target_mode: None,
+    }];
+    let mut content_types = ContentTypes::default();
+    content_types.defaults.insert(
+        "rels".to_string(),
+        "application/vnd.openxmlformats-package.relationships+xml".to_string(),
+    );
+    content_types
+        .defaults
+        .insert("xml".to_string(), "application/xml".to_string());
+    content_types.overrides.insert(
+        "/ppt/presentation.xml".to_string(),
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"
+            .to_string(),
+    );
+    content_types.overrides.insert(
+        "/ppt/slides/slide1.xml".to_string(),
+        "application/vnd.openxmlformats-officedocument.presentationml.slide+xml".to_string(),
+    );
+    content_types.overrides.insert(
+        "/ppt/theme/theme1.xml".to_string(),
+        "application/vnd.openxmlformats-officedocument.theme+xml".to_string(),
+    );
+    content_types
+        .overrides
+        .insert("/customXml/item1.xml".to_string(), CT_MANIFEST.to_string());
+
+    Session::new(
+        Deck {
+            schema_version: 1,
+            id: "fixture-deck-id".to_string(),
+            theme: Theme::default(),
+            slides: vec![slide],
+            media: MediaStore::default(),
+        },
+        original,
+        package_rels,
+        content_types,
+        slide_paths,
+        HashMap::new(),
+        None,
+        LossLedger::new(),
+    )
+}
+
+#[test]
+fn save_no_edit_keeps_byte_identical() {
+    let slide_xml = slide_with_transition_and_timing(
+        Some(r#"<p:transition spd="500"><p:fade/></p:transition>"#),
+        None,
+    );
+    let slide = Slide {
+        id: "ppt/slides/slide1.xml".to_string(),
+        notes: String::new(),
+        shapes: vec![passthrough_shape()],
+        animation: None,
+        transition: Some(Transition::new(TransitionKind::Fade, 500)),
+    };
+    let session = session_from_slide_xml(&slide_xml, slide);
+    let saved = save(&session).expect("save should succeed");
+
+    let original_entries = zip_entries(&session.original_bytes);
+    let saved_entries = zip_entries(&saved);
+    assert_eq!(original_entries, saved_entries);
+
+    for name in original_entries {
+        if name == "[Content_Types].xml" || name == "customXml/item1.xml" {
+            continue;
+        }
+        assert_eq!(
+            entry_bytes(&session.original_bytes, &name),
+            entry_bytes(&saved, &name),
+            "{name} should be byte-identical"
+        );
+    }
+}
+
+#[test]
+fn save_edits_transition_preserves_other_parts() {
+    let slide_xml = slide_with_transition_and_timing(
+        Some(r#"<p:transition spd="500"><p:fade/></p:transition>"#),
+        None,
+    );
+    let slide = Slide {
+        id: "ppt/slides/slide1.xml".to_string(),
+        notes: String::new(),
+        shapes: vec![passthrough_shape()],
+        animation: None,
+        transition: Some(Transition::new(TransitionKind::Push, 750)),
+    };
+    let mut session = session_from_slide_xml(&slide_xml, slide);
+    session.mark_slide_dirty("ppt/slides/slide1.xml");
+    let saved = save(&session).expect("save should succeed");
+
+    for name in zip_entries(&session.original_bytes) {
+        if name == "[Content_Types].xml"
+            || name == "customXml/item1.xml"
+            || name == "ppt/slides/slide1.xml"
+        {
+            continue;
+        }
+        assert_eq!(
+            entry_bytes(&session.original_bytes, &name),
+            entry_bytes(&saved, &name),
+            "{name} should be byte-identical"
+        );
+    }
+
+    let original_slide = String::from_utf8(entry_bytes(
+        &session.original_bytes,
+        "ppt/slides/slide1.xml",
+    ))
+    .unwrap();
+    let saved_slide = String::from_utf8(entry_bytes(&saved, "ppt/slides/slide1.xml")).unwrap();
+    assert!(
+        saved_slide.contains("<p:push/>"),
+        "saved slide should have push transition"
+    );
+    assert!(
+        !saved_slide.contains("<p:fade/>"),
+        "saved slide should not have old fade transition"
+    );
+    assert!(
+        saved_slide.contains(r#"spd="750""#),
+        "saved transition should use new duration"
+    );
+    assert_ne!(
+        original_slide, saved_slide,
+        "edited slide should have changed"
+    );
+}
+
+#[test]
+fn save_edits_animation_patches_timing() {
+    let slide_xml = slide_with_transition_and_timing(None, None);
+    let slide = Slide {
+        id: "ppt/slides/slide1.xml".to_string(),
+        notes: String::new(),
+        shapes: vec![passthrough_shape()],
+        animation: Some(Animation::new(vec![BuildStep::new(
+            0,
+            BuildEffect::Fade,
+            500,
+        )])),
+        transition: None,
+    };
+    let mut session = session_from_slide_xml(&slide_xml, slide);
+    session.mark_slide_dirty("ppt/slides/slide1.xml");
+    let saved = save(&session).expect("save should succeed");
+
+    let saved_slide = String::from_utf8(entry_bytes(&saved, "ppt/slides/slide1.xml")).unwrap();
+    assert!(
+        saved_slide.contains("<p:timing>"),
+        "saved slide should have p:timing"
+    );
+    assert!(
+        saved_slide.contains(r#"filter="fade""#),
+        "timing should reflect fade effect"
+    );
+    assert!(
+        saved_slide.contains(r#"spid="100000""#),
+        "timing should target generated shape id"
+    );
+}
+
+#[test]
+fn clear_transition_then_save() {
+    let slide_xml = slide_with_transition_and_timing(
+        Some(r#"<p:transition spd="500"><p:fade/></p:transition>"#),
+        None,
+    );
+    let slide = Slide {
+        id: "ppt/slides/slide1.xml".to_string(),
+        notes: String::new(),
+        shapes: vec![passthrough_shape()],
+        animation: None,
+        transition: None,
+    };
+    let mut session = session_from_slide_xml(&slide_xml, slide);
+    session.mark_slide_dirty("ppt/slides/slide1.xml");
+    let saved = save(&session).expect("save should succeed");
+
+    let saved_slide = String::from_utf8(entry_bytes(&saved, "ppt/slides/slide1.xml")).unwrap();
+    assert!(
+        !saved_slide.contains("<p:transition"),
+        "cleared transition should be removed"
+    );
 }
