@@ -19,6 +19,7 @@ mod media;
 mod package;
 mod save;
 mod session;
+mod transition;
 
 pub use error::{Error, Result};
 pub use ledger::{LossLedger, LossWarning};
@@ -239,3 +240,5 @@ mod rich_text_tests;
 mod table_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod transition_tests;
