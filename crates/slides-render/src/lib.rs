@@ -13,9 +13,9 @@ use std::hash::Hasher;
 
 use base64::Engine as _;
 use slides_core::{
-    CellAlign, Color, DashStyle, Fill, GeometricShape, Geometry, HeadingLevel, ImageShape,
-    ListStyle, MediaStore, Outline, Paragraph, PassthroughObject, Rect, Run, Shadow, Shape, Style,
-    TableBorders, TableCell, TableShape, TextBox, Theme, VerticalAlign,
+    CellAlign, ChartShape, Color, DashStyle, Fill, GeometricShape, Geometry, HeadingLevel,
+    ImageShape, ListStyle, MediaStore, Outline, Paragraph, PassthroughObject, Rect, Run, Shadow,
+    Shape, Style, TableBorders, TableCell, TableShape, TextBox, Theme, VerticalAlign,
 };
 
 /// Horizontal padding inside a text box, in EMU (0.1 inch).
@@ -110,7 +110,7 @@ pub fn render_slide(
                 render_geometric(geometric, filter_id, &mut body);
             }
             Shape::Table(table) => render_table(table, theme, &mut body),
-            Shape::Chart(_) => {}
+            Shape::Chart(chart) => render_chart(chart, &mut body),
         }
     }
 
@@ -139,6 +139,29 @@ pub fn render_slide(
     let hash = hasher.finish();
 
     RenderedSlide { svg, hash }
+}
+
+/// Renders a chart by delegating to [`slides_chart::render_chart_svg`] and
+/// embedding the result as a nested `<svg>` positioned at the chart's frame.
+///
+/// The chart crate emits a standalone `<svg viewBox="0 0 W H">` document sized
+/// to the dimensions it is given. To place it on the slide without it expanding
+/// to fill the entire viewport, the `x`, `y`, `width`, and `height` attributes
+/// are injected into the root tag, turning it into a nested viewport. This is
+/// safe because the chart output contains exactly one `<svg` token (its root);
+/// every chart primitive is a `<rect>`/`<text>`/`<path>`/`<circle>`/`<polyline>`.
+fn render_chart(chart: &ChartShape, out: &mut String) {
+    let frame = &chart.transform.frame;
+    let mut svg = slides_chart::render_chart_svg(chart, frame.width, frame.height);
+    let header = format!(
+        "<svg x=\"{x}\" y=\"{y}\" width=\"{w}\" height=\"{h}\" ",
+        x = fnum(frame.x),
+        y = fnum(frame.y),
+        w = fnum(frame.width),
+        h = fnum(frame.height),
+    );
+    svg = svg.replacen("<svg ", &header, 1);
+    out.push_str(&svg);
 }
 
 /// Formats an EMU/coordinate value as a deterministic string.
@@ -856,8 +879,8 @@ fn render_cell_text(
 mod tests {
     use super::*;
     use slides_core::{
-        BorderEdge, CellAlign, GeometricShape, HeadingLevel, ImageShape, MediaEntry,
-        ParagraphStyle, Run, TableBorders, TableShape, TextBox, Transform,
+        BorderEdge, CategorySeries, CellAlign, ChartData, ChartType, GeometricShape, HeadingLevel,
+        ImageShape, MediaEntry, ParagraphStyle, Run, TableBorders, TableShape, TextBox, Transform,
     };
 
     fn rect(x: f64, y: f64, w: f64, h: f64) -> Rect {
@@ -987,6 +1010,47 @@ mod tests {
         assert!(out.svg.contains("data:image/png;base64,"));
         assert!(out.svg.contains("Missing image: absent"));
         assert!(out.svg.contains("fill=\"#cccccc\""));
+    }
+
+    #[test]
+    fn chart_renders_positioned_and_deterministic() {
+        let chart = ChartShape::new(
+            Transform {
+                frame: rect(500_000.0, 500_000.0, 6_000_000.0, 3_000_000.0),
+                rotation: 0.0,
+            },
+            ChartType::Column,
+            ChartData::Category {
+                categories: vec!["Q1".to_string(), "Q2".to_string(), "Q3".to_string()],
+                series: vec![CategorySeries {
+                    name: "Sales".to_string(),
+                    values: vec![10.0, 20.0, 30.0],
+                }],
+            },
+            Some("Quarterly Sales".to_string()),
+        )
+        .expect("valid chart");
+
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::Chart(chart));
+
+        let out = render(&slide);
+
+        // The chart is embedded as a nested `<svg>` positioned at its frame,
+        // not stretched across the whole slide viewport.
+        assert!(
+            out.svg
+                .contains("<svg x=\"500000\" y=\"500000\" width=\"6000000\" height=\"3000000\""),
+            "chart must be positioned at its frame via a nested svg"
+        );
+        // Column charts render bars as rectangles.
+        assert!(out.svg.contains("<rect"), "column chart should render bars");
+        // Title text is rendered.
+        assert!(out.svg.contains("Quarterly Sales"));
+        // Deterministic: same input yields identical svg and hash.
+        let again = render(&slide);
+        assert_eq!(out.svg, again.svg);
+        assert_eq!(out.hash, again.hash);
     }
 
     #[test]
