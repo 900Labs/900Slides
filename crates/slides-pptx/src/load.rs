@@ -368,7 +368,14 @@ fn parse_slide(
     reader.config_mut().trim_text(true);
     let mut buf = Vec::new();
     let mut shapes: Vec<Shape> = Vec::new();
+    let mut shape_ids: Vec<String> = Vec::new();
     let mut in_sp_tree = false;
+    // `p:transition` (child of `p:cSld`) and `p:timing` (child of `p:sld`)
+    // both live outside `p:spTree`. We capture their raw XML here and parse
+    // them after the shape walk so build-in targets can resolve to shape
+    // indices.
+    let mut transition_xml: Option<String> = None;
+    let mut timing_xml: Option<String> = None;
 
     loop {
         match reader.read_event_into(&mut buf)? {
@@ -376,12 +383,29 @@ fn parse_slide(
                 let local = qname_str(e.name());
                 if local == "spTree" {
                     in_sp_tree = true;
+                } else if !in_sp_tree && local == "transition" {
+                    let start = e.into_owned();
+                    let mut captured = Vec::new();
+                    let mut writer = Writer::new(&mut captured);
+                    copy_element(&mut reader, &start, &mut writer, &mut buf)?;
+                    transition_xml = Some(String::from_utf8_lossy(&captured).into_owned());
+                } else if !in_sp_tree && local == "timing" {
+                    let start = e.into_owned();
+                    let mut captured = Vec::new();
+                    let mut writer = Writer::new(&mut captured);
+                    copy_element(&mut reader, &start, &mut writer, &mut buf)?;
+                    timing_xml = Some(String::from_utf8_lossy(&captured).into_owned());
                 } else if in_sp_tree && SHAPE_ELEMENT_NAMES.contains(&local.as_str()) {
                     let start = e.into_owned();
                     let mut captured = Vec::new();
                     let mut writer = Writer::new(&mut captured);
                     copy_element(&mut reader, &start, &mut writer, &mut buf)?;
                     let captured_str = String::from_utf8_lossy(&captured).into_owned();
+
+                    // Shapes are assigned to the model in document order; record
+                    // the OOXML `p:cNvPr` id of each so build-in animations can
+                    // resolve their `spTgt spid` back to a shape index.
+                    shape_ids.push(extract_id(&captured_str, shapes.len()));
 
                     if local == "pic" {
                         match parse_pic(&captured_str, slide_rels) {
@@ -499,12 +523,28 @@ fn parse_slide(
         buf.clear();
     }
 
+    // Map OOXML shape ids (p:cNvPr id) to model shape indices (document order).
+    let id_to_index: HashMap<String, usize> = shape_ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (id.clone(), index))
+        .collect();
+
+    let transition = match transition_xml.as_deref() {
+        Some(xml) => crate::transition::parse_transition(xml, slide_id, ledger),
+        None => None,
+    };
+    let animation = match timing_xml.as_deref() {
+        Some(xml) => crate::transition::parse_animation(xml, &id_to_index, slide_id, ledger),
+        None => None,
+    };
+
     Ok(Slide {
         id: String::new(),
         notes: String::new(),
         shapes,
-        animation: None,
-        transition: None,
+        animation,
+        transition,
     })
 }
 

@@ -7,6 +7,9 @@
   import RecoveryPrompt from './RecoveryPrompt.svelte'
   import ChartEditor from './ChartEditor.svelte'
   import type {
+    AnimationDto,
+    BuildEffectDto,
+    BuildStepDto,
     ChartDataDto,
     ChartShapeSnapshot,
     ChartTypeDto,
@@ -17,6 +20,7 @@
     RunDto,
     SlideSnapshot,
     TextBoxSnapshot,
+    TransitionKindDto,
     WarningDto,
   } from './lib/types'
 
@@ -42,11 +46,33 @@
   let showChartDropdown = $state(false)
   /** Currently edited chart, if any. */
   let activeChart = $state<{ shapeIndex: number } | null>(null)
+  /** Active right-panel tab: 'notes' or 'animation'. */
+  let rightPanelTab = $state<'notes' | 'animation'>('notes')
+  /** Selected shape index for adding a build step. */
+  let selectedShapeIndex = $state<number>(0)
+  /** Selected build effect for adding a build step. */
+  let selectedBuildEffect = $state<BuildEffectDto>('fade')
+  /** Duration (ms) for a new build step. */
+  let selectedBuildDuration = $state(500)
+  /** Duration (ms) for the slide transition. */
+  let transitionDuration = $state(500)
 
   /** Maximum grid dimension offered by the table size picker. */
   const PICKER_MAX = 6
   /** Chart types offered by the chart toolbar dropdown. */
   const CHART_TYPES: ChartTypeDto[] = ['bar', 'column', 'line', 'area', 'pie', 'scatter']
+  /** Slide transition kinds offered by the transition picker. */
+  const TRANSITION_KINDS: TransitionKindDto[] = ['none', 'fade', 'slide', 'push', 'wipe']
+  /** Build-in effects offered by the build step picker. */
+  const BUILD_EFFECTS: BuildEffectDto[] = [
+    'fade',
+    'slide_in_left',
+    'slide_in_right',
+    'slide_in_top',
+    'slide_in_bottom',
+    'appear',
+    'disappear',
+  ]
   /** Row/column indices for the picker grid. */
   const pickerIndices = [...Array(PICKER_MAX).keys()]
 
@@ -54,6 +80,9 @@
 
   const activeSlide = $derived<SlideSnapshot | null>(deck?.slides[activeIndex] ?? null)
   const notes = $derived(activeSlide?.notes ?? '')
+  const activeTransitionKind = $derived<TransitionKindDto>(activeSlide?.transition?.kind ?? 'none')
+  const activeTransitionDurationMs = $derived<number>(activeSlide?.transition?.durationMs ?? 500)
+  const activeAnimation = $derived<AnimationDto | undefined>(activeSlide?.animation)
 
   $effect(() => {
     if (!isPresenter) {
@@ -427,6 +456,55 @@
     }
   }
 
+  /** Applies or clears the active slide's transition. */
+  async function onSetTransition(kind: TransitionKindDto, durationMs: number): Promise<void> {
+    if (!activeSlide) return
+    deck = await invoke<DeckSnapshot>('set_transition', {
+      slide_id: activeSlide.id,
+      kind: kind === 'none' ? null : kind,
+      duration_ms: durationMs,
+    })
+  }
+
+  /** Replaces the full animation sequence for the active slide. */
+  async function onSetSlideAnimation(steps: BuildStepDto[]): Promise<void> {
+    if (!activeSlide) return
+    deck = await invoke<DeckSnapshot>('set_slide_animation', {
+      slide_id: activeSlide.id,
+      steps,
+    })
+  }
+
+  /** Appends a build step to the active slide's animation sequence. */
+  async function onAddBuildStep(): Promise<void> {
+    if (!activeSlide) return
+    deck = await invoke<DeckSnapshot>('add_build_step', {
+      slide_id: activeSlide.id,
+      shape_index: selectedShapeIndex,
+      effect: selectedBuildEffect,
+      duration_ms: selectedBuildDuration,
+    })
+  }
+
+  /** Removes a build step by index. */
+  async function onRemoveBuildStep(stepIndex: number): Promise<void> {
+    if (!activeSlide) return
+    deck = await invoke<DeckSnapshot>('remove_build_step', {
+      slide_id: activeSlide.id,
+      step_index: stepIndex,
+    })
+  }
+
+  /** Moves a build step from one position to another. */
+  async function onMoveBuildStep(from: number, to: number): Promise<void> {
+    if (!activeSlide) return
+    deck = await invoke<DeckSnapshot>('move_build_step', {
+      slide_id: activeSlide.id,
+      from,
+      to,
+    })
+  }
+
   /** Selects a different slide in the thumbnail panel. */
   function selectSlide(index: number): void {
     activeIndex = index
@@ -631,12 +709,141 @@
         {/if}
       </main>
 
-      <aside class="notes" aria-label="Speaker notes">
-        <h2>Notes</h2>
-        {#if notes}
-          <p>{notes}</p>
+      <aside class="right-panel" aria-label="Notes and animation">
+        <div class="tab-bar" role="tablist">
+          <button
+            class="tab"
+            class:active={rightPanelTab === 'notes'}
+            onclick={() => (rightPanelTab = 'notes')}
+            type="button"
+            role="tab"
+            aria-selected={rightPanelTab === 'notes'}
+          >
+            Notes
+          </button>
+          <button
+            class="tab"
+            class:active={rightPanelTab === 'animation'}
+            onclick={() => (rightPanelTab = 'animation')}
+            type="button"
+            role="tab"
+            aria-selected={rightPanelTab === 'animation'}
+          >
+            Animation
+          </button>
+        </div>
+
+        {#if rightPanelTab === 'notes'}
+          <div class="panel-content" role="tabpanel">
+            {#if notes}
+              <p>{notes}</p>
+            {:else}
+              <p class="placeholder">No notes for this slide.</p>
+            {/if}
+          </div>
         {:else}
-          <p class="placeholder">No notes for this slide.</p>
+          <div class="panel-content" role="tabpanel">
+            <div class="section">
+              <h3>Transition</h3>
+              <label class="field">
+                Kind
+                <select
+                  value={activeTransitionKind}
+                  onchange={(event) =>
+                    onSetTransition(
+                      (event.target as HTMLSelectElement).value as TransitionKindDto,
+                      activeTransitionDurationMs,
+                    )}
+                >
+                  {#each TRANSITION_KINDS as kind}
+                    <option value={kind}>{kind.charAt(0).toUpperCase() + kind.slice(1)}</option>
+                  {/each}
+                </select>
+              </label>
+              <label class="field">
+                Duration: {activeTransitionDurationMs}ms
+                <input
+                  type="range"
+                  min={0}
+                  max={5000}
+                  step={100}
+                  value={activeTransitionDurationMs}
+                  onchange={(event) =>
+                    onSetTransition(
+                      activeTransitionKind,
+                      Number.parseInt((event.target as HTMLInputElement).value, 10),
+                    )}
+                />
+              </label>
+            </div>
+
+            <div class="section">
+              <h3>Build Steps</h3>
+              {#if activeAnimation && activeAnimation.steps.length > 0}
+                <ol class="build-list">
+                  {#each activeAnimation.steps as step, stepIndex}
+                    <li class="build-item">
+                      <span class="build-info">
+                        Shape {step.shapeIndex}: {step.effect.replace(/_/g, ' ')} ({step.durationMs}ms)
+                      </span>
+                      <span class="build-actions">
+                        <button
+                          onclick={() => onMoveBuildStep(stepIndex, stepIndex - 1)}
+                          disabled={stepIndex === 0}
+                          type="button"
+                          title="Move up"
+                        >
+                          ↑
+                        </button>
+                        <button
+                          onclick={() => onMoveBuildStep(stepIndex, stepIndex + 1)}
+                          disabled={stepIndex === activeAnimation.steps.length - 1}
+                          type="button"
+                          title="Move down"
+                        >
+                          ↓
+                        </button>
+                        <button
+                          onclick={() => onRemoveBuildStep(stepIndex)}
+                          type="button"
+                          title="Remove"
+                        >
+                          −
+                        </button>
+                      </span>
+                    </li>
+                  {/each}
+                </ol>
+              {:else}
+                <p class="placeholder">No build steps yet.</p>
+              {/if}
+            </div>
+
+            <div class="section">
+              <h3>Add Build Step</h3>
+              <label class="field">
+                Shape
+                <select bind:value={selectedShapeIndex}>
+                  {#each activeSlide?.shapes ?? [] as shape, index}
+                    <option value={index}>{index}: {shape.kind}</option>
+                  {/each}
+                </select>
+              </label>
+              <label class="field">
+                Effect
+                <select bind:value={selectedBuildEffect}>
+                  {#each BUILD_EFFECTS as effect}
+                    <option value={effect}>{effect.replace(/_/g, ' ')}</option>
+                  {/each}
+                </select>
+              </label>
+              <label class="field">
+                Duration: {selectedBuildDuration}ms
+                <input type="range" min={0} max={3000} step={100} bind:value={selectedBuildDuration} />
+              </label>
+              <button onclick={onAddBuildStep} type="button">Add Step</button>
+            </div>
+          </div>
         {/if}
       </aside>
     </div>
@@ -838,16 +1045,86 @@
   .empty-canvas {
     color: #666;
   }
-  .notes {
-    width: 220px;
+  .right-panel {
+    width: 240px;
     border-left: 1px solid #ccc;
-    padding: 0.5rem;
     background: #fafafa;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .tab-bar {
+    display: flex;
+    border-bottom: 1px solid #ccc;
+  }
+  .tab {
+    flex: 1;
+    padding: 0.5rem;
+    background: #f0f0f0;
+    border: none;
+    border-right: 1px solid #ccc;
+    cursor: pointer;
+  }
+  .tab:last-child {
+    border-right: none;
+  }
+  .tab.active {
+    background: #fafafa;
+    font-weight: bold;
+  }
+  .panel-content {
+    flex: 1;
+    padding: 0.75rem;
     overflow-y: auto;
   }
-  .notes h2 {
-    font-size: 1rem;
-    margin-top: 0;
+  .panel-content h3 {
+    font-size: 0.9rem;
+    margin: 0 0 0.5rem;
+  }
+  .section {
+    margin-bottom: 1rem;
+    padding-bottom: 1rem;
+    border-bottom: 1px solid #ddd;
+  }
+  .section:last-child {
+    border-bottom: none;
+  }
+  .field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    margin-bottom: 0.5rem;
+    font-size: 0.8rem;
+    color: #555;
+  }
+  .field input,
+  .field select {
+    padding: 0.25rem;
+    font-size: 0.85rem;
+  }
+  .build-list {
+    margin: 0;
+    padding-left: 1.25rem;
+    font-size: 0.85rem;
+  }
+  .build-item {
+    margin-bottom: 0.25rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.25rem;
+  }
+  .build-info {
+    flex: 1;
+    text-transform: capitalize;
+  }
+  .build-actions {
+    display: flex;
+    gap: 0.1rem;
+  }
+  .build-actions button {
+    padding: 0.1rem 0.3rem;
+    font-size: 0.8rem;
   }
   .placeholder {
     color: #888;

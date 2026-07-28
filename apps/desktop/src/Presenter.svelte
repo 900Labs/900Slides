@@ -9,6 +9,10 @@
   let elapsed = $state(0)
   /** Timer interval handle. */
   let timer = $state<ReturnType<typeof setInterval> | null>(null)
+  /** Current build step index within the current slide; -1 = before first step. */
+  let activeBuildStep = $state<number>(Infinity)
+  /** Slide id at the time the current build step was initialized; resets on slide change. */
+  let lastSlideId = $state<string | null>(null)
 
   $effect(() => {
     refresh()
@@ -26,29 +30,63 @@
   /** Refreshes presenter state from the backend. */
   async function refresh(): Promise<void> {
     presenterState = await invoke<PresenterState>('get_presenter_state')
+    if (presenterState) {
+      lastSlideId = presenterState.currentSlide.id
+      activeBuildStep = Infinity
+    }
   }
 
-  /** Advances to the next slide. */
+  /** Advances the build timeline or moves to the next slide. */
   async function next(): Promise<void> {
-    presenterState = await invoke<PresenterState>('presenter_next')
+    if (!presenterState) return
+    const steps = presenterState.currentSlide.animation?.steps ?? []
+    const maxStep = steps.length - 1
+    if (activeBuildStep < maxStep) {
+      activeBuildStep += 1
+      return
+    }
+    const result = await invoke<PresenterState>('presenter_next')
+    if (result.slideNumber !== presenterState.slideNumber) {
+      presenterState = result
+      lastSlideId = result.currentSlide.id
+      activeBuildStep = -1
+    }
   }
 
-  /** Goes to the previous slide. */
+  /** Goes to the previous slide, showing it fully built. */
   async function previous(): Promise<void> {
-    presenterState = await invoke<PresenterState>('presenter_previous')
+    if (!presenterState) return
+    const result = await invoke<PresenterState>('presenter_previous')
+    if (result.slideNumber !== presenterState.slideNumber) {
+      presenterState = result
+      lastSlideId = result.currentSlide.id
+      activeBuildStep = Infinity
+    }
   }
 
   /** Jumps to the first slide. */
   async function first(): Promise<void> {
     while (presenterState && presenterState.slideNumber > 1) {
-      presenterState = await invoke<PresenterState>('presenter_previous')
+      const result = await invoke<PresenterState>('presenter_previous')
+      if (result.slideNumber === presenterState.slideNumber) break
+      presenterState = result
+    }
+    if (presenterState) {
+      lastSlideId = presenterState.currentSlide.id
+      activeBuildStep = Infinity
     }
   }
 
   /** Jumps to the last slide. */
   async function last(): Promise<void> {
     while (presenterState && presenterState.slideNumber < presenterState.total) {
-      presenterState = await invoke<PresenterState>('presenter_next')
+      const result = await invoke<PresenterState>('presenter_next')
+      if (result.slideNumber === presenterState.slideNumber) break
+      presenterState = result
+    }
+    if (presenterState) {
+      lastSlideId = presenterState.currentSlide.id
+      activeBuildStep = Infinity
     }
   }
 
@@ -90,17 +128,38 @@
   function backgroundColor(): ColorDto {
     return presenterState?.currentSlide ? { r: 255, g: 255, b: 255, a: 255 } : { r: 255, g: 255, b: 255, a: 255 }
   }
+
+  /** CSS class for the transition kind of the current slide. */
+  function transitionClass(): string {
+    const kind = presenterState?.currentSlide.transition?.kind ?? 'none'
+    return `transition-${kind}`
+  }
+
+  /** Duration of the current slide's transition in milliseconds. */
+  function transitionDurationMs(): number {
+    return presenterState?.currentSlide.transition?.durationMs ?? 0
+  }
 </script>
+
+<svelte:window onclick={next} />
 
 <div class="presenter" role="application" aria-label="Presenter view" tabindex="-1">
   {#if presenterState}
     <div class="stage">
-      <SlideCanvas
-        slide={presenterState.currentSlide}
-        background={backgroundColor()}
-        media={presenterState.media}
-        readonly
-      />
+      {#key presenterState.currentSlide.id}
+        <div
+          class="stage-content {transitionClass()}"
+          style:--transition-duration="{transitionDurationMs()}ms"
+        >
+          <SlideCanvas
+            slide={presenterState.currentSlide}
+            background={backgroundColor()}
+            media={presenterState.media}
+            readonly
+            activeBuildStep={activeBuildStep}
+          />
+        </div>
+      {/key}
     </div>
 
     <div class="hud">
@@ -183,5 +242,58 @@
   :global(.hud .canvas) {
     width: 320px !important;
     height: 180px !important;
+  }
+  .stage-content {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .stage-content.transition-fade {
+    animation: transition-fade var(--transition-duration, 500ms) ease forwards;
+  }
+  .stage-content.transition-slide {
+    animation: transition-slide var(--transition-duration, 500ms) ease forwards;
+  }
+  .stage-content.transition-push {
+    animation: transition-push var(--transition-duration, 500ms) ease forwards;
+  }
+  .stage-content.transition-wipe {
+    animation: transition-wipe var(--transition-duration, 500ms) ease forwards;
+  }
+  @keyframes transition-fade {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+  @keyframes transition-slide {
+    from {
+      transform: translateX(100%);
+    }
+    to {
+      transform: translateX(0);
+    }
+  }
+  @keyframes transition-push {
+    from {
+      transform: translateX(50%);
+      opacity: 0;
+    }
+    to {
+      transform: translateX(0);
+      opacity: 1;
+    }
+  }
+  @keyframes transition-wipe {
+    from {
+      clip-path: inset(0 100% 0 0);
+    }
+    to {
+      clip-path: inset(0 0 0 0);
+    }
   }
 </style>

@@ -21,6 +21,7 @@ base64 = "0.22"
 twox-hash = "1"
 image = "0.25"
 slides-core = { path = "crates/slides-core" }
+slides-animation = { path = "crates/slides-animation" }
 
 [profile.release]
 opt-level = "s"

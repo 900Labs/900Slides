@@ -9,5 +9,6 @@ description = "Deterministic slide rendering to SVG"
 [dependencies]
 slides-core = { path = "../slides-core" }
 slides-chart = { path = "../slides-chart" }
+slides-animation = { path = "../slides-animation" }
 base64 = { workspace = true }
 twox-hash = { workspace = true }

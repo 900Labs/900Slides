@@ -95,11 +95,33 @@ pub fn render_slide(
     let mut body = String::new();
     let mut shadow_counter: usize = 0;
 
-    for shape in &slide.shapes {
+    // When a slide has a build-in animation, wrap each step's target shape in a
+    // `<g>` tagged with the step and effect CSS classes, and collect the effects
+    // so a `<style>` block of `@keyframes` can be emitted. The classes are inert
+    // in the static editor SVG; the presenter activates them via CSS.
+    let mut build_style = String::new();
+    let mut used_effects: Vec<slides_core::BuildEffect> = Vec::new();
+    let mut build_map: std::collections::BTreeMap<usize, (usize, slides_core::BuildEffect)> =
+        std::collections::BTreeMap::new();
+    if let Some(anim) = &slide.animation {
+        for (step_index, step) in anim.steps.iter().enumerate() {
+            if !used_effects.contains(&step.effect) {
+                used_effects.push(step.effect);
+            }
+            // First step wins per shape; later steps (e.g. disappear) are
+            // handled by the presenter timeline.
+            build_map
+                .entry(step.shape_index)
+                .or_insert((step_index, step.effect));
+        }
+    }
+
+    for (shape_index, shape) in slide.shapes.iter().enumerate() {
+        let mut frag = String::new();
         match shape {
-            Shape::TextBox(text_box) => render_text_box(text_box, theme, &mut body),
-            Shape::Passthrough(object) => render_passthrough(object, &mut body),
-            Shape::Image(image) => render_image(image, media, &mut body),
+            Shape::TextBox(text_box) => render_text_box(text_box, theme, &mut frag),
+            Shape::Passthrough(object) => render_passthrough(object, &mut frag),
+            Shape::Image(image) => render_image(image, media, &mut frag),
             Shape::Geometric(geometric) => {
                 let filter_id = geometric.style.shadow.as_ref().map(|shadow| {
                     let id = shadow_counter;
@@ -107,11 +129,30 @@ pub fn render_slide(
                     push_shadow_filter(id, shadow, &mut defs);
                     id
                 });
-                render_geometric(geometric, filter_id, &mut body);
+                render_geometric(geometric, filter_id, &mut frag);
             }
-            Shape::Table(table) => render_table(table, theme, &mut body),
-            Shape::Chart(chart) => render_chart(chart, &mut body),
+            Shape::Table(table) => render_table(table, theme, &mut frag),
+            Shape::Chart(chart) => render_chart(chart, &mut frag),
         }
+
+        if let Some((step_index, effect)) = build_map.get(&shape_index) {
+            body.push_str(&format!(
+                "<g class=\"build-{step_index} {effect_class}\">",
+                effect_class = slides_animation::css_class(*effect)
+            ));
+            body.push_str(&frag);
+            body.push_str("</g>");
+        } else {
+            body.push_str(&frag);
+        }
+    }
+
+    if !used_effects.is_empty() {
+        build_style.push_str("<style>");
+        for effect in &used_effects {
+            build_style.push_str(slides_animation::keyframes(*effect));
+        }
+        build_style.push_str("</style>");
     }
 
     let mut svg = String::new();
@@ -130,6 +171,9 @@ pub fn render_slide(
         svg.push_str("<defs>");
         svg.push_str(&defs);
         svg.push_str("</defs>");
+    }
+    if !build_style.is_empty() {
+        svg.push_str(&build_style);
     }
     svg.push_str(&body);
     svg.push_str("</svg>");
@@ -879,8 +923,9 @@ fn render_cell_text(
 mod tests {
     use super::*;
     use slides_core::{
-        BorderEdge, CategorySeries, CellAlign, ChartData, ChartType, GeometricShape, HeadingLevel,
-        ImageShape, MediaEntry, ParagraphStyle, Run, TableBorders, TableShape, TextBox, Transform,
+        Animation, BorderEdge, BuildEffect, BuildStep, CategorySeries, CellAlign, ChartData,
+        ChartType, GeometricShape, HeadingLevel, ImageShape, MediaEntry, ParagraphStyle, Run,
+        TableBorders, TableShape, TextBox, Transform,
     };
 
     fn rect(x: f64, y: f64, w: f64, h: f64) -> Rect {
@@ -1051,6 +1096,61 @@ mod tests {
         let again = render(&slide);
         assert_eq!(out.svg, again.svg);
         assert_eq!(out.hash, again.hash);
+    }
+
+    #[test]
+    fn build_animation_wraps_target_shapes_and_emits_keyframes() {
+        // Two text boxes; shape index 1 gets a fade build step.
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::TextBox(TextBox {
+            frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
+            paragraphs: vec![],
+        }));
+        slide.shapes.push(Shape::TextBox(TextBox {
+            frame: rect(0.0, 600_000.0, 1_000_000.0, 500_000.0),
+            paragraphs: vec![],
+        }));
+        slide.animation = Some(Animation::new(vec![BuildStep::new(
+            1,
+            BuildEffect::Fade,
+            500,
+        )]));
+
+        let out = render(&slide);
+
+        // Shape 1 is wrapped in a tagged group carrying the step and effect class.
+        assert!(
+            out.svg.contains("class=\"build-0 build-fade\""),
+            "animated shape must be wrapped in a tagged <g>"
+        );
+        // The fade @keyframes are emitted in a <style> block.
+        assert!(
+            out.svg.contains("@keyframes build-fade"),
+            "animation <style> block must be emitted"
+        );
+        // Shape 0 (no build step) is NOT wrapped in a build group.
+        assert!(
+            !out.svg.contains("build-fade")
+                || out.svg.matches("class=\"build-0 build-fade\"").count() == 1,
+            "only the animated shape should carry the build class"
+        );
+        // Deterministic: same input -> identical output.
+        assert_eq!(out.svg, render(&slide).svg);
+        assert_eq!(out.hash, render(&slide).hash);
+    }
+
+    #[test]
+    fn slide_without_animation_emits_no_build_hooks() {
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::TextBox(TextBox {
+            frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
+            paragraphs: vec![],
+        }));
+
+        let out = render(&slide);
+
+        assert!(!out.svg.contains("@keyframes"));
+        assert!(!out.svg.contains("class=\"build-"));
     }
 
     #[test]
