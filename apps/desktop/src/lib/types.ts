@@ -15,6 +15,20 @@ export interface ThemeSnapshot {
   headingFont: string
   bodyFont: string
   accentColor: ColorDto
+  /** High-contrast accessibility mode. */
+  highContrast: boolean
+}
+
+/** Fixed slide dimensions (aspect ratio), in EMU. Mirrors slides-core SlideSize. */
+export interface SlideSizeDto {
+  widthEmu: number
+  heightEmu: number
+}
+
+/** A named slide section that starts at a given slide. Mirrors slides-core SlideSection. */
+export interface SlideSectionDto {
+  name: string
+  startSlideId: string
 }
 
 /** Heading level for a paragraph style. */
@@ -277,6 +291,8 @@ export interface SlideSnapshot {
   shapes: ShapeSnapshot[]
   transition?: TransitionDto
   animation?: AnimationDto
+  /** Rich-text speaker notes, when present. When absent, plain notes are used. */
+  richNotes?: ParagraphDto[]
 }
 
 /** Media entry with bytes base64-encoded, keyed by media reference. */
@@ -295,6 +311,10 @@ export interface DeckSnapshot {
   id: string
   schemaVersion: number
   theme: ThemeSnapshot
+  /** Fixed slide dimensions (aspect ratio), when set. */
+  slideSize?: SlideSizeDto
+  /** Named slide sections, in slide order. */
+  sections: SlideSectionDto[]
   slides: SlideSnapshot[]
   media: MediaMap
   warnings: WarningDto[]
@@ -314,6 +334,10 @@ export interface PresenterState {
   total: number
   notes: string
   media: MediaMap
+  /** Deck slide size (aspect ratio), when set. */
+  slideSize?: SlideSizeDto
+  /** Whether the deck is rendered in high-contrast mode. */
+  highContrast: boolean
 }
 
 /** Recovery snapshot metadata. */

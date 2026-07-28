@@ -20,6 +20,7 @@
     ParagraphStyleDto,
     PassthroughSnapshot,
     RunDto,
+    SlideSizeDto,
     SlideSnapshot,
     StyleDto,
     TableBordersDto,
@@ -61,6 +62,10 @@
     readonly?: boolean
     /** Current build step index for presenter playback. */
     activeBuildStep?: number
+    /** Deck slide size (aspect ratio). Defaults to 16:9 when unset. */
+    slideSize?: SlideSizeDto
+    /** Whether the deck is rendered in high-contrast mode. */
+    highContrast?: boolean
   }
 
   let {
@@ -74,7 +79,20 @@
     onSelectShape,
     readonly = false,
     activeBuildStep = Infinity,
+    slideSize,
+    highContrast = false,
   }: Props = $props()
+
+  /** Canvas width in pixels, derived from the deck slide size or 16:9 default. */
+  const canvasWidthPx = $derived(
+    toPx(slideSize?.widthEmu ?? 12_192_000),
+  )
+  /** Canvas height in pixels, derived from the deck slide size or 16:9 default. */
+  const canvasHeightPx = $derived(toPx(slideSize?.heightEmu ?? 6_858_000))
+  /** Background color, forced to black when high-contrast is on. */
+  const effectiveBackground = $derived<ColorDto>(
+    highContrast ? { r: 0, g: 0, b: 0, a: 255 } : background,
+  )
 
   /** Current build-in state per shape index for presenter playback. */
   const shapeBuildStates = $derived<Map<number, ShapeBuildState | null>>(
@@ -869,8 +887,11 @@
 
 <div
   class="canvas"
+  class:high-contrast={highContrast}
   bind:this={canvasEl}
-  style:background-color={toRgba(background)}
+  style:width={canvasWidthPx}
+  style:height={canvasHeightPx}
+  style:background-color={toRgba(effectiveBackground)}
   role="application"
   aria-label="Slide canvas"
 >
@@ -1116,11 +1137,23 @@
 <style>
   .canvas {
     position: relative;
-    width: 1280px;
-    height: 720px;
     flex-shrink: 0;
     box-shadow: 0 0 0 1px #ccc;
     overflow: hidden;
+  }
+  .canvas.high-contrast .text-box,
+  .canvas.high-contrast .table-cell-input,
+  .canvas.high-contrast .table-cell-text {
+    color: #ffffff;
+  }
+  .canvas.high-contrast .text-box-readonly {
+    color: #ffffff;
+  }
+  .canvas.high-contrast .text-box:focus {
+    outline: 2px solid #ffd700;
+  }
+  .canvas.high-contrast .table-cell-input:focus {
+    outline: 1px solid #ffd700;
   }
   .text-box-container {
     position: absolute;

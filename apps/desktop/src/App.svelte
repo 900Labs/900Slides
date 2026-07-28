@@ -6,6 +6,9 @@
   import Presenter from './Presenter.svelte'
   import RecoveryPrompt from './RecoveryPrompt.svelte'
   import ChartEditor from './ChartEditor.svelte'
+  import RichNotesEditor from './RichNotesEditor.svelte'
+  import FindReplace from './FindReplace.svelte'
+  import ShortcutsDialog from './ShortcutsDialog.svelte'
   import type {
     AnimationDto,
     BuildEffectDto,
@@ -18,6 +21,8 @@
     ParagraphDto,
     RecoverySnapshot,
     RunDto,
+    SlideSectionDto,
+    SlideSizeDto,
     SlideSnapshot,
     TextBoxSnapshot,
     TransitionKindDto,
@@ -56,6 +61,18 @@
   let selectedBuildDuration = $state(500)
   /** Duration (ms) for the slide transition. */
   let transitionDuration = $state(500)
+  /** Whether the find/replace dialog is open. */
+  let showFindReplace = $state(false)
+  /** Whether the find dialog opens focused on the replace field. */
+  let findReplaceMode = $state<'find' | 'replace'>('find')
+  /** Whether the shortcuts dialog is open. */
+  let showShortcuts = $state(false)
+  /** Slide-section start ids whose headers are collapsed in the sidebar. */
+  let collapsedSections = $state<Set<string>>(new Set())
+  /** Name being typed for a new slide section. */
+  let newSectionName = $state('')
+  /** Slide id at which a new section will start. */
+  let newSectionSlideId = $state<string>('')
 
   /** Maximum grid dimension offered by the table size picker. */
   const PICKER_MAX = 6
@@ -83,6 +100,63 @@
   const activeTransitionKind = $derived<TransitionKindDto>(activeSlide?.transition?.kind ?? 'none')
   const activeTransitionDurationMs = $derived<number>(activeSlide?.transition?.durationMs ?? 500)
   const activeAnimation = $derived<AnimationDto | undefined>(activeSlide?.animation)
+
+  /** Deck slide size (aspect ratio), when set. */
+  const slideSize = $derived<SlideSizeDto | undefined>(deck?.slideSize)
+  /** Whether the deck theme is in high-contrast mode. */
+  const highContrast = $derived<boolean>(deck?.theme.highContrast ?? false)
+  /** Rich-text notes for the active slide, when present. */
+  const activeRichNotes = $derived<ParagraphDto[] | undefined>(activeSlide?.richNotes)
+
+  /** Preset aspect-ratio slide sizes, in EMU, matching the Rust constructors. */
+  const ASPECT_PRESETS: Record<'16:9' | '4:3' | '16:10', SlideSizeDto> = {
+    '16:9': { widthEmu: 12_192_000, heightEmu: 6_858_000 },
+    '4:3': { widthEmu: 9_144_000, heightEmu: 6_858_000 },
+    '16:10': { widthEmu: 12_149_333, heightEmu: 7_593_333 },
+  }
+
+  /** The current aspect-ratio preset, or 'default' when the size is custom/unset. */
+  const currentAspectRatio = $derived.by<'16:9' | '4:3' | '16:10' | 'default'>(() => {
+    const size = slideSize
+    if (!size) return '16:9'
+    for (const key of ['16:9', '4:3', '16:10'] as const) {
+      const preset = ASPECT_PRESETS[key]
+      if (preset.widthEmu === size.widthEmu && preset.heightEmu === size.heightEmu) {
+        return key
+      }
+    }
+    return 'default'
+  })
+
+  /** Ordered section groups for the sidebar: each carries its section (or null
+   *  for slides before the first section) and the slide indices it spans. */
+  const sectionGroups = $derived.by<
+    { section: SlideSectionDto | null; indices: number[] }[]
+  >(() => {
+    const slides = deck?.slides ?? []
+    if (slides.length === 0) return []
+    const sections = deck?.sections ?? []
+    const starts = sections
+      .map((section) => ({
+        section,
+        idx: slides.findIndex((slide) => slide.id === section.startSlideId),
+      }))
+      .filter((entry) => entry.idx >= 0)
+      .sort((a, b) => a.idx - b.idx)
+
+    const groups: { section: SlideSectionDto | null; indices: number[] }[] = [
+      { section: null, indices: [] },
+    ]
+    let cursor = 0
+    for (let i = 0; i < slides.length; i += 1) {
+      if (cursor < starts.length && starts[cursor].idx === i) {
+        groups.push({ section: starts[cursor].section, indices: [] })
+        cursor += 1
+      }
+      groups[groups.length - 1].indices.push(i)
+    }
+    return groups.filter((group) => group.indices.length > 0)
+  })
 
   $effect(() => {
     if (!isPresenter) {
@@ -534,6 +608,125 @@
     showRecovery = false
     await newDeck()
   }
+
+  /** Sets the deck's aspect ratio to one of the presets, or clears it. */
+  async function onSetAspectRatio(ratio: '16:9' | '4:3' | '16:10' | 'default'): Promise<void> {
+    const slideSizePayload =
+      ratio === 'default' ? null : { ...ASPECT_PRESETS[ratio] }
+    deck = await invoke<DeckSnapshot>('set_slide_size', { slide_size: slideSizePayload })
+  }
+
+  /** Toggles the deck's high-contrast accessibility theme. */
+  async function toggleHighContrast(): Promise<void> {
+    deck = await invoke<DeckSnapshot>('set_high_contrast', {
+      high_contrast: !highContrast,
+    })
+  }
+
+  /** Commits rich-text notes (or clears them with null) for the active slide. */
+  async function handleSetRichNotes(paragraphs: ParagraphDto[] | null): Promise<void> {
+    if (!activeSlide) return
+    deck = await invoke<DeckSnapshot>('set_rich_notes', {
+      slide_id: activeSlide.id,
+      rich_notes: paragraphs,
+    })
+  }
+
+  /** Enables rich-text notes, seeded from the slide's plain notes. */
+  async function handleEnableRichNotes(): Promise<void> {
+    if (!activeSlide) return
+    const seed: ParagraphDto[] =
+      activeSlide.notes && activeSlide.notes.length > 0
+        ? [
+            {
+              runs: [
+                {
+                  text: activeSlide.notes,
+                  bold: false,
+                  italic: false,
+                  underline: false,
+                  strikethrough: false,
+                  verticalAlign: 'baseline',
+                  code: false,
+                },
+              ],
+              listStyle: 'none',
+              style: { blockquote: false, codeBlock: false, indentLevel: 0 },
+            },
+          ]
+        : [
+            {
+              runs: [],
+              listStyle: 'none',
+              style: { blockquote: false, codeBlock: false, indentLevel: 0 },
+            },
+          ]
+    await handleSetRichNotes(seed)
+  }
+
+  /** Adds a new section starting at the chosen slide. */
+  async function addSection(): Promise<void> {
+    if (!deck) return
+    const name = newSectionName.trim()
+    const startSlideId = newSectionSlideId || deck.slides[0]?.id
+    if (!name || !startSlideId) return
+    const sections = [...deck.sections, { name, startSlideId }]
+    deck = await invoke<DeckSnapshot>('set_sections', { sections })
+    newSectionName = ''
+  }
+
+  /** Removes the section that starts at the given slide. */
+  async function removeSection(startSlideId: string): Promise<void> {
+    if (!deck) return
+    const sections = deck.sections.filter((s) => s.startSlideId !== startSlideId)
+    deck = await invoke<DeckSnapshot>('set_sections', { sections })
+    const next = new Set(collapsedSections)
+    next.delete(startSlideId)
+    collapsedSections = next
+  }
+
+  /** Collapses or expands a section's thumbnails. */
+  function toggleSectionCollapse(startSlideId: string): void {
+    const next = new Set(collapsedSections)
+    if (next.has(startSlideId)) {
+      next.delete(startSlideId)
+    } else {
+      next.add(startSlideId)
+    }
+    collapsedSections = next
+  }
+
+  /** Applies a text-box edit from the find/replace dialog. */
+  async function handleFindReplaceApply(detail: {
+    slideId: string
+    shapeIndex: number
+    paragraphs: ParagraphDto[]
+  }): Promise<void> {
+    await handleTextEdit(detail)
+  }
+
+  /** Global keyboard shortcuts for the editor window. */
+  function handleGlobalKey(event: KeyboardEvent): void {
+    const mod = event.metaKey || event.ctrlKey
+    const target = event.target as HTMLElement | null
+    const typing =
+      target instanceof HTMLInputElement ||
+      target instanceof HTMLTextAreaElement ||
+      (target?.isContentEditable ?? false)
+
+    if (mod && event.key.toLowerCase() === 'f') {
+      event.preventDefault()
+      findReplaceMode = 'find'
+      showFindReplace = true
+    } else if (mod && event.key.toLowerCase() === 'h') {
+      event.preventDefault()
+      findReplaceMode = 'replace'
+      showFindReplace = true
+    } else if (!typing && event.key === '?') {
+      event.preventDefault()
+      showShortcuts = true
+    }
+  }
 </script>
 
 {#if isPresenter}
@@ -659,6 +852,45 @@
         <button onclick={() => toggleParagraphFlag('blockquote')} type="button" title="Blockquote">Quote</button>
         <button onclick={() => toggleParagraphFlag('codeBlock')} type="button" title="Code block">Block</button>
       </span>
+      <span class="toolbar-divider"></span>
+      <span class="deck-group">
+        <span class="shape-label">Ratio:</span>
+        <select
+          value={currentAspectRatio}
+          onchange={(event) =>
+            onSetAspectRatio(
+              (event.target as HTMLSelectElement).value as '16:9' | '4:3' | '16:10' | 'default',
+            )
+          }
+          title="Slide aspect ratio"
+        >
+          <option value="16:9">16:9</option>
+          <option value="4:3">4:3</option>
+          <option value="16:10">16:10</option>
+          <option value="default">Reset</option>
+        </select>
+        <button
+          onclick={toggleHighContrast}
+          type="button"
+          class:active-toggle={highContrast}
+          title="Toggle high-contrast theme"
+        >
+          Contrast
+        </button>
+        <button
+          onclick={() => {
+            findReplaceMode = 'find'
+            showFindReplace = true
+          }}
+          type="button"
+          title="Find (Ctrl/Cmd+F)"
+        >
+          Find
+        </button>
+        <button onclick={() => (showShortcuts = true)} type="button" title="Keyboard shortcuts (?)">
+          ?
+        </button>
+      </span>
       <input
         bind:this={imageInput}
         class="hidden-input"
@@ -683,13 +915,63 @@
     <div class="workspace">
       <aside class="sidebar" aria-label="Slide thumbnails">
         {#if deck}
-          {#each deck.slides as slide, index}
-            <SlideThumbnail
-              {slide}
-              selected={index === activeIndex}
-              onClick={() => selectSlide(index)}
-            />
+          {#each sectionGroups as group (group.section?.startSlideId ?? '__nostart__')}
+            {#if group.section}
+              <div class="section-header">
+                <button
+                  type="button"
+                  class="section-toggle"
+                  onclick={() => toggleSectionCollapse(group.section!.startSlideId)}
+                  aria-expanded={!collapsedSections.has(group.section!.startSlideId)}
+                  title={collapsedSections.has(group.section!.startSlideId) ? 'Expand' : 'Collapse'}
+                >
+                  {collapsedSections.has(group.section!.startSlideId) ? '▶' : '▼'}
+                </button>
+                <span class="section-name" title={group.section.name}>{group.section.name}</span>
+                <button
+                  type="button"
+                  class="section-remove"
+                  onclick={() => removeSection(group.section!.startSlideId)}
+                  title="Remove section"
+                >
+                  ✕
+                </button>
+              </div>
+            {/if}
+            {#if !group.section || !collapsedSections.has(group.section.startSlideId)}
+              {#each group.indices as index (index)}
+                {@const slide = deck.slides[index]}
+                <SlideThumbnail
+                  {slide}
+                  selected={index === activeIndex}
+                  onClick={() => selectSlide(index)}
+                />
+              {/each}
+            {/if}
           {/each}
+
+          <div class="section-add">
+            <input
+              class="section-name-input"
+              type="text"
+              placeholder="New section name"
+              bind:value={newSectionName}
+              aria-label="New section name"
+            />
+            <select
+              class="section-slide-select"
+              value={newSectionSlideId || activeSlide?.id || deck.slides[0]?.id || ''}
+              onchange={(event) => (newSectionSlideId = (event.target as HTMLSelectElement).value)}
+              aria-label="Section start slide"
+            >
+              {#each deck.slides as slide, index}
+                <option value={slide.id}>Slide {index + 1}</option>
+              {/each}
+            </select>
+            <button type="button" onclick={addSection} disabled={!newSectionName.trim()}>
+              Add Section
+            </button>
+          </div>
         {/if}
       </aside>
 
@@ -699,6 +981,8 @@
             slide={activeSlide}
             background={deck.theme.background}
             media={deck.media}
+            slideSize={slideSize}
+            highContrast={highContrast}
             onEditTextBox={handleTextEdit}
             onSetCellText={handleSetCellText}
             onCellFocus={handleCellFocus}
@@ -735,10 +1019,26 @@
 
         {#if rightPanelTab === 'notes'}
           <div class="panel-content" role="tabpanel">
-            {#if notes}
-              <p>{notes}</p>
+            {#if activeRichNotes}
+              <RichNotesEditor
+                slideId={activeSlide!.id}
+                richNotes={activeRichNotes}
+                onSetRichNotes={handleSetRichNotes}
+              />
+              <button class="notes-toggle" type="button" onclick={() => handleSetRichNotes(null)}>
+                Use plain notes
+              </button>
             {:else}
-              <p class="placeholder">No notes for this slide.</p>
+              <div class="plain-notes">
+                {#if notes}
+                  <p>{notes}</p>
+                {:else}
+                  <p class="placeholder">No notes for this slide.</p>
+                {/if}
+                <button class="notes-toggle" type="button" onclick={handleEnableRichNotes}>
+                  Use rich-text notes
+                </button>
+              </div>
             {/if}
           </div>
         {:else}
@@ -869,8 +1169,23 @@
         />
       {/if}
     {/if}
+
+    {#if showFindReplace && deck}
+      <FindReplace
+        {deck}
+        startInReplace={findReplaceMode === 'replace'}
+        onClose={() => (showFindReplace = false)}
+        onApplyEdit={handleFindReplaceApply}
+      />
+    {/if}
+
+    {#if showShortcuts}
+      <ShortcutsDialog onClose={() => (showShortcuts = false)} />
+    {/if}
   </div>
 {/if}
+
+<svelte:window onkeydown={isPresenter ? undefined : handleGlobalKey} />
 
 <style>
   :global(body) {
@@ -1128,5 +1443,83 @@
   }
   .placeholder {
     color: #888;
+  }
+  .deck-group {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+  }
+  .deck-group select {
+    padding: 0.3rem 0.4rem;
+  }
+  .active-toggle {
+    background: #0070c0 !important;
+    color: #fff !important;
+  }
+  .section-header {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    margin: 0.25rem 0 0.15rem;
+    padding: 0.2rem 0.25rem;
+    background: #e8eef7;
+    border: 1px solid #cdd9ea;
+    border-radius: 3px;
+  }
+  .section-toggle {
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 0 0.2rem;
+    font-size: 0.7rem;
+    color: #335;
+  }
+  .section-name {
+    flex: 1;
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: #234;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .section-remove {
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-size: 0.7rem;
+    color: #a33;
+    padding: 0 0.2rem;
+  }
+  .section-add {
+    margin-top: 0.5rem;
+    padding-top: 0.5rem;
+    border-top: 1px dashed #ccc;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+  .section-name-input,
+  .section-slide-select {
+    padding: 0.2rem;
+    font-size: 0.78rem;
+  }
+  .section-add button {
+    padding: 0.25rem;
+    font-size: 0.78rem;
+  }
+  .section-add button:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+  .plain-notes {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+  .notes-toggle {
+    margin-top: 0.5rem;
+    padding: 0.25rem 0.4rem;
+    font-size: 0.78rem;
   }
 </style>
