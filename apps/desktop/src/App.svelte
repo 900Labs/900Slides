@@ -5,7 +5,11 @@
   import SlideCanvas from './SlideCanvas.svelte'
   import Presenter from './Presenter.svelte'
   import RecoveryPrompt from './RecoveryPrompt.svelte'
+  import ChartEditor from './ChartEditor.svelte'
   import type {
+    ChartDataDto,
+    ChartShapeSnapshot,
+    ChartTypeDto,
     DeckSnapshot,
     HeadingLevelDto,
     ParagraphDto,
@@ -34,9 +38,15 @@
   /** Hovered dimensions in the table size picker (1-based). */
   let pickerRows = $state(1)
   let pickerCols = $state(1)
+  /** Whether the chart type dropdown is open. */
+  let showChartDropdown = $state(false)
+  /** Currently edited chart, if any. */
+  let activeChart = $state<{ shapeIndex: number } | null>(null)
 
   /** Maximum grid dimension offered by the table size picker. */
   const PICKER_MAX = 6
+  /** Chart types offered by the chart toolbar dropdown. */
+  const CHART_TYPES: ChartTypeDto[] = ['bar', 'column', 'line', 'area', 'pie', 'scatter']
   /** Row/column indices for the picker grid. */
   const pickerIndices = [...Array(PICKER_MAX).keys()]
 
@@ -360,6 +370,63 @@
     })
   }
 
+  /** Appends a chart of the given type to the active slide. */
+  async function onAddChart(chartType: ChartTypeDto): Promise<void> {
+    if (!activeSlide) return
+    showChartDropdown = false
+    deck = await invoke<DeckSnapshot>('add_chart', {
+      slide_id: activeSlide.id,
+      chart_type: chartType,
+    })
+  }
+
+  /** Opens the chart data-table editor for the given shape. */
+  function handleEditChart(detail: { slideId: string; shapeIndex: number }): void {
+    activeChart = { shapeIndex: detail.shapeIndex }
+  }
+
+  /** Applies changes from the chart editor and re-renders from the snapshot. */
+  async function handleChartApply(detail: {
+    slideId: string
+    shapeIndex: number
+    chartType: ChartTypeDto
+    data: ChartDataDto
+    title: string
+  }): Promise<void> {
+    if (!deck) return
+
+    try {
+      // Always send the (possibly converted) data first. If the data kind no
+      // longer matches the chart's current type, the backend command also
+      // switches the type to a sensible default, after which we can refine it.
+      deck = await invoke<DeckSnapshot>('set_chart_data', {
+        slide_id: detail.slideId,
+        shape_index: detail.shapeIndex,
+        data: detail.data,
+      })
+
+      const updated = activeSlide?.shapes[detail.shapeIndex]
+      const updatedType =
+        updated && updated.kind === 'chart' ? (updated.value as ChartShapeSnapshot).chartType : null
+      if (updatedType && updatedType !== detail.chartType) {
+        deck = await invoke<DeckSnapshot>('set_chart_type', {
+          slide_id: detail.slideId,
+          shape_index: detail.shapeIndex,
+          chart_type: detail.chartType,
+        })
+      }
+
+      deck = await invoke<DeckSnapshot>('set_chart_title', {
+        slide_id: detail.slideId,
+        shape_index: detail.shapeIndex,
+        title: detail.title,
+      })
+    } catch (err) {
+      console.error('Failed to apply chart changes:', err)
+      window.alert(`Chart update failed: ${err}`)
+    }
+  }
+
   /** Selects a different slide in the thumbnail panel. */
   function selectSlide(index: number): void {
     activeIndex = index
@@ -457,6 +524,36 @@
         <button onclick={onDeleteColumn} type="button" disabled={!hasActiveCell} title="Delete column">− Col</button>
       </span>
       <span class="toolbar-divider"></span>
+      <span class="chart-group">
+        <div class="chart-picker-wrap">
+          <button
+            onclick={() => (showChartDropdown = !showChartDropdown)}
+            type="button"
+          >
+            Chart
+          </button>
+          {#if showChartDropdown}
+            <button
+              class="picker-backdrop"
+              onclick={() => (showChartDropdown = false)}
+              type="button"
+              aria-label="Close chart type picker"
+            ></button>
+            <div class="chart-dropdown" role="menu" aria-label="Choose chart type">
+              {#each CHART_TYPES as type}
+                <button
+                  onclick={() => onAddChart(type)}
+                  type="button"
+                  role="menuitem"
+                >
+                  {type.charAt(0).toUpperCase() + type.slice(1)}
+                </button>
+              {/each}
+            </div>
+          {/if}
+        </div>
+      </span>
+      <span class="toolbar-divider"></span>
       <span class="text-group">
         <span class="shape-label">Text:</span>
         <button onclick={() => toggleRunFlag('bold')} type="button" title="Bold">B</button>
@@ -527,6 +624,7 @@
             onEditTextBox={handleTextEdit}
             onSetCellText={handleSetCellText}
             onCellFocus={handleCellFocus}
+            onEditChart={handleEditChart}
           />
         {:else}
           <div class="empty-canvas">Open or create a deck to start editing.</div>
@@ -550,6 +648,19 @@
         onDiscard={handleDiscard}
         onSkip={handleSkip}
       />
+    {/if}
+
+    {#if activeChart && activeSlide}
+      {@const chartShape = activeSlide.shapes[activeChart.shapeIndex]}
+      {#if chartShape && chartShape.kind === 'chart'}
+        <ChartEditor
+          chart={chartShape.value as ChartShapeSnapshot}
+          slideId={activeSlide.id}
+          shapeIndex={activeChart.shapeIndex}
+          onApply={handleChartApply}
+          onClose={() => (activeChart = null)}
+        />
+      {/if}
     {/if}
   </div>
 {/if}
@@ -647,6 +758,42 @@
     font-size: 0.75rem;
     color: #555;
     text-align: center;
+  }
+  .chart-group {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+  }
+  .chart-picker-wrap {
+    position: relative;
+    display: inline-flex;
+  }
+  .chart-dropdown {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    z-index: 10;
+    margin-top: 0.25rem;
+    display: flex;
+    flex-direction: column;
+    min-width: 120px;
+    background: #fff;
+    border: 1px solid #ccc;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  }
+  .chart-dropdown button {
+    text-align: left;
+    background: none;
+    border: none;
+    border-bottom: 1px solid #eee;
+    padding: 0.4rem 0.8rem;
+    cursor: pointer;
+  }
+  .chart-dropdown button:last-child {
+    border-bottom: none;
+  }
+  .chart-dropdown button:hover {
+    background: #f0f0f0;
   }
   .shape-label {
     font-size: 0.85rem;

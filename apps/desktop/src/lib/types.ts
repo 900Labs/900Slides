@@ -178,15 +178,65 @@ export interface TableShapeSnapshot {
   headerRow: boolean
 }
 
+/** Chart type (mirrors slides-core ChartType). */
+export type ChartTypeDto = 'bar' | 'column' | 'line' | 'area' | 'pie' | 'scatter'
+
+/** A single (x, y) point in a scatter series. */
+export interface XYPointDto {
+  x: number
+  y: number
+}
+
+/** A series of (x, y) points for scatter charts. */
+export interface XYSeriesDto {
+  name: string
+  points: XYPointDto[]
+}
+
+/** A value series aligned with a set of categories. */
+export interface CategorySeriesDto {
+  name: string
+  values: number[]
+}
+
+/** Category-based chart data. */
+export interface CategoryChartDataDto {
+  kind: 'category'
+  value: {
+    categories: string[]
+    series: CategorySeriesDto[]
+  }
+}
+
+/** XY (scatter) chart data. */
+export interface XYChartDataDto {
+  kind: 'xy'
+  value: {
+    series: XYSeriesDto[]
+  }
+}
+
+/** Chart data union. */
+export type ChartDataDto = CategoryChartDataDto | XYChartDataDto
+
+/** Chart shape snapshot. */
+export interface ChartShapeSnapshot {
+  transform: TransformDto
+  chartType: ChartTypeDto
+  data: ChartDataDto
+  title?: string
+}
+
 /** Shape snapshot union. */
 export interface ShapeSnapshot {
-  kind: 'text_box' | 'passthrough' | 'image' | 'geometric' | 'table'
+  kind: 'text_box' | 'passthrough' | 'image' | 'geometric' | 'table' | 'chart'
   value:
     | TextBoxSnapshot
     | PassthroughSnapshot
     | ImageShapeSnapshot
     | GeometricShapeSnapshot
     | TableShapeSnapshot
+    | ChartShapeSnapshot
 }
 
 /** Slide snapshot. */
