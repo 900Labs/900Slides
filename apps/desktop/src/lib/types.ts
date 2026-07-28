@@ -239,11 +239,44 @@ export interface ShapeSnapshot {
     | ChartShapeSnapshot
 }
 
+/** Slide-to-slide transition kind (mirrors slides-core TransitionKind). */
+export type TransitionKindDto = 'none' | 'fade' | 'slide' | 'push' | 'wipe'
+
+/** Slide-to-slide transition. */
+export interface TransitionDto {
+  kind: TransitionKindDto
+  durationMs: number
+}
+
+/** Build-in effect kind (mirrors slides-core BuildEffect). */
+export type BuildEffectDto =
+  | 'fade'
+  | 'slide_in_left'
+  | 'slide_in_right'
+  | 'slide_in_top'
+  | 'slide_in_bottom'
+  | 'appear'
+  | 'disappear'
+
+/** One build-in step targeting a shape by index. */
+export interface BuildStepDto {
+  shapeIndex: number
+  effect: BuildEffectDto
+  durationMs: number
+}
+
+/** Ordered build-in animation sequence (mirrors slides-core Animation). */
+export interface AnimationDto {
+  steps: BuildStepDto[]
+}
+
 /** Slide snapshot. */
 export interface SlideSnapshot {
   id: string
   notes: string
   shapes: ShapeSnapshot[]
+  transition?: TransitionDto
+  animation?: AnimationDto
 }
 
 /** Media entry with bytes base64-encoded, keyed by media reference. */

@@ -1,7 +1,9 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core'
   import type {
+    AnimationDto,
     BorderEdgeDto,
+    BuildEffectDto,
     CellAlignDto,
     ChartShapeSnapshot,
     ColorDto,
@@ -52,8 +54,12 @@
     onCellFocus?: (detail: { shapeIndex: number; row: number; col: number }) => void
     /** Callback invoked when a chart shape is double-clicked. */
     onEditChart?: (detail: { slideId: string; shapeIndex: number }) => void
+    /** Callback invoked when a shape is clicked to select it. */
+    onSelectShape?: (detail: { shapeIndex: number }) => void
     /** Whether the canvas is read-only (presenter mode). */
     readonly?: boolean
+    /** Current build step index for presenter playback. */
+    activeBuildStep?: number
   }
 
   let {
@@ -64,8 +70,45 @@
     onSetCellText,
     onCellFocus,
     onEditChart,
+    onSelectShape,
     readonly = false,
+    activeBuildStep = Infinity,
   }: Props = $props()
+
+  /** Current build-in state per shape index for presenter playback. */
+  const shapeBuildStates = $derived<Map<number, ShapeBuildState | null>>(
+    readonly && slide.animation
+      ? new Map(
+          slide.shapes.map((_, index) => [
+            index,
+            shapeBuildState(slide.animation, index, activeBuildStep),
+          ]),
+        )
+      : new Map(),
+  )
+
+  /** Looks up the build-in state for a shape, returning undefined if none. */
+  function buildStateFor(shapeIndex: number): ShapeBuildState | undefined {
+    return shapeBuildStates.get(shapeIndex) ?? undefined
+  }
+
+  /** Combines an existing image rotation with the build-in transform. */
+  function imageTransform(rotation: number, shapeIndex: number): string | undefined {
+    const parts: string[] = []
+    if (rotation) parts.push(`rotate(${rotation}deg)`)
+    const buildTransform = buildStateFor(shapeIndex)?.transform
+    if (buildTransform && buildTransform !== 'none') parts.push(buildTransform)
+    return parts.length > 0 ? parts.join(' ') : undefined
+  }
+
+  /** Combines an existing table rotation with the build-in transform. */
+  function tableTransform(rotation: number, shapeIndex: number): string | undefined {
+    const parts: string[] = []
+    if (rotation) parts.push(`rotate(${rotation}deg)`)
+    const buildTransform = buildStateFor(shapeIndex)?.transform
+    if (buildTransform && buildTransform !== 'none') parts.push(buildTransform)
+    return parts.length > 0 ? parts.join(' ') : undefined
+  }
 
   /** EMU to CSS pixels for a 1280x720 (16:9) canvas. */
   const EMU_TO_PX = 1.0 / 9525.0
@@ -89,6 +132,97 @@
   /** Builds a `data:` URI for a media entry. */
   function dataUri(entry: { mime: string; bytes: string }): string {
     return `data:${entry.mime};base64,${entry.bytes}`
+  }
+
+  /** Returns the off-screen transform for a slide-in effect before activation. */
+  function buildInitialTransform(effect: BuildEffectDto): string {
+    switch (effect) {
+      case 'slide_in_left':
+        return 'translateX(-100%)'
+      case 'slide_in_right':
+        return 'translateX(100%)'
+      case 'slide_in_top':
+        return 'translateY(-100%)'
+      case 'slide_in_bottom':
+        return 'translateY(100%)'
+      default:
+        return 'none'
+    }
+  }
+
+  /** Returns a CSS transition string for a build effect. */
+  function buildTransition(effect: BuildEffectDto, durationMs: number): string | undefined {
+    switch (effect) {
+      case 'fade':
+        return `opacity ${durationMs}ms ease, visibility ${durationMs}ms step-end`
+      case 'slide_in_left':
+      case 'slide_in_right':
+      case 'slide_in_top':
+      case 'slide_in_bottom':
+        return `opacity ${durationMs}ms ease, transform ${durationMs}ms ease, visibility ${durationMs}ms step-end`
+      case 'disappear':
+        return `opacity ${durationMs}ms ease, visibility ${durationMs}ms step-end`
+      case 'appear':
+      default:
+        return undefined
+    }
+  }
+
+  interface ShapeBuildState {
+    opacity: number
+    visibility: 'visible' | 'hidden'
+    transform: string
+    transition: string | undefined
+  }
+
+  /** Computes the current build-in state for a shape at the active step. */
+  function shapeBuildState(
+    animation: AnimationDto | undefined,
+    shapeIndex: number,
+    activeStep: number,
+  ): ShapeBuildState | null {
+    if (!animation || animation.steps.length === 0) return null
+    const activeSteps = animation.steps
+      .map((step, index) => ({ ...step, index }))
+      .filter((step) => step.shapeIndex === shapeIndex && step.index <= activeStep)
+    const pendingSteps = animation.steps
+      .map((step, index) => ({ ...step, index }))
+      .filter((step) => step.shapeIndex === shapeIndex && step.index > activeStep)
+
+    if (activeSteps.length === 0) {
+      const nextStep = pendingSteps[0]
+      if (!nextStep) return null
+      if (nextStep.effect === 'disappear') {
+        return {
+          opacity: 1,
+          visibility: 'visible',
+          transform: 'none',
+          transition: undefined,
+        }
+      }
+      return {
+        opacity: 0,
+        visibility: 'hidden',
+        transform: buildInitialTransform(nextStep.effect),
+        transition: buildTransition(nextStep.effect, nextStep.durationMs),
+      }
+    }
+
+    const lastActive = activeSteps[activeSteps.length - 1]
+    if (lastActive.effect === 'disappear') {
+      return {
+        opacity: 0,
+        visibility: 'hidden',
+        transform: 'none',
+        transition: buildTransition('disappear', lastActive.durationMs),
+      }
+    }
+    return {
+      opacity: 1,
+      visibility: 'visible',
+      transform: 'none',
+      transition: buildTransition(lastActive.effect, lastActive.durationMs),
+    }
   }
 
   /** Joins all runs in all paragraphs into a single editable string. */
@@ -485,10 +619,15 @@
       {@const textBox = shape.value as TextBoxSnapshot}
       <div
         class="text-box-container"
+        class:build-shape={buildStateFor(shapeIndex) !== undefined}
         style:left={toPx(textBox.frame.x)}
         style:top={toPx(textBox.frame.y)}
         style:width={toPx(textBox.frame.width)}
         style:height={toPx(textBox.frame.height)}
+        style:opacity={buildStateFor(shapeIndex)?.opacity}
+        style:visibility={buildStateFor(shapeIndex)?.visibility}
+        style:transform={buildStateFor(shapeIndex)?.transform}
+        style:transition={buildStateFor(shapeIndex)?.transition}
       >
         {#if readonly}
           <div class="text-box-readonly">
@@ -516,11 +655,16 @@
       {@const passthroughIndex = slide.shapes.filter((s, i) => s.kind === 'passthrough' && i < shapeIndex).length}
       <div
         class="passthrough"
+        class:build-shape={buildStateFor(shapeIndex) !== undefined}
         style:left={obj.frame ? toPx(obj.frame.x) : undefined}
         style:top={obj.frame ? toPx(obj.frame.y) : `${1 + passthroughIndex * 0.5}rem`}
         style:right={obj.frame ? undefined : '1rem'}
         style:width={obj.frame ? toPx(obj.frame.width) : undefined}
         style:height={obj.frame ? toPx(obj.frame.height) : undefined}
+        style:opacity={buildStateFor(shapeIndex)?.opacity}
+        style:visibility={buildStateFor(shapeIndex)?.visibility}
+        style:transform={buildStateFor(shapeIndex)?.transform}
+        style:transition={buildStateFor(shapeIndex)?.transition}
       >
         [preserved object: {obj.label}]
       </div>
@@ -531,11 +675,15 @@
       {@const rotation = image.transform.rotation}
       <div
         class="image-container"
+        class:build-shape={buildStateFor(shapeIndex) !== undefined}
         style:left={toPx(frame.x)}
         style:top={toPx(frame.y)}
         style:width={toPx(frame.width)}
         style:height={toPx(frame.height)}
-        style:transform={rotation ? `rotate(${rotation}deg)` : undefined}
+        style:transform={imageTransform(rotation, shapeIndex)}
+        style:opacity={buildStateFor(shapeIndex)?.opacity}
+        style:visibility={buildStateFor(shapeIndex)?.visibility}
+        style:transition={buildStateFor(shapeIndex)?.transition}
       >
         {#if entry}
           <img
@@ -554,10 +702,15 @@
       {@const frame = geometric.transform.frame}
       <div
         class="geometric-container"
+        class:build-shape={buildStateFor(shapeIndex) !== undefined}
         style:left={toPx(frame.x)}
         style:top={toPx(frame.y)}
         style:width={toPx(frame.width)}
         style:height={toPx(frame.height)}
+        style:opacity={buildStateFor(shapeIndex)?.opacity}
+        style:visibility={buildStateFor(shapeIndex)?.visibility}
+        style:transform={buildStateFor(shapeIndex)?.transform}
+        style:transition={buildStateFor(shapeIndex)?.transition}
       >
         {@html geometricSvg(geometric)}
       </div>
@@ -569,11 +722,15 @@
       {@const rowY = rowOffsets(table.rows)}
       <div
         class="table-container"
+        class:build-shape={buildStateFor(shapeIndex) !== undefined}
         style:left={toPx(tframe.x)}
         style:top={toPx(tframe.y)}
         style:width={toPx(tframe.width)}
         style:height={toPx(tframe.height)}
-        style:transform={trot ? `rotate(${trot}deg)` : undefined}
+        style:transform={tableTransform(trot, shapeIndex)}
+        style:opacity={buildStateFor(shapeIndex)?.opacity}
+        style:visibility={buildStateFor(shapeIndex)?.visibility}
+        style:transition={buildStateFor(shapeIndex)?.transition}
       >
         {#each table.rows as row, rowIndex}
           {@const isHeader = table.headerRow && rowIndex === 0}
@@ -620,10 +777,15 @@
       <div
         class="chart-container"
         class:chart-readonly={readonly}
+        class:build-shape={buildStateFor(shapeIndex) !== undefined}
         style:left={toPx(frame.x)}
         style:top={toPx(frame.y)}
         style:width={toPx(frame.width)}
         style:height={toPx(frame.height)}
+        style:opacity={buildStateFor(shapeIndex)?.opacity}
+        style:visibility={buildStateFor(shapeIndex)?.visibility}
+        style:transform={buildStateFor(shapeIndex)?.transform}
+        style:transition={buildStateFor(shapeIndex)?.transition}
         ondblclick={() => !readonly && onEditChart?.({ slideId: slide.id, shapeIndex })}
         role="img"
         aria-label={chart.title ? `Chart: ${chart.title}` : 'Chart'}
