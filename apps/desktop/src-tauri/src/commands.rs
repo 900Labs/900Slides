@@ -203,6 +203,89 @@ pub enum ShapeSnapshot {
     Geometric(GeometricShapeSnapshot),
     /// A table: a grid of editable cells.
     Table(TableShapeSnapshot),
+    /// A chart: a data visualization rendered as SVG.
+    Chart(ChartShapeSnapshot),
+}
+
+/// Snapshot of a chart shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChartShapeSnapshot {
+    /// Position, size, and rotation of the chart.
+    pub transform: TransformDto,
+    /// Kind of chart.
+    pub chart_type: ChartTypeDto,
+    /// Data plotted by the chart.
+    pub data: ChartDataDto,
+    /// Optional chart title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+/// The kind of chart, mirroring [`slides_core::ChartType`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChartTypeDto {
+    /// Horizontal bars.
+    Bar,
+    /// Vertical columns.
+    Column,
+    /// Connected line segments.
+    Line,
+    /// Filled area below a line.
+    Area,
+    /// Pie slices.
+    Pie,
+    /// Scatter (XY) points.
+    Scatter,
+}
+
+/// Data backing a chart, mirroring [`slides_core::ChartData`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum ChartDataDto {
+    /// Category-aligned data for bar, column, line, area, and pie charts.
+    Category {
+        /// Category labels, shared across every series.
+        categories: Vec<String>,
+        /// One or more value series, each aligned with `categories`.
+        series: Vec<CategorySeriesDto>,
+    },
+    /// XY (scatter) data.
+    #[serde(rename = "xy")]
+    XY {
+        /// One or more point series.
+        series: Vec<XYSeriesDto>,
+    },
+}
+
+/// A value series aligned with a set of categories.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CategorySeriesDto {
+    /// Series name, shown in the legend.
+    #[serde(default)]
+    pub name: String,
+    /// One numeric value per category.
+    pub values: Vec<f64>,
+}
+
+/// A series of (x, y) points for scatter charts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct XYSeriesDto {
+    /// Series name, shown in the legend.
+    #[serde(default)]
+    pub name: String,
+    /// Ordered (x, y) pairs.
+    pub points: Vec<XYPointDto>,
+}
+
+/// A single (x, y) point in an [`XYSeriesDto`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct XYPointDto {
+    /// Horizontal coordinate.
+    pub x: f64,
+    /// Vertical coordinate.
+    pub y: f64,
 }
 
 /// Snapshot of an image shape.
@@ -669,6 +752,76 @@ pub fn save_deck(path: String, state: State<'_, AppState>) -> Result<(), String>
     Ok(())
 }
 
+/// Internal command that atomically replaces a chart's data and type. Used
+/// when the data-table editor sends data whose kind does not match the chart's
+/// current type (e.g. switching to/from scatter).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct SetChartDataAndType {
+    slide_id: String,
+    shape_index: usize,
+    data: slides_core::ChartData,
+    chart_type: slides_core::ChartType,
+}
+
+impl slides_core::Command for SetChartDataAndType {
+    fn apply(&self, deck: &mut slides_core::Deck) {
+        let Some(slide) = deck.slide_mut(&self.slide_id) else {
+            return;
+        };
+        let Some(shape) = slide.shapes.get_mut(self.shape_index) else {
+            return;
+        };
+        if let slides_core::Shape::Chart(chart) = shape {
+            chart.data = self.data.clone();
+            chart.chart_type = self.chart_type;
+        }
+    }
+
+    fn inverse(&self, deck: &slides_core::Deck) -> Box<dyn slides_core::Command> {
+        let (prior_data, prior_type) = deck
+            .slide(&self.slide_id)
+            .and_then(|slide| slide.shapes.get(self.shape_index))
+            .and_then(|shape| match shape {
+                slides_core::Shape::Chart(chart) => Some((chart.data.clone(), chart.chart_type)),
+                _ => None,
+            })
+            .unwrap_or_else(|| (self.data.clone(), self.chart_type));
+        Box::new(Self {
+            slide_id: self.slide_id.clone(),
+            shape_index: self.shape_index,
+            data: prior_data,
+            chart_type: prior_type,
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &slides_core::Deck) -> bool {
+        let Some(slide) = deck.slide(&self.slide_id) else {
+            return false;
+        };
+        let Some(shape) = slide.shapes.get(self.shape_index) else {
+            return false;
+        };
+        let slides_core::Shape::Chart(chart) = shape else {
+            return false;
+        };
+        slides_core::ChartShape::new(
+            chart.transform,
+            self.chart_type,
+            self.data.clone(),
+            chart.title.clone(),
+        )
+        .is_ok()
+    }
+}
+
 /// Returns the current deck snapshot for re-rendering, or `None` if no deck is open.
 #[tauri::command]
 pub fn get_snapshot(state: State<'_, AppState>) -> Option<DeckSnapshot> {
@@ -1125,6 +1278,138 @@ pub fn delete_column(
     Ok(snapshot)
 }
 
+/// Appends a chart shape with default sample data to a slide and returns the
+/// updated deck snapshot.
+#[tauri::command]
+pub fn add_chart(
+    slide_id: String,
+    chart_type: ChartTypeDto,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let chart_type = chart_type_from_dto(chart_type);
+    let data = sample_chart_data(chart_type);
+    let chart = slides_core::ChartShape::new(
+        slides_core::Transform {
+            frame: centered_chart_frame(),
+            rotation: 0.0,
+        },
+        chart_type,
+        data,
+        None,
+    )
+    .map_err(|e| e.to_string())?;
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let command = Box::new(slides_core::AddChart::new(slide_id, chart));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Sets the chart type of a chart shape and returns the updated deck snapshot.
+///
+/// Switching between category-based types and scatter is rejected by the model
+/// when the existing data does not match the new type; the error is returned
+/// to the frontend.
+#[tauri::command]
+pub fn set_chart_type(
+    slide_id: String,
+    shape_index: usize,
+    chart_type: ChartTypeDto,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let chart_type = chart_type_from_dto(chart_type);
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let command = Box::new(slides_core::SetChartType::new(slide_id, shape_index, chart_type));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Replaces the full data set of a chart shape and returns the updated deck
+/// snapshot.
+///
+/// If the provided data kind does not match the chart's current type (for
+/// example, sending XY data to a category chart), the command also updates the
+/// type to a sensible default so the change can be applied atomically.
+#[tauri::command]
+pub fn set_chart_data(
+    slide_id: String,
+    shape_index: usize,
+    data: ChartDataDto,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let data = chart_data_from_dto(data);
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+
+    let needs_type_update = session
+        .deck()
+        .slide(&slide_id)
+        .and_then(|slide| slide.shapes.get(shape_index))
+        .and_then(|shape| match shape {
+            slides_core::Shape::Chart(chart) => {
+                let data_kind_matches = match &data {
+                    slides_core::ChartData::Category { .. } => chart.chart_type.is_category(),
+                    slides_core::ChartData::XY { .. } => chart.chart_type.is_xy(),
+                };
+                Some(!data_kind_matches)
+            }
+            _ => None,
+        })
+        .unwrap_or(false);
+
+    let command: Box<dyn slides_core::Command> = if needs_type_update {
+        let chart_type = match &data {
+            slides_core::ChartData::Category { .. } => slides_core::ChartType::Column,
+            slides_core::ChartData::XY { .. } => slides_core::ChartType::Scatter,
+        };
+        Box::new(SetChartDataAndType {
+            slide_id,
+            shape_index,
+            data,
+            chart_type,
+        })
+    } else {
+        Box::new(slides_core::SetChartData::new(slide_id, shape_index, data))
+    };
+
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Sets or clears the title of a chart shape and returns the updated deck
+/// snapshot. Pass an empty string to clear the title.
+#[tauri::command]
+pub fn set_chart_title(
+    slide_id: String,
+    shape_index: usize,
+    title: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let title = if title.is_empty() { None } else { Some(title) };
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let command = Box::new(slides_core::SetChartTitle::new(slide_id, shape_index, title));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
 /// Renders a single slide to a deterministic SVG string.
 #[tauri::command]
 pub fn render_slide_svg(slide_id: String, state: State<'_, AppState>) -> Result<String, String> {
@@ -1463,6 +1748,7 @@ fn shape_to_dto(shape: &slides_core::Shape) -> ShapeSnapshot {
             })
         }
         slides_core::Shape::Table(table) => ShapeSnapshot::Table(table_to_dto(table)),
+        slides_core::Shape::Chart(chart) => ShapeSnapshot::Chart(chart_to_dto(chart)),
     }
 }
 
@@ -1668,6 +1954,46 @@ fn centered_table_frame() -> slides_core::Rect {
     slides_core::Rect::new(x, y, width, height)
 }
 
+/// Returns a centered frame for a new chart, sized to ~60% of the slide width
+/// and ~40% of the slide height.
+fn centered_chart_frame() -> slides_core::Rect {
+    let width = SLIDE_WIDTH_EMU * 0.6;
+    let height = SLIDE_HEIGHT_EMU * 0.4;
+    let x = (SLIDE_WIDTH_EMU - width) / 2.0;
+    let y = (SLIDE_HEIGHT_EMU - height) / 2.0;
+    slides_core::Rect::new(x, y, width, height)
+}
+
+/// Builds default sample data for a newly inserted chart.
+fn sample_chart_data(chart_type: slides_core::ChartType) -> slides_core::ChartData {
+    if chart_type.is_category() {
+        slides_core::ChartData::Category {
+            categories: vec!["Q1".to_string(), "Q2".to_string(), "Q3".to_string()],
+            series: vec![
+                slides_core::CategorySeries {
+                    name: "2023".to_string(),
+                    values: vec![10.0, 20.0, 30.0],
+                },
+                slides_core::CategorySeries {
+                    name: "2024".to_string(),
+                    values: vec![15.0, 25.0, 35.0],
+                },
+            ],
+        }
+    } else {
+        slides_core::ChartData::XY {
+            series: vec![slides_core::XYSeries {
+                name: "Run A".to_string(),
+                points: vec![
+                    slides_core::XYPoint::new(0.0, 1.0),
+                    slides_core::XYPoint::new(1.0, 2.0),
+                    slides_core::XYPoint::new(2.0, 3.0),
+                ],
+            }],
+        }
+    }
+}
+
 /// Finds a table shape on a slide, returning `Err` if the slide or shape is
 /// missing or is not a table.
 fn lookup_table<'a>(
@@ -1801,6 +2127,85 @@ fn table_to_dto(table: &slides_core::TableShape) -> TableShapeSnapshot {
         column_widths: table.column_widths.clone(),
         default_borders: table_borders_to_dto(&table.default_borders),
         header_row: table.header_row,
+    }
+}
+
+fn chart_to_dto(chart: &slides_core::ChartShape) -> ChartShapeSnapshot {
+    ChartShapeSnapshot {
+        transform: transform_to_dto(chart.transform),
+        chart_type: chart_type_to_dto(chart.chart_type),
+        data: chart_data_to_dto(&chart.data),
+        title: chart.title.clone(),
+    }
+}
+
+fn chart_type_to_dto(chart_type: slides_core::ChartType) -> ChartTypeDto {
+    match chart_type {
+        slides_core::ChartType::Bar => ChartTypeDto::Bar,
+        slides_core::ChartType::Column => ChartTypeDto::Column,
+        slides_core::ChartType::Line => ChartTypeDto::Line,
+        slides_core::ChartType::Area => ChartTypeDto::Area,
+        slides_core::ChartType::Pie => ChartTypeDto::Pie,
+        slides_core::ChartType::Scatter => ChartTypeDto::Scatter,
+    }
+}
+
+fn chart_data_to_dto(data: &slides_core::ChartData) -> ChartDataDto {
+    match data {
+        slides_core::ChartData::Category { categories, series } => ChartDataDto::Category {
+            categories: categories.clone(),
+            series: series
+                .iter()
+                .map(|s| CategorySeriesDto {
+                    name: s.name.clone(),
+                    values: s.values.clone(),
+                })
+                .collect(),
+        },
+        slides_core::ChartData::XY { series } => ChartDataDto::XY {
+            series: series
+                .iter()
+                .map(|s| XYSeriesDto {
+                    name: s.name.clone(),
+                    points: s.points.iter().map(|p| XYPointDto { x: p.x, y: p.y }).collect(),
+                })
+                .collect(),
+        },
+    }
+}
+
+fn chart_type_from_dto(dto: ChartTypeDto) -> slides_core::ChartType {
+    match dto {
+        ChartTypeDto::Bar => slides_core::ChartType::Bar,
+        ChartTypeDto::Column => slides_core::ChartType::Column,
+        ChartTypeDto::Line => slides_core::ChartType::Line,
+        ChartTypeDto::Area => slides_core::ChartType::Area,
+        ChartTypeDto::Pie => slides_core::ChartType::Pie,
+        ChartTypeDto::Scatter => slides_core::ChartType::Scatter,
+    }
+}
+
+fn chart_data_from_dto(dto: ChartDataDto) -> slides_core::ChartData {
+    match dto {
+        ChartDataDto::Category { categories, series } => slides_core::ChartData::Category {
+            categories,
+            series: series
+                .into_iter()
+                .map(|s| slides_core::CategorySeries {
+                    name: s.name,
+                    values: s.values,
+                })
+                .collect(),
+        },
+        ChartDataDto::XY { series } => slides_core::ChartData::XY {
+            series: series
+                .into_iter()
+                .map(|s| slides_core::XYSeries {
+                    name: s.name,
+                    points: s.points.into_iter().map(|p| slides_core::XYPoint::new(p.x, p.y)).collect(),
+                })
+                .collect(),
+        },
     }
 }
 

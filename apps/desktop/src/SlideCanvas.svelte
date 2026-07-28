@@ -1,7 +1,9 @@
 <script lang="ts">
+  import { invoke } from '@tauri-apps/api/core'
   import type {
     BorderEdgeDto,
     CellAlignDto,
+    ChartShapeSnapshot,
     ColorDto,
     CropDto,
     DashStyleDto,
@@ -48,12 +50,22 @@
     }) => void
     /** Callback invoked when a table cell gains focus. */
     onCellFocus?: (detail: { shapeIndex: number; row: number; col: number }) => void
+    /** Callback invoked when a chart shape is double-clicked. */
+    onEditChart?: (detail: { slideId: string; shapeIndex: number }) => void
     /** Whether the canvas is read-only (presenter mode). */
     readonly?: boolean
   }
 
-  let { slide, background, media, onEditTextBox, onSetCellText, onCellFocus, readonly = false }: Props =
-    $props()
+  let {
+    slide,
+    background,
+    media,
+    onEditTextBox,
+    onSetCellText,
+    onCellFocus,
+    onEditChart,
+    readonly = false,
+  }: Props = $props()
 
   /** EMU to CSS pixels for a 1280x720 (16:9) canvas. */
   const EMU_TO_PX = 1.0 / 9525.0
@@ -420,6 +432,46 @@
       onSetCellText({ slideId: slide.id, shapeIndex, row, col, text: target.value })
     }
   }
+
+  /** Cache for rendered chart SVGs, keyed by a stable shape key. */
+  const chartSvgCache = new Map<string, string>()
+
+  /** Builds a stable cache key for a chart shape. */
+  function chartKey(shapeIndex: number, chart: ChartShapeSnapshot): string {
+    return `${slide.id}:${shapeIndex}:${chart.chartType}:${chart.title ?? ''}:${JSON.stringify(chart.data)}`
+  }
+
+  /**
+   * Renders the slide SVG and extracts the nested <svg> for the chart at the
+   * given shape index. The chart is identified by counting chart shapes before
+   * `shapeIndex` in the slide.
+   */
+  async function chartSvg(shapeIndex: number, chart: ChartShapeSnapshot): Promise<string> {
+    const key = chartKey(shapeIndex, chart)
+    const cached = chartSvgCache.get(key)
+    if (cached !== undefined) return cached
+
+    const svg = await invoke<string>('render_slide_svg', { slide_id: slide.id })
+    const parsed = new DOMParser().parseFromString(svg, 'image/svg+xml')
+    const svgs = Array.from(parsed.querySelectorAll('svg'))
+    // The first <svg> is the slide root; nested <svg> elements are charts.
+    const chartIndex = slide.shapes
+      .slice(0, shapeIndex)
+      .filter((s) => s.kind === 'chart').length
+    const nested = svgs[chartIndex + 1]
+    if (!nested) {
+      throw new Error('chart SVG not found in rendered slide')
+    }
+    const clone = nested.cloneNode(true) as SVGSVGElement
+    clone.removeAttribute('x')
+    clone.removeAttribute('y')
+    clone.setAttribute('width', '100%')
+    clone.setAttribute('height', '100%')
+    const serializer = new XMLSerializer()
+    const result = serializer.serializeToString(clone)
+    chartSvgCache.set(key, result)
+    return result
+  }
 </script>
 
 <div
@@ -561,6 +613,28 @@
             </div>
           {/each}
         {/each}
+      </div>
+    {:else if shape.kind === 'chart'}
+      {@const chart = shape.value as ChartShapeSnapshot}
+      {@const frame = chart.transform.frame}
+      <div
+        class="chart-container"
+        class:chart-readonly={readonly}
+        style:left={toPx(frame.x)}
+        style:top={toPx(frame.y)}
+        style:width={toPx(frame.width)}
+        style:height={toPx(frame.height)}
+        ondblclick={() => !readonly && onEditChart?.({ slideId: slide.id, shapeIndex })}
+        role="img"
+        aria-label={chart.title ? `Chart: ${chart.title}` : 'Chart'}
+      >
+        {#await chartSvg(shapeIndex, chart)}
+          <div class="chart-loading">Loading chart…</div>
+        {:then svg}
+          {@html svg}
+        {:catch}
+          <div class="chart-fallback">Chart</div>
+        {/await}
       </div>
     {/if}
   {/each}
@@ -726,5 +800,28 @@
     line-height: 1.2;
     white-space: pre-wrap;
     overflow: hidden;
+  }
+  .chart-container {
+    position: absolute;
+    background: #fff;
+    cursor: pointer;
+  }
+  .chart-container:not(.chart-readonly):hover {
+    outline: 1px dashed #0070c0;
+  }
+  .chart-container :global(svg) {
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+  .chart-loading,
+  .chart-fallback {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #666;
+    font-size: 0.85rem;
   }
 </style>
