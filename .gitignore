@@ -22,3 +22,6 @@ Thumbs.db
 # Environment
 .env
 .env.local
+
+# Local agent reminders (never commit; private process notes)
+.agent-reminders.md

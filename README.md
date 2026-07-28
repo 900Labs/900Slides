@@ -31,13 +31,17 @@ What v0.1.0 does:
 - Edits **tables** up to 50 rows × 50 columns with cell text, fills, borders,
   column/row resize, header rows, and cell alignment. Insert a table through
   the toolbar, click cells to edit, and add or remove rows and columns.
+- Edits **charts** (bar, column, line, area, pie, scatter) with an in-place
+  data-table editor for categories, series, and values. Insert a chart through
+  the toolbar and double-click it to edit its data; the chart type can be
+  switched at any time.
 - Sanitizes every image on the way in: EXIF and other metadata are stripped by
   default, only allowlisted image formats are accepted, and embedded SVG is
   scrubbed of scripts, event handlers, and unsafe URL references.
-- Preserves everything else in the PPTX package **byte-for-byte**. Charts,
-  tables, SmartArt, and any other content 900Slides does not yet edit are
-  carried as opaque objects and re-emitted unchanged on save. Save regenerates
-  only the slides you actually edited.
+- Preserves everything else in the PPTX package **byte-for-byte**. SmartArt
+  and any other content 900Slides does not yet edit are carried as opaque
+  objects and re-emitted unchanged on save. Save regenerates only the slides
+  you actually edited.
 - Shows per-slide warnings when a file contains content that is preserved but
   not editable (the loss ledger).
 - Renders a slide to deterministic SVG for thumbnails and presenter previews.
@@ -50,8 +54,6 @@ What v0.1.0 does:
 
 What v0.1.0 does **not** do yet:
 
-- Edit charts (they are preserved on save but shown as non-editable
-  placeholders in the editor).
 - Animate builds or transitions.
 - Export to PDF, PNG, SVG, or ODP.
 - Spell-check.
@@ -101,8 +103,10 @@ visibility:
 4. Insert an image with the toolbar button (it is sanitized on the way in), or
    add a geometric shape from the shape menu. Images and shapes render on the
    canvas and can be moved and restyled.
-5. Content 900Slides cannot edit (charts, tables, SmartArt) appears as a
-   labelled placeholder. It is preserved on save but cannot be modified.
+ 5. Insert a table through the toolbar and edit its cells, or insert a chart
+    and double-click it to edit its data. Content 900Slides cannot edit
+    (SmartArt) appears as a labelled placeholder. It is preserved on save but
+    cannot be modified.
 6. Choose **Save** to write a `.pptx` file. Only edited slides are
    regenerated; every other part of the original file is unchanged.
 7. Choose **Present** to open a fullscreen presenter window. Use arrow keys,
@@ -144,7 +148,7 @@ crates/slides-odp/        ODP import / export conversion boundary (stub)
 crates/slides-pdf/        PDF export and image-per-page import (stub)
 crates/slides-render/     Deterministic slide rendering to SVG
 crates/slides-animation/  Deterministic build and transition playback (stub)
-crates/slides-chart/      Chart data and SVG previews (stub)
+crates/slides-chart/      Chart data model and deterministic SVG previews
 crates/slides-spell/      Spell-check dictionary boundary (stub)
 crates/slides-media/      Image ingest, EXIF strip, MIME allowlist, SVG sanitize
 crates/slides-i18n/       Locale and accessibility helpers (stub)

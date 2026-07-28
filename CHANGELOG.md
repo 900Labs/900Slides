@@ -10,8 +10,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 This section tracks work toward v0.2.0 (editor completeness). See
 [`docs/ROADMAP.md`](docs/ROADMAP.md),
 [`docs/sprint-records/wave-1.md`](docs/sprint-records/wave-1.md),
-[`docs/sprint-records/wave-2.md`](docs/sprint-records/wave-2.md), and
-[`docs/sprint-records/wave-3.md`](docs/sprint-records/wave-3.md).
+[`docs/sprint-records/wave-2.md`](docs/sprint-records/wave-2.md),
+[`docs/sprint-records/wave-3.md`](docs/sprint-records/wave-3.md), and
+[`docs/sprint-records/wave-4.md`](docs/sprint-records/wave-4.md).
+
+### Added — Wave 4 (charts)
+
+- Charts are now first-class in `slides-core`: `Shape` gains a `Chart`
+  variant with `ChartShape`, `ChartType` (bar, column, line, area, pie,
+  scatter), `ChartData` (category-based or XY), `CategorySeries`, `XYSeries`,
+  and `XYPoint` types. Data is capped at 100 categories, 20 series, and
+  1000 points per series (`PRODUCT_SPEC.md` §5.2), with structural invariants
+  enforced (non-empty series, value/category alignment, and a data kind that
+  matches the chart type). All additive; old decks deserialize unchanged.
+- Four reversible commands: `AddChart`, `SetChartType`, `SetChartData`, and
+  `SetChartTitle`. Each produces a verified inverse; deleting a chart and
+  undoing restores it.
+- New `slides-chart` crate (no longer a stub) renders any `ChartShape` to a
+  deterministic SVG via `render_chart_svg`: bars/columns as grouped
+  rectangles, lines as polylines, areas as filled polygons, pie wedges, and
+  scatter points, with axes, tick labels, grid lines, an optional legend, and
+  a title. `slides-render` delegates chart shapes to this crate.
+- PPTX loader resolves chart `p:graphicFrame` relationships to their
+  `ppt/charts/chartN.xml` parts and maps `c:chartSpace` to `ChartShape`
+  (type from the plot-area chart element and `barDir`; series from `c:ser`).
+  The original part path is retained for lossless save; unrecognized or
+  malformed charts fall back to passthrough with a loss warning. The saver
+  patches only the data sections of dirty chart parts (values, category and
+  series names, title) and writes fresh parts for newly inserted charts;
+  every unedited part stays byte-for-byte identical.
+- Four new Tauri commands (`add_chart`, `set_chart_type`, `set_chart_data`,
+  `set_chart_title`) wired through the transactional command bus. The Svelte
+  canvas renders charts through the deterministic slide SVG, and a data-table
+  editor (double-click a chart) edits categories, series, and values.
+- `docs/sprint-records/wave-4.md` documenting the wave scope and acceptance
+  criteria.
 
 ### Added — Wave 3 (tables)
 
