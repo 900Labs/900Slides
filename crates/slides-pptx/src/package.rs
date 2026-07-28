@@ -25,9 +25,11 @@ pub const REL_TYPE_IMAGE: &str =
 /// Relationship type for hyperlink relationships on a slide.
 pub const REL_TYPE_HYPERLINK: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink";
+/// Relationship type for chart parts embedded in a slide.
+pub const REL_TYPE_CHART: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart";
 /// 900Slides manifest relationship type.
 pub const REL_TYPE_MANIFEST: &str = "http://900labs.github.io/900Slides/1.0/relationships/manifest";
-
 /// Content type for the 900Slides manifest.
 pub const CT_MANIFEST: &str = "application/vnd.900labs.900slides.manifest+xml";
 /// Namespace for OOXML package relationships.

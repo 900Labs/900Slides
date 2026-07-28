@@ -13,13 +13,15 @@ use slides_core::{
     TextBox, Theme, Transform, VerticalAlign, MAX_TABLE_COLS, MAX_TABLE_ROWS,
 };
 
+use crate::chart::{is_chart_frame, parse_chart_frame};
 use crate::error::{Error, Result};
 use crate::geometry;
 use crate::ledger::{LossLedger, LossWarning};
 use crate::media as pkgmedia;
 use crate::package::{
-    find_rel_by_type, parse_rels, Rel, REL_TYPE_HYPERLINK, REL_TYPE_IMAGE, REL_TYPE_MANIFEST,
-    REL_TYPE_NOTES_SLIDE, REL_TYPE_OFFICE_DOCUMENT, REL_TYPE_SLIDE, REL_TYPE_THEME,
+    find_rel_by_type, parse_rels, Rel, REL_TYPE_CHART, REL_TYPE_HYPERLINK, REL_TYPE_IMAGE,
+    REL_TYPE_MANIFEST, REL_TYPE_NOTES_SLIDE, REL_TYPE_OFFICE_DOCUMENT, REL_TYPE_SLIDE,
+    REL_TYPE_THEME,
 };
 
 pub(crate) const SHAPE_ELEMENT_NAMES: &[&str] =
@@ -87,7 +89,8 @@ pub fn read_entry_to_bytes(
     Ok(buf)
 }
 
-/// Resolved relationships for a single slide: media embeddings and hyperlinks.
+/// Resolved relationships for a single slide: media embeddings, hyperlinks, and
+/// chart part references.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct SlideRels {
     /// `r:embed` relationship id -> media content key (into `deck.media`).
@@ -96,11 +99,15 @@ pub(crate) struct SlideRels {
     pub rid_by_media: HashMap<String, String>,
     /// `r:id` -> hyperlink target URL for external hyperlinks on the slide.
     pub hyperlink_by_rid: HashMap<String, String>,
+    /// `r:id` -> chart part path for chart relationships on the slide.
+    pub chart_by_rid: HashMap<String, String>,
+    /// `r:id` -> original chart part bytes for chart relationships on the slide.
+    pub chart_bytes_by_rid: HashMap<String, Vec<u8>>,
 }
 
 /// Loads every image referenced by a slide's relationships into the deck media
-/// store and resolves hyperlink targets, returning the resolved relationship
-/// mapping.
+/// store, resolves hyperlink targets and chart part references, returning the
+/// resolved relationship mapping.
 ///
 /// Each image part is ingested through `slides_media` (MIME sniff, EXIF strip,
 /// size/dimension caps) and stored under a content-addressed key. A failure to
@@ -168,6 +175,24 @@ fn load_slide_rels(
         out.rid_by_media.insert(key, rel.id.clone());
     }
 
+    for rel in rels.iter().filter(|r| r.rel_type == REL_TYPE_CHART) {
+        let Some(part_path) = rel.resolve(&base) else {
+            continue;
+        };
+        match read_entry_to_bytes(archive, &part_path) {
+            Ok(bytes) => {
+                out.chart_by_rid.insert(rel.id.clone(), part_path);
+                out.chart_bytes_by_rid.insert(rel.id.clone(), bytes);
+            }
+            Err(err) => {
+                ledger.add(LossWarning::new(
+                    slide_path,
+                    format!("could not read chart part {part_path}: {err}"),
+                ));
+            }
+        }
+    }
+
     Ok(out)
 }
 
@@ -183,6 +208,17 @@ pub(crate) struct LoadResult {
     /// (into `deck.media`) to the OOXML relationship id that resolves it. Used
     /// by the saver to emit `<a:blip r:embed="...">` for modeled images.
     pub slide_media_rids: HashMap<String, HashMap<String, String>>,
+    /// For each slide (keyed by its part path), a map from shape index to the
+    /// chart part path that backs a chart shape. Used by the saver to know
+    /// which chart XML to patch.
+    pub chart_source_parts: HashMap<String, HashMap<usize, String>>,
+    /// Original bytes of every chart part encountered during load, keyed by
+    /// part path. Used by the saver to preserve unedited charts byte-for-byte.
+    pub original_chart_bytes: HashMap<String, Vec<u8>>,
+    /// For each slide (keyed by its part path), a map from chart part path to
+    /// the relationship id that resolves it. Used by the saver to emit
+    /// `<c:chart r:id="...">` for modeled charts.
+    pub slide_chart_rids: HashMap<String, HashMap<String, String>>,
 }
 
 /// Loads a PPTX package into a [`Deck`] plus package metadata.
@@ -221,6 +257,9 @@ pub fn load(bytes: &[u8]) -> Result<LoadResult> {
     let mut ledger = LossLedger::new();
     let mut slide_paths = HashMap::new();
     let mut slide_media_rids: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut chart_source_parts: HashMap<String, HashMap<usize, String>> = HashMap::new();
+    let mut original_chart_bytes: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut slide_chart_rids: HashMap<String, HashMap<String, String>> = HashMap::new();
 
     if let Some(path) = theme_path {
         if let Ok(xml) = read_entry_to_string(&mut archive, &path) {
@@ -238,13 +277,21 @@ pub fn load(bytes: &[u8]) -> Result<LoadResult> {
         };
         let slide_rels = load_slide_rels(&mut archive, slide_path, &mut deck.media, &mut ledger)?;
         let slide_xml = read_entry_to_string(&mut archive, slide_path)?;
-        let mut slide = parse_slide(&slide_xml, slide_path, &slide_rels, &mut ledger)?;
+        let mut slide = parse_slide(
+            &slide_xml,
+            slide_path,
+            &slide_rels,
+            &mut ledger,
+            &mut chart_source_parts,
+            &mut original_chart_bytes,
+        )?;
         slide.id = slide_path.to_string();
         if let Ok(notes) = load_slide_notes(&mut archive, slide_path) {
             slide.notes = notes;
         }
         slide_paths.insert(slide_path.to_string(), slide_path.to_string());
         slide_media_rids.insert(slide_path.to_string(), slide_rels.rid_by_media);
+        slide_chart_rids.insert(slide_path.to_string(), slide_rels.chart_by_rid);
         deck.slides.push(slide);
     }
 
@@ -260,6 +307,9 @@ pub fn load(bytes: &[u8]) -> Result<LoadResult> {
         manifest_path,
         loss_ledger: ledger,
         slide_media_rids,
+        chart_source_parts,
+        original_chart_bytes,
+        slide_chart_rids,
     })
 }
 
@@ -311,6 +361,8 @@ fn parse_slide(
     slide_id: &str,
     slide_rels: &SlideRels,
     ledger: &mut LossLedger,
+    chart_source_parts: &mut HashMap<String, HashMap<usize, String>>,
+    original_chart_bytes: &mut HashMap<String, Vec<u8>>,
 ) -> Result<Slide> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
@@ -387,11 +439,30 @@ fn parse_slide(
                     } else if local == "graphicFrame" {
                         if let Some(table) = parse_table(&captured_str, slide_id, ledger) {
                             shapes.push(Shape::Table(table));
+                        } else if let Some(chart) = parse_chart_frame(
+                            &captured_str,
+                            slide_id,
+                            &slide_rels.chart_by_rid,
+                            &slide_rels.chart_bytes_by_rid,
+                            shapes.len(),
+                            ledger,
+                            chart_source_parts,
+                            original_chart_bytes,
+                        ) {
+                            shapes.push(Shape::Chart(chart));
                         } else {
-                            ledger.add(LossWarning::new(
-                                slide_id,
-                                format!("preserved {local} as opaque object; not editable"),
-                            ));
+                            let is_chart = is_chart_frame(&captured_str);
+                            if is_chart {
+                                ledger.add(LossWarning::new(
+                                    slide_id,
+                                    "chart preserved as opaque object; not editable".to_string(),
+                                ));
+                            } else {
+                                ledger.add(LossWarning::new(
+                                    slide_id,
+                                    format!("preserved {local} as opaque object; not editable"),
+                                ));
+                            }
                             let frame = parse_frame(&captured_str);
                             shapes.push(Shape::Passthrough(PassthroughObject {
                                 id: extract_id(&captured_str, shapes.len()),
@@ -1681,11 +1752,11 @@ fn extract_id(xml: &str, fallback_index: usize) -> String {
     format!("shape-{fallback_index}")
 }
 
-fn qname_str(q: QName) -> String {
+pub(crate) fn qname_str(q: QName) -> String {
     String::from_utf8_lossy(q.local_name().as_ref()).into_owned()
 }
 
-fn attr_by_local_name(e: &BytesStart<'_>, name: &str) -> Option<String> {
+pub(crate) fn attr_by_local_name(e: &BytesStart<'_>, name: &str) -> Option<String> {
     for attr in e.attributes() {
         let attr = attr.ok()?;
         if attr.key.local_name().as_ref() == name.as_bytes() {
@@ -1695,7 +1766,7 @@ fn attr_by_local_name(e: &BytesStart<'_>, name: &str) -> Option<String> {
     None
 }
 
-fn rel_attribute(e: &BytesStart<'_>, name: &str) -> Option<String> {
+pub(crate) fn rel_attribute(e: &BytesStart<'_>, name: &str) -> Option<String> {
     for attr in e.attributes() {
         let attr = attr.ok()?;
         let key_bytes = attr.key.as_ref();
@@ -1710,7 +1781,7 @@ fn rel_attribute(e: &BytesStart<'_>, name: &str) -> Option<String> {
     None
 }
 
-fn parse_attr_f64(e: &BytesStart<'_>, name: &str) -> Option<f64> {
+pub(crate) fn parse_attr_f64(e: &BytesStart<'_>, name: &str) -> Option<f64> {
     attr_by_local_name(e, name)?.parse().ok()
 }
 

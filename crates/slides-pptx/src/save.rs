@@ -12,13 +12,17 @@ use slides_core::{
 };
 use zip::write::{FileOptions, ZipWriter};
 
+use crate::chart::{
+    chart_graphic_frame_xml, chart_part_path, generate_chart_xml, is_chart_frame, next_chart_index,
+    patch_chart_xml, CT_CHART,
+};
 use crate::error::{Error, Result};
 use crate::geometry;
 use crate::load::{copy_element, extract_blip_embed, rels_path_for, SHAPE_ELEMENT_NAMES};
 use crate::media as pkgmedia;
 use crate::package::{
-    parse_rels, write_content_types, write_rels, Rel, CT_MANIFEST, REL_TYPE_HYPERLINK,
-    REL_TYPE_IMAGE, REL_TYPE_MANIFEST,
+    parse_rels, write_content_types, write_rels, Rel, CT_MANIFEST, REL_TYPE_CHART,
+    REL_TYPE_HYPERLINK, REL_TYPE_IMAGE, REL_TYPE_MANIFEST,
 };
 use crate::session::Session;
 
@@ -148,6 +152,16 @@ pub fn save(session: &Session) -> Result<Vec<u8>> {
         }
     }
 
+    // Pre-pass for charts: allocate part paths and relationship ids for charts on
+    // dirty slides, and pre-patch dirty existing chart XML parts.
+    let mut chart_save_state = prepare_charts(
+        session,
+        &mut archive,
+        &dirty_paths,
+        &mut slide_rels_additions,
+        &mut content_types,
+    )?;
+
     let mut manifest_seen = false;
     let mut content_types_seen = false;
     let mut rels_seen = false;
@@ -179,6 +193,9 @@ pub fn save(session: &Session) -> Result<Vec<u8>> {
             let bytes = write_rels(&rels)?;
             writer.start_file(&name, options)?;
             writer.write_all(&bytes)?;
+        } else if let Some(bytes) = chart_save_state.patched_chart_parts.remove(&name) {
+            writer.start_file(&name, options)?;
+            writer.write_all(&bytes)?;
         } else if let Some(slide) = find_slide_by_path(session, &dirty_paths, &name) {
             let mut original_xml = String::new();
             entry.read_to_string(&mut original_xml)?;
@@ -186,9 +203,14 @@ pub fn save(session: &Session) -> Result<Vec<u8>> {
                 .get(slide.id.as_str())
                 .cloned()
                 .unwrap_or_default();
+            let chart_rids = chart_save_state
+                .chart_rids
+                .get(slide.id.as_str())
+                .cloned()
+                .unwrap_or_default();
             let rels_path = rels_path_for(&name);
             let link_rids = slide_link_rids.get(&rels_path).cloned().unwrap_or_default();
-            let xml = patch_slide_xml(slide, &original_xml, &rids, &link_rids)?;
+            let xml = patch_slide_xml(slide, &original_xml, &rids, &link_rids, &chart_rids)?;
             writer.start_file(&name, options)?;
             writer.write_all(&xml)?;
         } else {
@@ -196,9 +218,13 @@ pub fn save(session: &Session) -> Result<Vec<u8>> {
         }
     }
 
-    // Write brand-new media parts (inserted images) and any slide rels files
-    // that did not previously exist.
+    // Write brand-new media parts (inserted images), chart parts, and any slide
+    // rels files that did not previously exist.
     for (part, bytes) in &new_media_parts {
+        writer.start_file(part.as_str(), options)?;
+        writer.write_all(bytes)?;
+    }
+    for (part, bytes) in &chart_save_state.new_chart_parts {
         writer.start_file(part.as_str(), options)?;
         writer.write_all(bytes)?;
     }
@@ -226,6 +252,130 @@ pub fn save(session: &Session) -> Result<Vec<u8>> {
 
     writer.finish()?;
     Ok(out.into_inner())
+}
+
+/// State accumulated while preparing charts for save.
+struct ChartSaveState {
+    /// Patched bytes for dirty existing chart parts, keyed by part path.
+    patched_chart_parts: HashMap<String, Vec<u8>>,
+    /// (slide_id, shape_index) -> relationship id for all charts on dirty slides.
+    chart_rids: HashMap<String, HashMap<usize, String>>,
+    /// New chart parts to write, keyed by part path.
+    new_chart_parts: Vec<(String, Vec<u8>)>,
+}
+
+/// Prepares chart parts for save: allocates new chart parts/relationships and
+/// pre-patches dirty existing chart XML. Existing chart parts that are not dirty
+/// are left untouched and will be copied byte-for-byte from the original archive.
+fn prepare_charts(
+    session: &Session,
+    archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
+    dirty_paths: &HashSet<String>,
+    slide_rels_additions: &mut HashMap<String, Vec<Rel>>,
+    content_types: &mut crate::package::ContentTypes,
+) -> Result<ChartSaveState> {
+    let mut state = ChartSaveState {
+        patched_chart_parts: HashMap::new(),
+        chart_rids: HashMap::new(),
+        new_chart_parts: Vec::new(),
+    };
+    let mut chart_counter = next_chart_index(archive);
+
+    for slide_id in session.dirty_slides.iter() {
+        let Some(slide_path) = session.slide_paths.get(slide_id) else {
+            continue;
+        };
+        if !dirty_paths.contains(slide_path) {
+            continue;
+        }
+        let Some(slide) = session.deck.slides.iter().find(|s| &s.id == slide_id) else {
+            continue;
+        };
+
+        let rels_path = rels_path_for(slide_path);
+        let existing_rels = match crate::load::read_entry_to_string(archive, &rels_path) {
+            Ok(xml) => parse_rels(&xml).unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        let base_max = max_rel_number(&existing_rels);
+        let additions = slide_rels_additions
+            .get(&rels_path)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let additions_max = max_rel_number(additions);
+        let mut max_rid = base_max.max(additions_max);
+
+        for (shape_index, shape) in slide.shapes.iter().enumerate() {
+            let Shape::Chart(chart) = shape else {
+                continue;
+            };
+
+            if let Some(part_path) = session
+                .chart_source_parts
+                .get(slide_id)
+                .and_then(|m| m.get(&shape_index))
+            {
+                // Existing chart: reuse relationship id.
+                let rid = session
+                    .slide_chart_rids
+                    .get(slide_id)
+                    .and_then(|m| m.get(part_path))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        max_rid += 1;
+                        format!("rId{max_rid}")
+                    });
+                state
+                    .chart_rids
+                    .entry(slide_id.clone())
+                    .or_default()
+                    .insert(shape_index, rid);
+
+                if session.dirty_charts.contains(part_path) {
+                    if let Some(original) = session.original_chart_bytes.get(part_path) {
+                        let original_str = String::from_utf8_lossy(original);
+                        match patch_chart_xml(&original_str, chart) {
+                            Ok(bytes) => {
+                                state.patched_chart_parts.insert(part_path.clone(), bytes);
+                            }
+                            Err(_) => {
+                                // Fallback: generate fresh chart XML.
+                                state
+                                    .patched_chart_parts
+                                    .insert(part_path.clone(), generate_chart_xml(chart));
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Newly inserted chart: allocate a part and relationship.
+                let part_index = chart_counter;
+                chart_counter += 1;
+                let part_path = chart_part_path(part_index);
+                let bytes = generate_chart_xml(chart);
+                max_rid += 1;
+                let rid = format!("rId{max_rid}");
+                state.new_chart_parts.push((part_path.clone(), bytes));
+                state
+                    .chart_rids
+                    .entry(slide_id.clone())
+                    .or_default()
+                    .insert(shape_index, rid.clone());
+                slide_rels_additions
+                    .entry(rels_path.clone())
+                    .or_default()
+                    .push(Rel {
+                        id: rid,
+                        rel_type: REL_TYPE_CHART.to_string(),
+                        target: pkgmedia::relative_target(slide_path, &part_path),
+                        target_mode: None,
+                    });
+                content_types.ensure_override(&part_path, CT_CHART);
+            }
+        }
+    }
+
+    Ok(state)
 }
 
 /// Returns the highest `image<N>` index under `ppt/media/`, or `0` if none.
@@ -382,6 +532,7 @@ fn regenerate_sp_tree(
     original_xml: &str,
     rids: &HashMap<String, String>,
     link_rids: &HashMap<String, String>,
+    chart_rids: &HashMap<usize, String>,
 ) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     {
@@ -421,7 +572,14 @@ fn regenerate_sp_tree(
                     let local = qname_str(e.name());
                     if local == "spTree" && in_sp_tree {
                         for (index, shape) in slide.shapes.iter().enumerate() {
-                            write_model_shape(&mut writer, shape, rids, link_rids, index)?;
+                            write_model_shape(
+                                &mut writer,
+                                shape,
+                                rids,
+                                link_rids,
+                                chart_rids,
+                                index,
+                            )?;
                         }
                         in_sp_tree = false;
                     }
@@ -445,6 +603,7 @@ fn write_model_shape<W: Write>(
     shape: &Shape,
     rids: &HashMap<String, String>,
     link_rids: &HashMap<String, String>,
+    chart_rids: &HashMap<usize, String>,
     index: usize,
 ) -> Result<()> {
     let id = 100_000 + index as i64;
@@ -487,30 +646,58 @@ fn write_model_shape<W: Write>(
             let xml = table_graphic_frame_xml(table, id, &name);
             writer.get_mut().write_all(xml.as_bytes())?;
         }
-        Shape::Chart(_) => {}
+        Shape::Chart(chart) => {
+            if let Some(rid) = chart_rids.get(&index) {
+                let name = format!("Chart {}", index + 1);
+                let xml = chart_graphic_frame_xml(chart, id, &name, rid);
+                writer.get_mut().write_all(xml.as_bytes())?;
+            }
+        }
     }
     Ok(())
 }
 
-/// Patches a single slide XML document in place.
+/// Patches a captured `<p:graphicFrame>` that represents a chart. Since all chart
+/// data lives in a separate chart XML part, the slide graphicFrame is written
+/// back byte-for-byte.
+fn patch_chart_frame_xml<W: Write>(
+    writer: &mut Writer<W>,
+    captured: &[u8],
+    _shape: &Shape,
+    _chart_rids: &HashMap<usize, String>,
+    _index: usize,
+) -> Result<()> {
+    writer.get_mut().write_all(captured)?;
+    Ok(())
+}
+
 ///
 /// Editable text boxes have their paragraphs rewritten; modeled images and
 /// geometric shapes have their `<p:spPr>` (and `<p:blipFill>` for pictures)
 /// regenerated from the model while every other element on the slide —
 /// pictures, transitions, timing, backgrounds, non-editable shapes — is copied
 /// through untouched. Shapes added since load are appended to the shape tree.
+/// Patches a single slide XML document in place.
+///
+/// Editable text boxes have their paragraphs rewritten; modeled images,
+/// geometric shapes, and tables have their model-driven content regenerated
+/// while non-modeled attributes survive. Chart graphicFrames have their
+/// transform updated while the chart relationship id is preserved so the chart
+/// XML part can be patched separately. Shapes added since load are appended to
+/// the shape tree.
 fn patch_slide_xml(
     slide: &Slide,
     original_xml: &str,
     rids: &HashMap<String, String>,
     link_rids: &HashMap<String, String>,
+    chart_rids: &HashMap<usize, String>,
 ) -> Result<Vec<u8>> {
     // If the model has fewer shapes than the original slide XML, a shape was
     // deleted. The positional patch below cannot represent a deletion (it would
     // misalign every following shape and leave the deleted element in place), so
     // fall back to regenerating the entire shape tree from the model.
     if count_top_level_shapes(original_xml)? > slide.shapes.len() {
-        return regenerate_sp_tree(slide, original_xml, rids, link_rids);
+        return regenerate_sp_tree(slide, original_xml, rids, link_rids, chart_rids);
     }
 
     let mut out = Vec::new();
@@ -579,6 +766,20 @@ fn patch_slide_xml(
                                 }
                                 Some(shape)
                             }
+                            Some(shape)
+                                if matches!(shape, Shape::Chart(_))
+                                    && local == "graphicFrame"
+                                    && is_chart_frame(&String::from_utf8_lossy(&captured)) =>
+                            {
+                                patch_chart_frame_xml(
+                                    &mut writer,
+                                    &captured,
+                                    shape,
+                                    chart_rids,
+                                    shape_idx,
+                                )?;
+                                Some(shape)
+                            }
                             _ => {
                                 writer.get_mut().write_all(&captured)?;
                                 model_shape
@@ -605,6 +806,7 @@ fn patch_slide_xml(
                                 &slide.shapes[shape_idx],
                                 rids,
                                 link_rids,
+                                chart_rids,
                                 shape_idx,
                             )?;
                             shape_idx += 1;
@@ -785,6 +987,7 @@ fn append_shape<W: Write>(
     shape: &Shape,
     rids: &HashMap<String, String>,
     link_rids: &HashMap<String, String>,
+    chart_rids: &HashMap<usize, String>,
     index: usize,
 ) -> Result<()> {
     let id = 100_000 + index as i64;
@@ -826,7 +1029,13 @@ fn append_shape<W: Write>(
             let xml = table_graphic_frame_xml(table, id, &name);
             writer.get_mut().write_all(xml.as_bytes())?;
         }
-        Shape::Chart(_) => {}
+        Shape::Chart(chart) => {
+            if let Some(rid) = chart_rids.get(&index) {
+                let name = format!("Chart {}", index + 1);
+                let xml = chart_graphic_frame_xml(chart, id, &name, rid);
+                writer.get_mut().write_all(xml.as_bytes())?;
+            }
+        }
     }
     Ok(())
 }
