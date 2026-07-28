@@ -15,6 +15,7 @@
     HeadingLevelDto,
     ImageShapeSnapshot,
     MediaMap,
+    MisspellingDto,
     ParagraphDto,
     ParagraphStyleDto,
     PassthroughSnapshot,
@@ -305,13 +306,12 @@
     }
   }
 
-  /** Emits a text-box edit command after splitting the textarea value into paragraphs. */
-  function handleBlur(event: FocusEvent, shapeIndex: number): void {
+  /** Emits a text-box edit command for the given textarea value, if it changed. */
+  function commitTextBox(textarea: HTMLTextAreaElement, shapeIndex: number): void {
     if (!onEditTextBox) return
-    const target = event.target as HTMLTextAreaElement
-    const textBox = (slide.shapes[shapeIndex].value as TextBoxSnapshot)
+    const textBox = slide.shapes[shapeIndex].value as TextBoxSnapshot
     const originalParagraphs = textBox.paragraphs
-    const lines = target.value.split('\n')
+    const lines = textarea.value.split('\n')
 
     const newParagraphs: ParagraphDto[] = lines.map((line, index) =>
       buildParagraph(line, originalParagraphs[index]),
@@ -345,6 +345,11 @@
         paragraphs: newParagraphs,
       })
     }
+  }
+
+  /** Emits a text-box edit command on blur. */
+  function handleBlur(event: FocusEvent, shapeIndex: number): void {
+    commitTextBox(event.target as HTMLTextAreaElement, shapeIndex)
   }
 
   /** Dash pattern in EMU for a given dash style, matching slides-render. */
@@ -570,6 +575,260 @@
   /** Cache for rendered chart SVGs, keyed by a stable shape key. */
   const chartSvgCache = new Map<string, string>()
 
+  // --- Spell-check (Wave 6, component 2) -------------------------------------
+  // Squiggles are rendered in a transparent overlay positioned exactly behind
+  // the textarea; the textarea itself stays fully editable. Spell-check runs
+  // via async invoke on a debounce so it never blocks typing.
+
+  /** Live (possibly uncommitted) textarea text per text-box shape index. */
+  let liveText = $state<Record<number, string>>({})
+  /** Last spell-check result per shape, paired with the exact text it covers. */
+  let spellChecked = $state<Record<number, { text: string; errors: MisspellingDto[] }>>({})
+  /** Per-shape debounce timers and tokens (cancel stale checks on new input). */
+  const spellTimers = new Map<number, ReturnType<typeof setTimeout>>()
+  const spellTokens = new Map<number, number>()
+  /** Spell-check debounce window in milliseconds. */
+  const SPELL_DEBOUNCE_MS = 350
+  /** Maximum suggestions requested per word. */
+  const SPELL_MAX_SUGGESTIONS = 5
+
+  /** Open spell-check context menu state (null when closed). */
+  let spellMenu = $state<{
+    word: string
+    start: number
+    end: number
+    x: number
+    y: number
+    suggestions: string[]
+  } | null>(null)
+  /** Textbox the open menu targets (kept outside reactive state on purpose). */
+  let spellMenuTextarea: HTMLTextAreaElement | null = null
+  let spellMenuShapeIndex = 0
+
+  /** Tracks the rendered slide so per-shape spell state resets on slide change. */
+  let lastSlideId = ''
+  /** Root canvas element, used to keep the squiggle overlay scroll in sync. */
+  let canvasEl: HTMLElement
+
+  $effect(() => {
+    if (slide.id === lastSlideId) return
+    lastSlideId = slide.id
+    liveText = {}
+    spellChecked = {}
+    spellMenu = null
+    spellMenuTextarea = null
+    // Seed an initial check for every text box so squiggles appear on load.
+    for (let index = 0; index < slide.shapes.length; index += 1) {
+      const shape = slide.shapes[index]
+      if (shape.kind === 'text_box') {
+        const tb = shape.value as TextBoxSnapshot
+        scheduleSpellCheck(index, textFromParagraphs(tb.paragraphs))
+      }
+    }
+  })
+
+  // Re-applies each textarea's scroll offset to its squiggle overlay after the
+  // overlay content is re-rendered (which resets scrollTop to 0).
+  $effect(() => {
+    void spellChecked
+    void liveText
+    if (!canvasEl) return
+    for (const overlay of Array.from(canvasEl.querySelectorAll<HTMLElement>('.text-box-overlay'))) {
+      const textarea = overlay.parentElement?.querySelector('textarea')
+      if (textarea instanceof HTMLTextAreaElement) {
+        overlay.scrollTop = textarea.scrollTop
+        overlay.scrollLeft = textarea.scrollLeft
+      }
+    }
+  })
+
+  /** Maps a UTF-8 byte offset (as returned by the checker) to a JS string index. */
+  function byteOffsetToChar(text: string, byteOffset: number): number {
+    if (byteOffset <= 0) return 0
+    const encoder = new TextEncoder()
+    let bytes = 0
+    let i = 0
+    while (i < text.length) {
+      if (bytes >= byteOffset) return i
+      const cp = text.codePointAt(i) as number
+      bytes += encoder.encode(String.fromCodePoint(cp)).length
+      i += cp > 0xffff ? 2 : 1
+    }
+    return text.length
+  }
+
+  /** Escapes the HTML-significant characters in a string. */
+  function escapeHtml(s: string): string {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  }
+
+  /** Builds the overlay HTML: escaped text with misspelled words wrapped in
+   *  spans carrying their JS char offsets for hit-testing. */
+  function overlayMarkup(text: string, errors: MisspellingDto[]): string {
+    const spans = errors
+      .map((e) => ({
+        start: byteOffsetToChar(text, e.byteStart),
+        end: byteOffsetToChar(text, e.byteEnd),
+      }))
+      .filter((s) => s.start <= s.end)
+      .sort((a, b) => a.start - b.start)
+
+    let html = ''
+    let pos = 0
+    for (const span of spans) {
+      if (span.start < pos) continue
+      html += escapeHtml(text.slice(pos, span.start))
+      const word = text.slice(span.start, span.end)
+      html += `<span class="misspelled" data-start="${span.start}" data-end="${span.end}">${escapeHtml(word)}</span>`
+      pos = span.end
+    }
+    html += escapeHtml(text.slice(pos))
+    return html
+  }
+
+  /** Overlay markup for a text box: the live text with squiggles when the last
+   *  check matches the current text (avoids misaligned stale squiggles). */
+  function textBoxOverlay(shapeIndex: number, paragraphs: ParagraphDto[]): string {
+    const text = liveText[shapeIndex] ?? textFromParagraphs(paragraphs)
+    const checked = spellChecked[shapeIndex]
+    const errors = checked && checked.text === text ? checked.errors : []
+    return overlayMarkup(text, errors)
+  }
+
+  /** Schedules a debounced spell-check for a text box. */
+  function scheduleSpellCheck(shapeIndex: number, text: string): void {
+    const prev = spellTimers.get(shapeIndex)
+    if (prev !== undefined) clearTimeout(prev)
+    const token = (spellTokens.get(shapeIndex) ?? 0) + 1
+    spellTokens.set(shapeIndex, token)
+    const timer = setTimeout(async () => {
+      if (spellTokens.get(shapeIndex) !== token) return
+      try {
+        const errors = await invoke<MisspellingDto[]>('spell_check', { text })
+        if (spellTokens.get(shapeIndex) !== token) return
+        spellChecked = { ...spellChecked, [shapeIndex]: { text, errors } }
+      } catch {
+        // Never block editing on a spell-check failure.
+      }
+    }, SPELL_DEBOUNCE_MS)
+    spellTimers.set(shapeIndex, timer)
+  }
+
+  /** Handles textarea input: records live text and schedules a check. */
+  function handleInput(event: Event, shapeIndex: number): void {
+    const textarea = event.currentTarget as HTMLTextAreaElement
+    liveText = { ...liveText, [shapeIndex]: textarea.value }
+    syncScroll(event)
+    scheduleSpellCheck(shapeIndex, textarea.value)
+  }
+
+  /** Mirrors the textarea scroll position onto the squiggle overlay. */
+  function syncScroll(event: Event): void {
+    const textarea = event.currentTarget as HTMLTextAreaElement
+    const overlay = textarea.parentElement?.querySelector('.text-box-overlay') as HTMLElement | null
+    if (overlay) {
+      overlay.scrollTop = textarea.scrollTop
+      overlay.scrollLeft = textarea.scrollLeft
+    }
+  }
+
+  /** Hit-tests the click point against rendered misspelled-word spans. */
+  function findMisspellingAt(
+    textarea: HTMLTextAreaElement,
+    x: number,
+    y: number,
+  ): { word: string; start: number; end: number } | null {
+    const overlay = textarea.parentElement?.querySelector('.text-box-overlay')
+    if (!overlay) return null
+    const spans = Array.from(overlay.querySelectorAll<HTMLElement>('.misspelled'))
+    for (const span of spans) {
+      const rect = span.getBoundingClientRect()
+      if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) {
+        return {
+          word: span.textContent ?? '',
+          start: Number(span.dataset.start ?? '0'),
+          end: Number(span.dataset.end ?? '0'),
+        }
+      }
+    }
+    return null
+  }
+
+  /** Opens the spell-check context menu for the misspelled word under the cursor. */
+  async function openSpellMenu(
+    textarea: HTMLTextAreaElement,
+    shapeIndex: number,
+    word: string,
+    start: number,
+    end: number,
+    x: number,
+    y: number,
+  ): Promise<void> {
+    let suggestions: string[] = []
+    try {
+      suggestions = await invoke<string[]>('spell_suggest', {
+        word,
+        max: SPELL_MAX_SUGGESTIONS,
+      })
+    } catch {
+      suggestions = []
+    }
+    spellMenuTextarea = textarea
+    spellMenuShapeIndex = shapeIndex
+    spellMenu = { word, start, end, x, y, suggestions }
+  }
+
+  /** Right-click handler: shows the spell menu only on a misspelled word. */
+  function handleContextMenu(event: MouseEvent, shapeIndex: number): void {
+    if (readonly) return
+    const textarea = event.currentTarget as HTMLTextAreaElement
+    const hit = findMisspellingAt(textarea, event.clientX, event.clientY)
+    if (!hit) return
+    event.preventDefault()
+    void openSpellMenu(textarea, shapeIndex, hit.word, hit.start, hit.end, event.clientX, event.clientY)
+  }
+
+  /** Replaces the misspelled word with the chosen suggestion and re-checks. */
+  function applySuggestion(replacement: string): void {
+    const menu = spellMenu
+    const textarea = spellMenuTextarea
+    spellMenu = null
+    spellMenuTextarea = null
+    if (!menu || !textarea) return
+    const text = textarea.value
+    const next = text.slice(0, menu.start) + replacement + text.slice(menu.end)
+    textarea.value = next
+    const caret = menu.start + replacement.length
+    textarea.focus()
+    textarea.setSelectionRange(caret, caret)
+    liveText = { ...liveText, [spellMenuShapeIndex]: next }
+    commitTextBox(textarea, spellMenuShapeIndex)
+    scheduleSpellCheck(spellMenuShapeIndex, next)
+  }
+
+  /** Learns the misspelled word into the user dictionary and re-checks. */
+  async function addToDictionary(): Promise<void> {
+    const menu = spellMenu
+    const textarea = spellMenuTextarea
+    spellMenu = null
+    spellMenuTextarea = null
+    if (!menu || !textarea) return
+    try {
+      await invoke('spell_add_word', { word: menu.word })
+    } catch {
+      // Persistence failure should not crash the editor.
+    }
+    const text = textarea.value
+    liveText = { ...liveText, [spellMenuShapeIndex]: text }
+    scheduleSpellCheck(spellMenuShapeIndex, text)
+  }
+
+  /** Closes the spell-check context menu. */
+  function closeSpellMenu(): void {
+    spellMenu = null
+    spellMenuTextarea = null
+  }
+
   /** Builds a stable cache key for a chart shape. */
   function chartKey(shapeIndex: number, chart: ChartShapeSnapshot): string {
     return `${slide.id}:${shapeIndex}:${chart.chartType}:${chart.title ?? ''}:${JSON.stringify(chart.data)}`
@@ -610,6 +869,7 @@
 
 <div
   class="canvas"
+  bind:this={canvasEl}
   style:background-color={toRgba(background)}
   role="application"
   aria-label="Slide canvas"
@@ -640,14 +900,27 @@
             {/each}
           </div>
         {:else}
-          <textarea
-            class="text-box"
-            data-slide-id={slide.id}
-            data-shape-index={shapeIndex}
-            value={textFromParagraphs(textBox.paragraphs)}
-            onblur={(event) => handleBlur(event, shapeIndex)}
-            aria-label="Editable text box"
-          ></textarea>
+          <div class="text-box-editor">
+            <div class="text-box-overlay" aria-hidden="true">
+              {@html textBoxOverlay(shapeIndex, textBox.paragraphs)}
+            </div>
+            <textarea
+              class="text-box"
+              data-slide-id={slide.id}
+              data-shape-index={shapeIndex}
+              value={textFromParagraphs(textBox.paragraphs)}
+              oninput={(event) => handleInput(event, shapeIndex)}
+              onscroll={syncScroll}
+              oncontextmenu={(event) => handleContextMenu(event, shapeIndex)}
+              onblur={(event) => {
+                handleBlur(event, shapeIndex)
+                const cleared = { ...liveText }
+                delete cleared[shapeIndex]
+                liveText = cleared
+              }}
+              aria-label="Editable text box"
+            ></textarea>
+          </div>
         {/if}
       </div>
     {:else if shape.kind === 'passthrough'}
@@ -802,6 +1075,44 @@
   {/each}
 </div>
 
+{#if spellMenu}
+  <button
+    type="button"
+    class="spell-menu-backdrop"
+    aria-label="Close spell-check menu"
+    onclick={closeSpellMenu}
+  ></button>
+  <div
+    class="spell-menu"
+    style:left={`${spellMenu.x}px`}
+    style:top={`${spellMenu.y}px`}
+    role="menu"
+    aria-label="Spell-check suggestions"
+  >
+    {#each spellMenu.suggestions as suggestion}
+      <button
+        type="button"
+        class="spell-menu-item"
+        role="menuitem"
+        onclick={() => applySuggestion(suggestion)}
+      >
+        {suggestion}
+      </button>
+    {:else}
+      <div class="spell-menu-empty">No suggestions</div>
+    {/each}
+    <div class="spell-menu-divider"></div>
+    <button
+      type="button"
+      class="spell-menu-item spell-menu-add"
+      role="menuitem"
+      onclick={addToDictionary}
+    >
+      Add &ldquo;{spellMenu.word}&rdquo; to dictionary
+    </button>
+  </div>
+{/if}
+
 <style>
   .canvas {
     position: relative;
@@ -813,6 +1124,38 @@
   }
   .text-box-container {
     position: absolute;
+  }
+  .text-box-editor {
+    position: relative;
+    width: 100%;
+    height: 100%;
+  }
+  .text-box-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    border: 1px solid transparent;
+    padding: 0.25rem;
+    font-family: inherit;
+    font-size: 1rem;
+    line-height: 1.3;
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+    color: transparent;
+    overflow: hidden;
+    pointer-events: none;
+    z-index: 0;
+  }
+  .text-box-overlay :global(.misspelled) {
+    text-decoration: underline wavy #d00;
+    text-decoration-skip-ink: none;
+  }
+  .text-box {
+    position: relative;
+    z-index: 1;
   }
   .text-box {
     width: 100%;
@@ -985,5 +1328,54 @@
     justify-content: center;
     color: #666;
     font-size: 0.85rem;
+  }
+  .spell-menu-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    background: transparent;
+    border: none;
+    padding: 0;
+    cursor: default;
+  }
+  .spell-menu {
+    position: fixed;
+    z-index: 51;
+    min-width: 160px;
+    max-width: 280px;
+    padding: 0.2rem 0;
+    background: #fff;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.2);
+    display: flex;
+    flex-direction: column;
+  }
+  .spell-menu-item {
+    text-align: left;
+    background: none;
+    border: none;
+    padding: 0.35rem 0.75rem;
+    font-family: inherit;
+    font-size: 0.85rem;
+    cursor: pointer;
+    color: #222;
+  }
+  .spell-menu-item:hover,
+  .spell-menu-item:focus-visible {
+    background: #e8f0fe;
+  }
+  .spell-menu-empty {
+    padding: 0.35rem 0.75rem;
+    font-size: 0.85rem;
+    color: #888;
+  }
+  .spell-menu-divider {
+    height: 1px;
+    margin: 0.2rem 0;
+    background: #e5e5e5;
+  }
+  .spell-menu-add {
+    color: #444;
   }
 </style>

@@ -3613,6 +3613,7 @@ dependencies = [
  "slides-media",
  "slides-pptx",
  "slides-render",
+ "slides-spell",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
@@ -3652,6 +3653,10 @@ dependencies = [
  "slides-core",
  "twox-hash",
 ]
+
+[[package]]
+name = "slides-spell"
+version = "0.1.0"
 
 [[package]]
 name = "smallvec"

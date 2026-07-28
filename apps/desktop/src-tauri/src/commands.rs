@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -39,6 +40,12 @@ pub struct AppState {
     /// media store has not changed so that non-media commands (text edits,
     /// moves, style changes) do not re-encode every image on every keystroke.
     pub media_cache: Mutex<MediaCache>,
+    /// Offline en-US spell checker (bundled dictionary + learned user words).
+    /// Held behind a Mutex because learning a word needs `&mut self`.
+    pub spell: Mutex<slides_spell::SpellChecker>,
+    /// Path to the newline-delimited user dictionary file. `spell_add_word`
+    /// appends learned words here; on startup the checker reloads them.
+    pub user_dictionary_path: PathBuf,
 }
 
 /// Cached media snapshot, keyed by a content fingerprint of the deck's media.
@@ -65,15 +72,15 @@ pub struct RecoveryTracker {
 impl AppState {
     /// Creates a new application state with the default recovery directory.
     pub fn new() -> Self {
-        let dir = dirs::data_dir()
-            .unwrap_or_default()
-            .join("900Slides")
-            .join("recovery");
-        fs::create_dir_all(&dir).ok();
+        let app_dir = dirs::data_dir().unwrap_or_default().join("900Slides");
+        fs::create_dir_all(&app_dir).ok();
+        let recovery_dir = app_dir.join("recovery");
+        fs::create_dir_all(&recovery_dir).ok();
+        let user_dictionary_path = app_dir.join("user-dictionary.txt");
         Self {
             session: Mutex::new(None),
             recovery: Mutex::new(RecoveryTracker {
-                dir,
+                dir: recovery_dir,
                 pending_token: 0,
                 pending_bytes: None,
                 pending_deck_id: None,
@@ -81,6 +88,8 @@ impl AppState {
             presenter_index: Mutex::new(0),
             recovery_token: AtomicU64::new(0),
             media_cache: Mutex::new(MediaCache::default()),
+            spell: Mutex::new(slides_spell::SpellChecker::new()),
+            user_dictionary_path,
         }
     }
 }
@@ -106,6 +115,26 @@ impl AppState {
             slides: deck.slides.iter().map(slide_to_dto).collect(),
             media,
             warnings: Vec::new(),
+        }
+    }
+
+    /// Loads the persisted user dictionary (if any) into the spell checker.
+    ///
+    /// Called once at startup. Read errors are ignored gracefully: a missing
+    /// or unreadable file simply yields an empty user dictionary, so spell
+    /// checking still works from the bundled en-US word list.
+    pub fn load_user_dictionary(&self) {
+        let Ok(content) = fs::read_to_string(&self.user_dictionary_path) else {
+            return;
+        };
+        let Ok(mut checker) = self.spell.lock() else {
+            return;
+        };
+        for line in content.lines() {
+            let word = line.trim();
+            if !word.is_empty() {
+                checker.add_user_word(word);
+            }
         }
     }
 }
@@ -747,6 +776,19 @@ pub struct WarningDto {
     pub slide_id: String,
     /// Human-readable warning message.
     pub message: String,
+}
+
+/// A misspelled word and its byte span within the checked text. Mirrors
+/// [`slides_spell::Misspelling`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MisspellingDto {
+    /// The misspelled token exactly as it appeared in the source text.
+    pub word: String,
+    /// Inclusive byte offset of the token within the checked text.
+    pub byte_start: usize,
+    /// Exclusive byte offset of the token within the checked text.
+    pub byte_end: usize,
 }
 
 /// State returned to the presenter window.
@@ -1397,7 +1439,11 @@ pub fn set_chart_type(
     let chart_type = chart_type_from_dto(chart_type);
     let mut guard = state.session.lock().map_err(|e| e.to_string())?;
     let session = guard.as_mut().ok_or("no deck is open")?;
-    let command = Box::new(slides_core::SetChartType::new(slide_id, shape_index, chart_type));
+    let command = Box::new(slides_core::SetChartType::new(
+        slide_id,
+        shape_index,
+        chart_type,
+    ));
     session.execute(command).map_err(|e| e.to_string())?;
     let snapshot = state.snapshot(session.deck());
     drop(guard);
@@ -1474,7 +1520,11 @@ pub fn set_chart_title(
     let title = if title.is_empty() { None } else { Some(title) };
     let mut guard = state.session.lock().map_err(|e| e.to_string())?;
     let session = guard.as_mut().ok_or("no deck is open")?;
-    let command = Box::new(slides_core::SetChartTitle::new(slide_id, shape_index, title));
+    let command = Box::new(slides_core::SetChartTitle::new(
+        slide_id,
+        shape_index,
+        title,
+    ));
     session.execute(command).map_err(|e| e.to_string())?;
     let snapshot = state.snapshot(session.deck());
     drop(guard);
@@ -1493,7 +1543,8 @@ pub fn set_transition(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<DeckSnapshot, String> {
-    let transition = kind.map(|k| slides_core::Transition::new(transition_kind_from_dto(k), duration_ms));
+    let transition =
+        kind.map(|k| slides_core::Transition::new(transition_kind_from_dto(k), duration_ms));
     let mut guard = state.session.lock().map_err(|e| e.to_string())?;
     let session = guard.as_mut().ok_or("no deck is open")?;
     let command = Box::new(slides_core::SetTransition::new(slide_id, transition));
@@ -1746,6 +1797,71 @@ pub fn discard_recovery(id: String, state: State<'_, AppState>) -> Result<(), St
         sanitize_recovery_id(&tracker.dir, &id)?
     };
     fs::remove_file(&path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Checks `text` for en-US misspellings, returning each flagged word with its
+/// byte span. Runs against the bundled dictionary plus the session's learned
+/// user words. Runs on demand from the frontend (debounced by the caller).
+#[tauri::command]
+pub fn spell_check(
+    text: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<MisspellingDto>, String> {
+    let checker = state.spell.lock().map_err(|e| e.to_string())?;
+    Ok(checker
+        .check(&text)
+        .into_iter()
+        .map(|m| MisspellingDto {
+            word: m.word,
+            byte_start: m.byte_start,
+            byte_end: m.byte_end,
+        })
+        .collect())
+}
+
+/// Returns up to `max` correction suggestions for `word`, ranked by edit
+/// distance then alphabetical. An empty list is returned for known words.
+#[tauri::command]
+pub fn spell_suggest(
+    word: String,
+    max: usize,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    let checker = state.spell.lock().map_err(|e| e.to_string())?;
+    Ok(checker.suggest(&word, max))
+}
+
+/// Learns `word` into the in-memory user dictionary and appends it to the
+/// persisted user dictionary file so it survives restarts. A no-op for empty
+/// input or words already present in the file.
+#[tauri::command]
+pub fn spell_add_word(word: String, state: State<'_, AppState>) -> Result<(), String> {
+    let trimmed = word.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    {
+        let mut checker = state.spell.lock().map_err(|e| e.to_string())?;
+        checker.add_user_word(trimmed);
+    }
+    let path = state.user_dictionary_path.clone();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    // Avoid duplicating an entry that was learned earlier (case-insensitive).
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    let already_known = existing
+        .lines()
+        .any(|line| line.trim().eq_ignore_ascii_case(trimmed));
+    if !already_known {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| e.to_string())?;
+        writeln!(file, "{trimmed}").map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -2350,7 +2466,11 @@ fn chart_data_to_dto(data: &slides_core::ChartData) -> ChartDataDto {
                 .iter()
                 .map(|s| XYSeriesDto {
                     name: s.name.clone(),
-                    points: s.points.iter().map(|p| XYPointDto { x: p.x, y: p.y }).collect(),
+                    points: s
+                        .points
+                        .iter()
+                        .map(|p| XYPointDto { x: p.x, y: p.y })
+                        .collect(),
                 })
                 .collect(),
         },
@@ -2385,7 +2505,11 @@ fn chart_data_from_dto(dto: ChartDataDto) -> slides_core::ChartData {
                 .into_iter()
                 .map(|s| slides_core::XYSeries {
                     name: s.name,
-                    points: s.points.into_iter().map(|p| slides_core::XYPoint::new(p.x, p.y)).collect(),
+                    points: s
+                        .points
+                        .into_iter()
+                        .map(|p| slides_core::XYPoint::new(p.x, p.y))
+                        .collect(),
                 })
                 .collect(),
         },

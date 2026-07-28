@@ -13,7 +13,31 @@ This section tracks work toward v0.2.0 (editor completeness). See
 [`docs/sprint-records/wave-2.md`](docs/sprint-records/wave-2.md),
 [`docs/sprint-records/wave-3.md`](docs/sprint-records/wave-3.md),
 [`docs/sprint-records/wave-4.md`](docs/sprint-records/wave-4.md), and
-[`docs/sprint-records/wave-5.md`](docs/sprint-records/wave-5.md).
+[`docs/sprint-records/wave-5.md`](docs/sprint-records/wave-5.md), and
+[`docs/sprint-records/wave-6.md`](docs/sprint-records/wave-6.md).
+
+### Added — Wave 6 (spell-check)
+
+- Offline en-US spell-check is now first-class. A new `slides-spell` crate
+  (no longer a stub) bundles a public-domain en-US word list (~233,000 words
+  plus contractions) via `include_str!`, so checking works fully offline with
+  no network dependency. Membership uses an exact `HashSet` (no false
+  positives that silently accept errors).
+- `SpellChecker` tokenizes text into word spans, flags misspellings with
+  byte offsets, and returns correction suggestions ranked by edit distance
+  then alphabetical order. Suggestions use the Norvig generate-and-test
+  method (edits at distance 1–2, filtered against the dictionary set) — never
+  scanning all 233k words per call, so there is no perceptible latency. A
+  user dictionary (learned words) augments the bundled list
+  case-insensitively.
+- Three Tauri commands (`spell_check`, `spell_suggest`, `spell_add_word`)
+  hold a single `SpellChecker` in shared state. The Svelte text editor
+  renders red squiggles under misspelled words (debounced, non-blocking),
+  a context menu offers suggestions and an "Add to dictionary" action, and
+  learned words persist to a file in the app data directory and reload on
+  startup.
+- `docs/sprint-records/wave-6.md` documenting the wave scope and acceptance
+  criteria.
 
 ### Added — Wave 5 (animations and transitions)
 
