@@ -1357,6 +1357,7 @@ fn session_from_slide_xml(slide_xml: &str, slide: Slide) -> Session {
             slide_size: None,
             sections: Vec::new(),
             media: MediaStore::default(),
+            presenter_settings: slides_core::PresenterSettings::default(),
         },
         original,
         package_rels,
