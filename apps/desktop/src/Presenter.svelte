@@ -155,6 +155,8 @@
             slide={presenterState.currentSlide}
             background={backgroundColor()}
             media={presenterState.media}
+            slideSize={presenterState.slideSize}
+            highContrast={presenterState.highContrast}
             readonly
             activeBuildStep={activeBuildStep}
           />
@@ -169,6 +171,8 @@
             slide={presenterState.nextSlide}
             background={backgroundColor()}
             media={presenterState.media}
+            slideSize={presenterState.slideSize}
+            highContrast={presenterState.highContrast}
             readonly
           />
         {:else}

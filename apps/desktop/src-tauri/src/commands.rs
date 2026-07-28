@@ -112,6 +112,8 @@ impl AppState {
             id: deck.id.clone(),
             schema_version: deck.schema_version,
             theme: theme_to_dto(&deck.theme),
+            slide_size: deck.slide_size.as_ref().map(slide_size_to_dto),
+            sections: deck.sections.iter().map(section_to_dto).collect(),
             slides: deck.slides.iter().map(slide_to_dto).collect(),
             media,
             warnings: Vec::new(),
@@ -168,6 +170,13 @@ pub struct DeckSnapshot {
     pub schema_version: u32,
     /// Theme applied to the whole deck.
     pub theme: ThemeSnapshot,
+    /// Fixed slide dimensions (aspect ratio), when set. When `None`, the deck
+    /// renders at the default 16:9.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slide_size: Option<SlideSizeDto>,
+    /// Named slide sections, in slide order.
+    #[serde(default)]
+    pub sections: Vec<SlideSectionDto>,
     /// Ordered slides in the deck.
     pub slides: Vec<SlideSnapshot>,
     /// Media store: image bytes keyed by their media reference, base64-encoded
@@ -176,6 +185,28 @@ pub struct DeckSnapshot {
     pub media: BTreeMap<String, MediaEntryDto>,
     /// Warnings from the last load (empty for most commands).
     pub warnings: Vec<WarningDto>,
+}
+
+/// Fixed slide dimensions, in EMU, used to pin the deck's aspect ratio.
+/// Mirrors [`slides_core::SlideSize`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlideSizeDto {
+    /// Slide width, in EMU.
+    pub width_emu: f64,
+    /// Slide height, in EMU.
+    pub height_emu: f64,
+}
+
+/// A named slide section that starts at a given slide. Mirrors
+/// [`slides_core::SlideSection`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlideSectionDto {
+    /// Human-readable section name.
+    pub name: String,
+    /// Id of the first slide in this section.
+    pub start_slide_id: String,
 }
 
 /// Snapshot of a theme for the frontend.
@@ -190,6 +221,9 @@ pub struct ThemeSnapshot {
     pub body_font: String,
     /// Accent color.
     pub accent_color: ColorDto,
+    /// High-contrast accessibility mode.
+    #[serde(default)]
+    pub high_contrast: bool,
 }
 
 /// RGBA color sent to the frontend.
@@ -222,6 +256,10 @@ pub struct SlideSnapshot {
     /// Ordered build-in animation sequence for this slide.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub animation: Option<AnimationDto>,
+    /// Rich-text speaker notes, when present. When `None`, the plain
+    /// [`SlideSnapshot::notes`] field is used instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rich_notes: Option<Vec<ParagraphDto>>,
 }
 
 /// Snapshot of a slide-to-slide transition.
@@ -808,6 +846,12 @@ pub struct PresenterState {
     /// Media store, base64-encoded, so presenter slides can render images.
     #[serde(default)]
     pub media: BTreeMap<String, MediaEntryDto>,
+    /// Deck slide size (aspect ratio), when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slide_size: Option<SlideSizeDto>,
+    /// Whether the deck is rendered in high-contrast mode.
+    #[serde(default)]
+    pub high_contrast: bool,
 }
 
 /// Recovery snapshot metadata returned to the frontend.
@@ -1643,19 +1687,126 @@ pub fn move_build_step(
 }
 
 /// Renders a single slide to a deterministic SVG string.
+///
+/// The slide's dimensions come from the deck's `slide_size` (aspect ratio),
+/// falling back to the default 16:9. When the deck theme has high-contrast
+/// enabled, a high-contrast palette (black background, white text, yellow
+/// accents) overrides the theme before rendering.
 #[tauri::command]
 pub fn render_slide_svg(slide_id: String, state: State<'_, AppState>) -> Result<String, String> {
     let guard = state.session.lock().map_err(|e| e.to_string())?;
     let session = guard.as_ref().ok_or("no deck is open")?;
     let deck = session.deck();
     let slide = deck.slide(&slide_id).ok_or("slide not found")?;
-    let rendered = slides_render::render_slide(
-        slide,
-        &deck.theme,
-        &deck.media,
-        &slides_render::RenderOptions::default(),
-    );
+    let opts = render_options(deck);
+    let theme = high_contrast_theme(deck);
+    let rendered = slides_render::render_slide(slide, &theme, &deck.media, &opts);
     Ok(rendered.svg)
+}
+
+/// Builds render dimensions for a deck: the deck's `slide_size` when set, else
+/// the default 16:9.
+fn render_options(deck: &slides_core::Deck) -> slides_render::RenderOptions {
+    if let Some(size) = &deck.slide_size {
+        slides_render::RenderOptions {
+            width_emu: size.width_emu,
+            height_emu: size.height_emu,
+        }
+    } else {
+        slides_render::RenderOptions::default()
+    }
+}
+
+/// Returns the theme to render with. When high-contrast is enabled, returns an
+/// overridden palette (black background, yellow accent) without mutating the
+/// deck; otherwise returns the deck's theme by reference.
+fn high_contrast_theme(deck: &slides_core::Deck) -> std::borrow::Cow<'_, slides_core::Theme> {
+    if deck.theme.high_contrast {
+        let mut theme = deck.theme.clone();
+        theme.background = slides_core::Color::black();
+        theme.accent_color = slides_core::Color::rgb(255, 215, 0);
+        std::borrow::Cow::Owned(theme)
+    } else {
+        std::borrow::Cow::Borrowed(&deck.theme)
+    }
+}
+
+/// Sets or clears the deck's slide size (aspect ratio) and returns the updated
+/// deck snapshot. Pass `None` to revert to the default 16:9.
+#[tauri::command]
+pub fn set_slide_size(
+    slide_size: Option<SlideSizeDto>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let core_size = slide_size.map(slide_size_from_dto);
+    let command = Box::new(slides_core::SetSlideSize::new(core_size));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Replaces the deck's entire slide-section list and returns the updated deck
+/// snapshot.
+#[tauri::command]
+pub fn set_sections(
+    sections: Vec<SlideSectionDto>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let core_sections = sections.iter().map(section_from_dto).collect();
+    let command = Box::new(slides_core::SetSections::new(core_sections));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Sets or clears the rich-text speaker notes for a slide and returns the
+/// updated deck snapshot. Pass `None` to clear rich notes (falling back to the
+/// plain `notes` field).
+#[tauri::command]
+pub fn set_rich_notes(
+    slide_id: String,
+    rich_notes: Option<Vec<ParagraphDto>>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let core_notes = rich_notes
+        .map(|paragraphs| paragraphs.iter().map(paragraph_from_dto).collect());
+    let command = Box::new(slides_core::SetRichNotes::new(slide_id, core_notes));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Sets the deck theme's high-contrast accessibility mode and returns the
+/// updated deck snapshot.
+#[tauri::command]
+pub fn set_high_contrast(
+    high_contrast: bool,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let command = Box::new(slides_core::SetHighContrast::new(high_contrast));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
 }
 
 /// Undoes the most recent command and returns the updated deck snapshot.
@@ -1886,6 +2037,8 @@ fn presenter_state_at(state: &AppState) -> Result<PresenterState, String> {
         total: slides.len(),
         notes,
         media: media_to_dto(&session.deck().media),
+        slide_size: session.deck().slide_size.as_ref().map(slide_size_to_dto),
+        high_contrast: session.deck().theme.high_contrast,
     })
 }
 
@@ -2000,6 +2153,35 @@ fn theme_to_dto(theme: &slides_core::Theme) -> ThemeSnapshot {
         heading_font: theme.heading_font.clone(),
         body_font: theme.body_font.clone(),
         accent_color: color_to_dto(theme.accent_color),
+        high_contrast: theme.high_contrast,
+    }
+}
+
+fn slide_size_to_dto(size: &slides_core::SlideSize) -> SlideSizeDto {
+    SlideSizeDto {
+        width_emu: size.width_emu,
+        height_emu: size.height_emu,
+    }
+}
+
+fn slide_size_from_dto(dto: SlideSizeDto) -> slides_core::SlideSize {
+    slides_core::SlideSize {
+        width_emu: dto.width_emu,
+        height_emu: dto.height_emu,
+    }
+}
+
+fn section_to_dto(section: &slides_core::SlideSection) -> SlideSectionDto {
+    SlideSectionDto {
+        name: section.name.clone(),
+        start_slide_id: section.start_slide_id.clone(),
+    }
+}
+
+fn section_from_dto(dto: &SlideSectionDto) -> slides_core::SlideSection {
+    slides_core::SlideSection {
+        name: dto.name.clone(),
+        start_slide_id: dto.start_slide_id.clone(),
     }
 }
 
@@ -2019,6 +2201,10 @@ fn slide_to_dto(slide: &slides_core::Slide) -> SlideSnapshot {
         shapes: slide.shapes.iter().map(shape_to_dto).collect(),
         transition: slide.transition.as_ref().map(transition_to_dto),
         animation: slide.animation.as_ref().map(animation_to_dto),
+        rich_notes: slide
+            .rich_notes
+            .as_ref()
+            .map(|paragraphs| paragraphs.iter().map(paragraph_to_dto).collect()),
     }
 }
 
