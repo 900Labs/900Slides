@@ -27,6 +27,20 @@
   let showRecovery = $state(false)
   /** Hidden file input used to pick an image to insert. */
   let imageInput = $state<HTMLInputElement | null>(null)
+  /** Currently focused table cell, used by the table row/column toolbar. */
+  let activeCell = $state<{ shapeIndex: number; row: number; col: number } | null>(null)
+  /** Whether the table size picker popover is open. */
+  let showTablePicker = $state(false)
+  /** Hovered dimensions in the table size picker (1-based). */
+  let pickerRows = $state(1)
+  let pickerCols = $state(1)
+
+  /** Maximum grid dimension offered by the table size picker. */
+  const PICKER_MAX = 6
+  /** Row/column indices for the picker grid. */
+  const pickerIndices = [...Array(PICKER_MAX).keys()]
+
+  const hasActiveCell = $derived(activeCell !== null)
 
   const activeSlide = $derived<SlideSnapshot | null>(deck?.slides[activeIndex] ?? null)
   const notes = $derived(activeSlide?.notes ?? '')
@@ -273,6 +287,79 @@
     })
   }
 
+  /** Appends a new `rows` x `cols` table to the active slide. */
+  async function onAddTable(rows: number, cols: number): Promise<void> {
+    if (!activeSlide) return
+    showTablePicker = false
+    deck = await invoke<DeckSnapshot>('add_table', {
+      slide_id: activeSlide.id,
+      rows,
+      cols,
+    })
+  }
+
+  /** Commits a table cell text edit and re-renders from the snapshot. */
+  async function handleSetCellText(detail: {
+    slideId: string
+    shapeIndex: number
+    row: number
+    col: number
+    text: string
+  }): Promise<void> {
+    deck = await invoke<DeckSnapshot>('set_cell_text', {
+      slide_id: detail.slideId,
+      shape_index: detail.shapeIndex,
+      row: detail.row,
+      col: detail.col,
+      text: detail.text,
+    })
+  }
+
+  /** Records the focused cell so the row/column toolbar can target it. */
+  function handleCellFocus(detail: { shapeIndex: number; row: number; col: number }): void {
+    activeCell = detail
+  }
+
+  /** Inserts a row below the focused cell. */
+  async function onInsertRow(): Promise<void> {
+    if (!activeSlide || !activeCell) return
+    deck = await invoke<DeckSnapshot>('insert_row', {
+      slide_id: activeSlide.id,
+      shape_index: activeCell.shapeIndex,
+      index: activeCell.row + 1,
+    })
+  }
+
+  /** Inserts a column to the right of the focused cell. */
+  async function onInsertColumn(): Promise<void> {
+    if (!activeSlide || !activeCell) return
+    deck = await invoke<DeckSnapshot>('insert_column', {
+      slide_id: activeSlide.id,
+      shape_index: activeCell.shapeIndex,
+      index: activeCell.col + 1,
+    })
+  }
+
+  /** Deletes the focused cell's row. */
+  async function onDeleteRow(): Promise<void> {
+    if (!activeSlide || !activeCell) return
+    deck = await invoke<DeckSnapshot>('delete_row', {
+      slide_id: activeSlide.id,
+      shape_index: activeCell.shapeIndex,
+      index: activeCell.row,
+    })
+  }
+
+  /** Deletes the focused cell's column. */
+  async function onDeleteColumn(): Promise<void> {
+    if (!activeSlide || !activeCell) return
+    deck = await invoke<DeckSnapshot>('delete_column', {
+      slide_id: activeSlide.id,
+      shape_index: activeCell.shapeIndex,
+      index: activeCell.col,
+    })
+  }
+
   /** Selects a different slide in the thumbnail panel. */
   function selectSlide(index: number): void {
     activeIndex = index
@@ -321,6 +408,53 @@
         <button onclick={() => onAddShape('rectangle')} type="button">Rectangle</button>
         <button onclick={() => onAddShape('ellipse')} type="button">Ellipse</button>
         <button onclick={() => onAddShape('triangle')} type="button">Triangle</button>
+      </span>
+      <span class="toolbar-divider"></span>
+      <span class="table-group">
+        <div class="table-picker-wrap">
+          <button
+            onclick={() => {
+              showTablePicker = !showTablePicker
+              pickerRows = 1
+              pickerCols = 1
+            }}
+            type="button"
+          >
+            Table
+          </button>
+          {#if showTablePicker}
+            <button
+              class="picker-backdrop"
+              onclick={() => (showTablePicker = false)}
+              type="button"
+              aria-label="Close table size picker"
+            ></button>
+            <div class="table-picker" role="dialog" aria-label="Choose table size">
+              <div class="table-picker-grid">
+                {#each pickerIndices as r}
+                  {#each pickerIndices as c}
+                    <button
+                      class="picker-cell"
+                      class:active={pickerRows > r && pickerCols > c}
+                      onmouseenter={() => {
+                        pickerRows = r + 1
+                        pickerCols = c + 1
+                      }}
+                      onclick={() => onAddTable(r + 1, c + 1)}
+                      type="button"
+                      aria-label={`Insert ${r + 1} by ${c + 1} table`}
+                    ></button>
+                  {/each}
+                {/each}
+              </div>
+              <div class="table-picker-label">{pickerRows} × {pickerCols}</div>
+            </div>
+          {/if}
+        </div>
+        <button onclick={onInsertRow} type="button" disabled={!hasActiveCell} title="Insert row below">+ Row</button>
+        <button onclick={onInsertColumn} type="button" disabled={!hasActiveCell} title="Insert column right">+ Col</button>
+        <button onclick={onDeleteRow} type="button" disabled={!hasActiveCell} title="Delete row">− Row</button>
+        <button onclick={onDeleteColumn} type="button" disabled={!hasActiveCell} title="Delete column">− Col</button>
       </span>
       <span class="toolbar-divider"></span>
       <span class="text-group">
@@ -391,6 +525,8 @@
             background={deck.theme.background}
             media={deck.media}
             onEditTextBox={handleTextEdit}
+            onSetCellText={handleSetCellText}
+            onCellFocus={handleCellFocus}
           />
         {:else}
           <div class="empty-canvas">Open or create a deck to start editing.</div>
@@ -456,6 +592,61 @@
   }
   .text-group select {
     padding: 0.3rem 0.4rem;
+  }
+  .table-group {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+  }
+  .table-group button:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+  .table-picker-wrap {
+    position: relative;
+    display: inline-flex;
+  }
+  .picker-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 5;
+    background: transparent;
+    border: none;
+    padding: 0;
+    cursor: default;
+  }
+  .table-picker {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    z-index: 10;
+    margin-top: 0.25rem;
+    padding: 0.4rem;
+    background: #fff;
+    border: 1px solid #ccc;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  }
+  .table-picker-grid {
+    display: grid;
+    grid-template-columns: repeat(6, 1rem);
+    grid-template-rows: repeat(6, 1rem);
+    gap: 2px;
+  }
+  .picker-cell {
+    padding: 0;
+    border: 1px solid #ddd;
+    background: #fafafa;
+    cursor: pointer;
+  }
+  .picker-cell.active {
+    background: #0070c0;
+    border-color: #0070c0;
+  }
+  .table-picker-label {
+    margin-top: 0.3rem;
+    font-size: 0.75rem;
+    color: #555;
+    text-align: center;
   }
   .shape-label {
     font-size: 0.85rem;

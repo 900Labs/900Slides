@@ -92,10 +92,7 @@ impl AppState {
     pub fn snapshot(&self, deck: &slides_core::Deck) -> DeckSnapshot {
         let fingerprint = media_fingerprint(deck);
         let media = {
-            let mut cache = self
-                .media_cache
-                .lock()
-                .expect("media cache mutex poisoned");
+            let mut cache = self.media_cache.lock().expect("media cache mutex poisoned");
             if cache.fingerprint != fingerprint {
                 cache.dto = media_to_dto(&deck.media);
                 cache.fingerprint = fingerprint;
@@ -204,6 +201,8 @@ pub enum ShapeSnapshot {
     Image(ImageShapeSnapshot),
     /// A geometric shape.
     Geometric(GeometricShapeSnapshot),
+    /// A table: a grid of editable cells.
+    Table(TableShapeSnapshot),
 }
 
 /// Snapshot of an image shape.
@@ -228,6 +227,96 @@ pub struct GeometricShapeSnapshot {
     pub geometry: GeometryDto,
     /// Visual style of the shape.
     pub style: StyleDto,
+}
+
+/// Horizontal alignment of cell text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CellAlignDto {
+    /// Left-aligned text.
+    #[default]
+    Left,
+    /// Centered text.
+    Center,
+    /// Right-aligned text.
+    Right,
+}
+
+/// A single border edge: color, width, and dash style.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BorderEdgeDto {
+    /// Edge color.
+    pub color: ColorDto,
+    /// Width in EMU.
+    pub width_emu: f64,
+    /// Dash pattern of the edge.
+    #[serde(default)]
+    pub dash: DashStyleDto,
+}
+
+/// The four borders of a cell (or the table default).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableBordersDto {
+    /// Top edge, if any.
+    #[serde(default)]
+    pub top: Option<BorderEdgeDto>,
+    /// Bottom edge, if any.
+    #[serde(default)]
+    pub bottom: Option<BorderEdgeDto>,
+    /// Left edge, if any.
+    #[serde(default)]
+    pub left: Option<BorderEdgeDto>,
+    /// Right edge, if any.
+    #[serde(default)]
+    pub right: Option<BorderEdgeDto>,
+}
+
+/// A single cell in a table.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableCellDto {
+    /// Plain-text content of the cell.
+    #[serde(default)]
+    pub text: String,
+    /// Cell fill, or `None` to inherit the table default.
+    #[serde(default)]
+    pub fill: Option<FillDto>,
+    /// Cell-level border overrides. When `None`, inherit the table default.
+    #[serde(default)]
+    pub borders: Option<TableBordersDto>,
+    /// Horizontal alignment of the cell text.
+    #[serde(default)]
+    pub align: CellAlignDto,
+}
+
+/// A single row of cells in a table.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableRowDto {
+    /// Row height in EMU.
+    pub height: f64,
+    /// Cells, left to right.
+    pub cells: Vec<TableCellDto>,
+}
+
+/// Snapshot of a table shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableShapeSnapshot {
+    /// Position, size, and rotation of the table.
+    pub transform: TransformDto,
+    /// Rows, top to bottom.
+    pub rows: Vec<TableRowDto>,
+    /// Per-column width in EMU.
+    pub column_widths: Vec<f64>,
+    /// Default cell borders applied when a cell has no explicit border.
+    #[serde(default)]
+    pub default_borders: TableBordersDto,
+    /// Whether the first row is rendered as a header (bold, distinct fill).
+    #[serde(default)]
+    pub header_row: bool,
 }
 
 /// Placement of a shape: a bounding frame plus a rotation around its center.
@@ -544,14 +633,8 @@ pub fn new_deck(state: State<'_, AppState>) -> Result<DeckSnapshot, String> {
     let fresh = slides_core::Deck::new();
     session.deck_mut().id = fresh.id;
     let snapshot = state.snapshot(session.deck());
-    *state
-        .session
-        .lock()
-        .map_err(|e| e.to_string())? = Some(session);
-    *state
-        .presenter_index
-        .lock()
-        .map_err(|e| e.to_string())? = 0;
+    *state.session.lock().map_err(|e| e.to_string())? = Some(session);
+    *state.presenter_index.lock().map_err(|e| e.to_string())? = 0;
     Ok(snapshot)
 }
 
@@ -567,14 +650,8 @@ pub fn open_deck(path: String, state: State<'_, AppState>) -> Result<DeckSnapsho
         .iter()
         .map(warning_to_dto)
         .collect();
-    *state
-        .session
-        .lock()
-        .map_err(|e| e.to_string())? = Some(session);
-    *state
-        .presenter_index
-        .lock()
-        .map_err(|e| e.to_string())? = 0;
+    *state.session.lock().map_err(|e| e.to_string())? = Some(session);
+    *state.presenter_index.lock().map_err(|e| e.to_string())? = 0;
     Ok(snapshot)
 }
 
@@ -669,12 +746,8 @@ pub fn set_run_style(
 ) -> Result<DeckSnapshot, String> {
     let mut guard = state.session.lock().map_err(|e| e.to_string())?;
     let session = guard.as_mut().ok_or("no deck is open")?;
-    let mut command = slides_core::SetRunStyle::new(
-        slide_id,
-        shape_index,
-        paragraph_index,
-        run_index,
-    );
+    let mut command =
+        slides_core::SetRunStyle::new(slide_id, shape_index, paragraph_index, run_index);
     if let Some(bold) = bold {
         command = command.bold(bold);
     }
@@ -697,7 +770,9 @@ pub fn set_run_style(
     if let Some(code) = code {
         command = command.code(code);
     }
-    session.execute(Box::new(command)).map_err(|e| e.to_string())?;
+    session
+        .execute(Box::new(command))
+        .map_err(|e| e.to_string())?;
     let snapshot = state.snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
@@ -859,6 +934,197 @@ pub fn delete_shape(
     Ok(snapshot)
 }
 
+/// Appends a new `rows` x `cols` table to a slide and returns the updated deck
+/// snapshot.
+#[tauri::command]
+pub fn add_table(
+    slide_id: String,
+    rows: usize,
+    cols: usize,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let table = slides_core::TableShape::default_grid(rows, cols, centered_table_frame());
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let command = Box::new(slides_core::AddTable::new(slide_id, table));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Sets the text of a single cell in a table shape and returns the updated
+/// deck snapshot.
+#[tauri::command]
+pub fn set_cell_text(
+    slide_id: String,
+    shape_index: usize,
+    row: usize,
+    col: usize,
+    text: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let command = Box::new(slides_core::SetCellText::new(
+        slide_id,
+        shape_index,
+        row,
+        col,
+        text,
+    ));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Merge-patches a cell's style (fill, borders, and/or alignment) and returns
+/// the updated deck snapshot. Pass `clear_fill: true` / `clear_borders: true`
+/// to remove an existing fill / borders.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub fn set_cell_style(
+    slide_id: String,
+    shape_index: usize,
+    row: usize,
+    col: usize,
+    fill: Option<FillDto>,
+    clear_fill: Option<bool>,
+    borders: Option<TableBordersDto>,
+    clear_borders: Option<bool>,
+    align: Option<CellAlignDto>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let mut command = slides_core::SetCellStyle::new(slide_id, shape_index, row, col);
+    if clear_fill.unwrap_or(false) {
+        command = command.fill(None);
+    } else if let Some(fill) = fill {
+        command = command.fill(Some(fill_to_core(fill)));
+    }
+    if clear_borders.unwrap_or(false) {
+        command = command.borders(None);
+    } else if let Some(borders) = borders {
+        command = command.borders(Some(table_borders_to_core(borders)));
+    }
+    if let Some(align) = align {
+        command = command.align(cell_align_to_core(align));
+    }
+    session
+        .execute(Box::new(command))
+        .map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Inserts an empty row into a table at `index` and returns the updated deck
+/// snapshot. The new row matches the table's column count and the height of
+/// the last row.
+#[tauri::command]
+pub fn insert_row(
+    slide_id: String,
+    shape_index: usize,
+    index: usize,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let (col_count, row_height) = table_grid_metrics(session.deck(), &slide_id, shape_index)?;
+    let row = slides_core::TableRow {
+        height: row_height,
+        cells: (0..col_count)
+            .map(|_| slides_core::TableCell::default())
+            .collect(),
+    };
+    let command = Box::new(slides_core::InsertRow::new(
+        slide_id,
+        shape_index,
+        index,
+        row,
+    ));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Inserts an empty column into a table at `index` and returns the updated
+/// deck snapshot. The new column's width is the table's average column width.
+#[tauri::command]
+pub fn insert_column(
+    slide_id: String,
+    shape_index: usize,
+    index: usize,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let table = lookup_table(session.deck(), &slide_id, shape_index)?;
+    let width = average_column_width(table);
+    let command = Box::new(slides_core::InsertColumn::new(
+        slide_id,
+        shape_index,
+        index,
+        width,
+    ));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Removes a row from a table at `index` and returns the updated deck snapshot.
+#[tauri::command]
+pub fn delete_row(
+    slide_id: String,
+    shape_index: usize,
+    index: usize,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let command = Box::new(slides_core::DeleteRow::new(slide_id, shape_index, index));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Removes a column from a table at `index` and returns the updated deck
+/// snapshot.
+#[tauri::command]
+pub fn delete_column(
+    slide_id: String,
+    shape_index: usize,
+    index: usize,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let command = Box::new(slides_core::DeleteColumn::new(slide_id, shape_index, index));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
 /// Renders a single slide to a deterministic SVG string.
 #[tauri::command]
 pub fn render_slide_svg(slide_id: String, state: State<'_, AppState>) -> Result<String, String> {
@@ -912,10 +1178,7 @@ pub fn start_presenter(app: AppHandle, state: State<'_, AppState>) -> Result<(),
             return Err("no deck is open".to_string());
         }
     }
-    *state
-        .presenter_index
-        .lock()
-        .map_err(|e| e.to_string())? = 0;
+    *state.presenter_index.lock().map_err(|e| e.to_string())? = 0;
     tauri::WebviewWindowBuilder::new(
         &app,
         "presenter",
@@ -939,10 +1202,7 @@ pub fn get_presenter_state(state: State<'_, AppState>) -> Result<PresenterState,
 pub fn presenter_next(state: State<'_, AppState>) -> Result<PresenterState, String> {
     let len = {
         let guard = state.session.lock().map_err(|e| e.to_string())?;
-        guard
-            .as_ref()
-            .map(|s| s.deck().slides.len())
-            .unwrap_or(0)
+        guard.as_ref().map(|s| s.deck().slides.len()).unwrap_or(0)
     };
     let mut idx = state.presenter_index.lock().map_err(|e| e.to_string())?;
     if *idx + 1 < len {
@@ -993,10 +1253,7 @@ pub fn list_recovery_snapshots(
 
 /// Restores a recovery snapshot as the current deck.
 #[tauri::command]
-pub fn restore_recovery(
-    id: String,
-    state: State<'_, AppState>,
-) -> Result<DeckSnapshot, String> {
+pub fn restore_recovery(id: String, state: State<'_, AppState>) -> Result<DeckSnapshot, String> {
     let path = {
         let tracker = state.recovery.lock().map_err(|e| e.to_string())?;
         sanitize_recovery_id(&tracker.dir, &id)?
@@ -1010,14 +1267,8 @@ pub fn restore_recovery(
         .iter()
         .map(warning_to_dto)
         .collect();
-    *state
-        .session
-        .lock()
-        .map_err(|e| e.to_string())? = Some(session);
-    *state
-        .presenter_index
-        .lock()
-        .map_err(|e| e.to_string())? = 0;
+    *state.session.lock().map_err(|e| e.to_string())? = Some(session);
+    *state.presenter_index.lock().map_err(|e| e.to_string())? = 0;
     Ok(snapshot)
 }
 
@@ -1211,6 +1462,7 @@ fn shape_to_dto(shape: &slides_core::Shape) -> ShapeSnapshot {
                 style: style_to_dto(&geometric.style),
             })
         }
+        slides_core::Shape::Table(table) => ShapeSnapshot::Table(table_to_dto(table)),
     }
 }
 
@@ -1406,6 +1658,59 @@ fn centered_transform(native_w: u32, native_h: u32) -> slides_core::Transform {
     }
 }
 
+/// Returns a centered frame for a new table, sized to ~70% of the slide width
+/// and ~60% of the slide height.
+fn centered_table_frame() -> slides_core::Rect {
+    let width = SLIDE_WIDTH_EMU * 0.7;
+    let height = SLIDE_HEIGHT_EMU * 0.6;
+    let x = (SLIDE_WIDTH_EMU - width) / 2.0;
+    let y = (SLIDE_HEIGHT_EMU - height) / 2.0;
+    slides_core::Rect::new(x, y, width, height)
+}
+
+/// Finds a table shape on a slide, returning `Err` if the slide or shape is
+/// missing or is not a table.
+fn lookup_table<'a>(
+    deck: &'a slides_core::Deck,
+    slide_id: &str,
+    shape_index: usize,
+) -> Result<&'a slides_core::TableShape, String> {
+    let slide = deck.slide(slide_id).ok_or("slide not found")?;
+    let shape = slide.shapes.get(shape_index).ok_or("shape not found")?;
+    match shape {
+        slides_core::Shape::Table(table) => Ok(table),
+        _ => Err("shape is not a table".to_string()),
+    }
+}
+
+/// Returns the column count and a representative row height (from the last
+/// row, or a quarter of the slide height when the table is empty) for building
+/// a new row that matches the table's grid.
+fn table_grid_metrics(
+    deck: &slides_core::Deck,
+    slide_id: &str,
+    shape_index: usize,
+) -> Result<(usize, f64), String> {
+    let table = lookup_table(deck, slide_id, shape_index)?;
+    let col_count = table.col_count();
+    let row_height = table
+        .rows
+        .last()
+        .map(|row| row.height)
+        .unwrap_or(SLIDE_HEIGHT_EMU / 4.0);
+    Ok((col_count, row_height))
+}
+
+/// Returns the average column width of a table, used as the width of a newly
+/// inserted column.
+fn average_column_width(table: &slides_core::TableShape) -> f64 {
+    let count = table.col_count();
+    if count == 0 {
+        return SLIDE_WIDTH_EMU / 4.0;
+    }
+    table.column_widths.iter().sum::<f64>() / count as f64
+}
+
 fn media_entry_to_dto(entry: &slides_core::MediaEntry) -> MediaEntryDto {
     let bytes = base64::engine::general_purpose::STANDARD.encode(&entry.bytes);
     MediaEntryDto {
@@ -1421,6 +1726,82 @@ fn media_to_dto(media: &slides_core::MediaStore) -> BTreeMap<String, MediaEntryD
         .iter()
         .map(|(key, entry)| (key.clone(), media_entry_to_dto(entry)))
         .collect()
+}
+
+fn cell_align_to_dto(align: slides_core::CellAlign) -> CellAlignDto {
+    match align {
+        slides_core::CellAlign::Left => CellAlignDto::Left,
+        slides_core::CellAlign::Center => CellAlignDto::Center,
+        slides_core::CellAlign::Right => CellAlignDto::Right,
+    }
+}
+
+fn cell_align_to_core(align: CellAlignDto) -> slides_core::CellAlign {
+    match align {
+        CellAlignDto::Left => slides_core::CellAlign::Left,
+        CellAlignDto::Center => slides_core::CellAlign::Center,
+        CellAlignDto::Right => slides_core::CellAlign::Right,
+    }
+}
+
+fn border_edge_to_dto(edge: &slides_core::BorderEdge) -> BorderEdgeDto {
+    BorderEdgeDto {
+        color: color_to_dto(edge.color),
+        width_emu: edge.width_emu,
+        dash: dash_to_dto(&edge.dash),
+    }
+}
+
+fn border_edge_to_core(edge: BorderEdgeDto) -> slides_core::BorderEdge {
+    slides_core::BorderEdge {
+        color: color_to_core(edge.color),
+        width_emu: edge.width_emu,
+        dash: dash_to_core(edge.dash),
+    }
+}
+
+fn table_borders_to_dto(borders: &slides_core::TableBorders) -> TableBordersDto {
+    TableBordersDto {
+        top: borders.top.as_ref().map(border_edge_to_dto),
+        bottom: borders.bottom.as_ref().map(border_edge_to_dto),
+        left: borders.left.as_ref().map(border_edge_to_dto),
+        right: borders.right.as_ref().map(border_edge_to_dto),
+    }
+}
+
+fn table_borders_to_core(borders: TableBordersDto) -> slides_core::TableBorders {
+    slides_core::TableBorders {
+        top: borders.top.map(border_edge_to_core),
+        bottom: borders.bottom.map(border_edge_to_core),
+        left: borders.left.map(border_edge_to_core),
+        right: borders.right.map(border_edge_to_core),
+    }
+}
+
+fn table_cell_to_dto(cell: &slides_core::TableCell) -> TableCellDto {
+    TableCellDto {
+        text: cell.text.clone(),
+        fill: cell.fill.as_ref().map(fill_to_dto),
+        borders: cell.borders.as_ref().map(table_borders_to_dto),
+        align: cell_align_to_dto(cell.align),
+    }
+}
+
+fn table_row_to_dto(row: &slides_core::TableRow) -> TableRowDto {
+    TableRowDto {
+        height: row.height,
+        cells: row.cells.iter().map(table_cell_to_dto).collect(),
+    }
+}
+
+fn table_to_dto(table: &slides_core::TableShape) -> TableShapeSnapshot {
+    TableShapeSnapshot {
+        transform: transform_to_dto(table.transform),
+        rows: table.rows.iter().map(table_row_to_dto).collect(),
+        column_widths: table.column_widths.clone(),
+        default_borders: table_borders_to_dto(&table.default_borders),
+        header_row: table.header_row,
+    }
 }
 
 fn paragraph_to_dto(paragraph: &slides_core::Paragraph) -> ParagraphDto {
@@ -1484,7 +1865,10 @@ fn run_from_dto(run: &RunDto) -> slides_core::Run {
             VerticalAlignDto::Superscript => slides_core::VerticalAlign::Superscript,
             VerticalAlignDto::Subscript => slides_core::VerticalAlign::Subscript,
         },
-        link: run.link.as_ref().map(|link| slides_core::Link::new_unchecked(link.url.clone())),
+        link: run
+            .link
+            .as_ref()
+            .map(|link| slides_core::Link::new_unchecked(link.url.clone())),
         code: run.code,
         font_family: run.font_family.clone(),
     }
@@ -1527,7 +1911,10 @@ fn warning_to_dto(warning: &slides_pptx::LossWarning) -> WarningDto {
 
 #[cfg(test)]
 mod tests {
-    use super::{sanitize_recovery_id, AppState};
+    use super::{
+        average_column_width, sanitize_recovery_id, table_grid_metrics, table_to_dto, AppState,
+        CellAlignDto,
+    };
     use std::fs;
 
     #[test]
@@ -1559,5 +1946,60 @@ mod tests {
             super::presenter_state_at(&state),
             Err("deck has no slides".to_string())
         );
+    }
+
+    fn sample_table() -> slides_core::TableShape {
+        let mut table = slides_core::TableShape::default_grid(
+            2,
+            2,
+            slides_core::Rect::new(0.0, 0.0, 200.0, 100.0),
+        );
+        table.cell_mut(0, 0).unwrap().text = "Name".to_string();
+        table.cell_mut(0, 1).unwrap().text = "Value".to_string();
+        table.cell_mut(1, 0).unwrap().text = "x".to_string();
+        table.cell_mut(1, 1).unwrap().align = slides_core::CellAlign::Right;
+        table.header_row = true;
+        table
+    }
+
+    #[test]
+    fn table_to_dto_round_trips_cells_and_header() {
+        let table = sample_table();
+        let dto = table_to_dto(&table);
+        assert_eq!(dto.rows.len(), 2);
+        assert_eq!(dto.column_widths, table.column_widths);
+        assert!(dto.header_row);
+        assert_eq!(dto.rows[0].cells[0].text, "Name");
+        assert_eq!(dto.rows[1].cells[1].align, CellAlignDto::Right);
+    }
+
+    #[test]
+    fn average_column_width_matches_mean() {
+        let mut table = slides_core::TableShape::default_grid(
+            1,
+            2,
+            slides_core::Rect::new(0.0, 0.0, 300.0, 100.0),
+        );
+        table.column_widths = vec![100.0, 200.0];
+        assert_eq!(average_column_width(&table), 150.0);
+    }
+
+    #[test]
+    fn table_grid_metrics_reads_existing_table() {
+        let table = sample_table();
+        let mut deck = slides_core::Deck::new();
+        let slide = slides_core::Slide {
+            id: "slide-1".to_string(),
+            shapes: vec![slides_core::Shape::Table(table)],
+            ..Default::default()
+        };
+        let slide_id = slide.id.clone();
+        deck.slides.push(slide);
+
+        let (cols, height) = table_grid_metrics(&deck, &slide_id, 0).expect("table metrics");
+        assert_eq!(cols, 2);
+        assert_eq!(height, 50.0);
+
+        assert!(table_grid_metrics(&deck, &slide_id, 1).is_err());
     }
 }

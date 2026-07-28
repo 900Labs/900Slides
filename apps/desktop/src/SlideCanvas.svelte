@@ -1,5 +1,7 @@
 <script lang="ts">
   import type {
+    BorderEdgeDto,
+    CellAlignDto,
     ColorDto,
     CropDto,
     DashStyleDto,
@@ -15,6 +17,9 @@
     RunDto,
     SlideSnapshot,
     StyleDto,
+    TableBordersDto,
+    TableCellDto,
+    TableShapeSnapshot,
     TextBoxSnapshot,
     VerticalAlignDto,
   } from './lib/types'
@@ -33,11 +38,22 @@
       shapeIndex: number
       paragraphs: ParagraphDto[]
     }) => void
+    /** Callback invoked when a table cell's text is edited. */
+    onSetCellText?: (detail: {
+      slideId: string
+      shapeIndex: number
+      row: number
+      col: number
+      text: string
+    }) => void
+    /** Callback invoked when a table cell gains focus. */
+    onCellFocus?: (detail: { shapeIndex: number; row: number; col: number }) => void
     /** Whether the canvas is read-only (presenter mode). */
     readonly?: boolean
   }
 
-  let { slide, background, media, onEditTextBox, readonly = false }: Props = $props()
+  let { slide, background, media, onEditTextBox, onSetCellText, onCellFocus, readonly = false }: Props =
+    $props()
 
   /** EMU to CSS pixels for a 1280x720 (16:9) canvas. */
   const EMU_TO_PX = 1.0 / 9525.0
@@ -325,6 +341,85 @@
     const offsetY = crop.top * scaledH
     return `position:absolute;width:${scaledW}%;height:${scaledH}%;left:-${offsetX}%;top:-${offsetY}%;object-fit:fill;`
   }
+
+  /** Background color for a cell: cell fill, header default, or transparent. */
+  function cellBackground(cell: TableCellDto, isHeader: boolean): string {
+    if (cell.fill && cell.fill.solid) return toHex(cell.fill.solid)
+    if (isHeader) return '#d9e1f2'
+    return 'transparent'
+  }
+
+  /** Maps a dash style to a CSS border-style keyword. */
+  function dashToCss(dash: DashStyleDto): string {
+    switch (dash) {
+      case 'dash':
+        return 'dashed'
+      case 'dot':
+        return 'dotted'
+      case 'dash_dot':
+        return 'dashed'
+      default:
+        return 'solid'
+    }
+  }
+
+  /** CSS shorthand for a single border edge. */
+  function edgeBorder(edge: BorderEdgeDto): string {
+    return `${edge.widthEmu * EMU_TO_PX}px ${dashToCss(edge.dash)} ${toHex(edge.color)}`
+  }
+
+  /** CSS `border` declaration for a cell, honoring per-cell or default borders. */
+  function cellBorders(cell: TableCellDto, defaults: TableBordersDto): string {
+    const borders = cell.borders ?? defaults
+    return [
+      `border-top:${borders.top ? edgeBorder(borders.top) : 'none'}`,
+      `border-bottom:${borders.bottom ? edgeBorder(borders.bottom) : 'none'}`,
+      `border-left:${borders.left ? edgeBorder(borders.left) : 'none'}`,
+      `border-right:${borders.right ? edgeBorder(borders.right) : 'none'}`,
+    ].join(';')
+  }
+
+  /** CSS `text-align` for a cell alignment. */
+  function cellTextAlign(align: CellAlignDto): string {
+    return align
+  }
+
+  /** Cumulative column left edges, in EMU, starting at 0. */
+  function columnOffsets(widths: number[]): number[] {
+    const offsets: number[] = []
+    let acc = 0
+    for (const w of widths) {
+      offsets.push(acc)
+      acc += w
+    }
+    return offsets
+  }
+
+  /** Cumulative row top edges, in EMU, starting at 0. */
+  function rowOffsets(rows: { height: number }[]): number[] {
+    const offsets: number[] = []
+    let acc = 0
+    for (const row of rows) {
+      offsets.push(acc)
+      acc += row.height
+    }
+    return offsets
+  }
+
+  /** Emits a cell-text edit command if the cell value changed on blur. */
+  function handleCellBlur(
+    event: FocusEvent,
+    shapeIndex: number,
+    row: number,
+    col: number,
+    original: string,
+  ): void {
+    if (!onSetCellText) return
+    const target = event.target as HTMLTextAreaElement
+    if (target.value !== original) {
+      onSetCellText({ slideId: slide.id, shapeIndex, row, col, text: target.value })
+    }
+  }
 </script>
 
 <div
@@ -413,6 +508,59 @@
         style:height={toPx(frame.height)}
       >
         {@html geometricSvg(geometric)}
+      </div>
+    {:else if shape.kind === 'table'}
+      {@const table = shape.value as TableShapeSnapshot}
+      {@const tframe = table.transform.frame}
+      {@const trot = table.transform.rotation}
+      {@const colX = columnOffsets(table.columnWidths)}
+      {@const rowY = rowOffsets(table.rows)}
+      <div
+        class="table-container"
+        style:left={toPx(tframe.x)}
+        style:top={toPx(tframe.y)}
+        style:width={toPx(tframe.width)}
+        style:height={toPx(tframe.height)}
+        style:transform={trot ? `rotate(${trot}deg)` : undefined}
+      >
+        {#each table.rows as row, rowIndex}
+          {@const isHeader = table.headerRow && rowIndex === 0}
+          {#each row.cells as cell, colIndex}
+            {@const cleft = colX[colIndex] ?? 0}
+            {@const ctop = rowY[rowIndex] ?? 0}
+            {@const cwidth = table.columnWidths[colIndex] ?? 0}
+            {@const cheight = row.height}
+            <div
+              class="table-cell"
+              style:left={toPx(cleft)}
+              style:top={toPx(ctop)}
+              style:width={toPx(cwidth)}
+              style:height={toPx(cheight)}
+              style:background-color={cellBackground(cell, isHeader)}
+              style:font-weight={isHeader ? 'bold' : undefined}
+              style={cellBorders(cell, table.defaultBorders)}
+            >
+              {#if readonly}
+                <div class="table-cell-text" style:text-align={cellTextAlign(cell.align)}>
+                  {cell.text}
+                </div>
+              {:else}
+                <textarea
+                  class="table-cell-input"
+                  data-slide-id={slide.id}
+                  data-shape-index={shapeIndex}
+                  data-row={rowIndex}
+                  data-col={colIndex}
+                  style:text-align={cellTextAlign(cell.align)}
+                  value={cell.text}
+                  onfocus={() => onCellFocus?.({ shapeIndex, row: rowIndex, col: colIndex })}
+                  onblur={(event) => handleCellBlur(event, shapeIndex, rowIndex, colIndex, cell.text)}
+                  aria-label={`Cell row ${rowIndex + 1} column ${colIndex + 1}`}
+                ></textarea>
+              {/if}
+            </div>
+          {/each}
+        {/each}
       </div>
     {/if}
   {/each}
@@ -545,5 +693,38 @@
     height: 100%;
     display: block;
     overflow: visible;
+  }
+  .table-container {
+    position: absolute;
+    box-sizing: content-box;
+  }
+  .table-cell {
+    position: absolute;
+    box-sizing: border-box;
+    overflow: hidden;
+  }
+  .table-cell-input {
+    width: 100%;
+    height: 100%;
+    border: none;
+    background: transparent;
+    resize: none;
+    padding: 0.1rem 0.2rem;
+    font-family: inherit;
+    font-size: 0.85rem;
+    line-height: 1.2;
+    outline: none;
+  }
+  .table-cell-input:focus {
+    outline: 1px solid #0070c0;
+  }
+  .table-cell-text {
+    width: 100%;
+    height: 100%;
+    padding: 0.1rem 0.2rem;
+    font-size: 0.85rem;
+    line-height: 1.2;
+    white-space: pre-wrap;
+    overflow: hidden;
   }
 </style>
