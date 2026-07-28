@@ -50,6 +50,7 @@ fn main() {
             commands::set_sections,
             commands::set_rich_notes,
             commands::set_high_contrast,
+            commands::set_presenter_settings,
             commands::render_slide_svg,
             commands::undo,
             commands::get_loss_ledger,

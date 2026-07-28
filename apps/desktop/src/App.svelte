@@ -4,6 +4,7 @@
   import SlideThumbnail from './SlideThumbnail.svelte'
   import SlideCanvas from './SlideCanvas.svelte'
   import Presenter from './Presenter.svelte'
+  import AudienceWindow from './AudienceWindow.svelte'
   import RecoveryPrompt from './RecoveryPrompt.svelte'
   import ChartEditor from './ChartEditor.svelte'
   import RichNotesEditor from './RichNotesEditor.svelte'
@@ -29,8 +30,10 @@
     WarningDto,
   } from './lib/types'
 
-  /** True if this window is the presenter view. */
+  /** True if this window is the presenter control view. */
   const isPresenter = window.location.hash === '#/presenter'
+  /** True if this window is the fullscreen audience view. */
+  const isAudience = window.location.hash === '#/audience'
 
   let deck = $state<DeckSnapshot | null>(null)
   let activeIndex = $state(0)
@@ -159,7 +162,7 @@
   })
 
   $effect(() => {
-    if (!isPresenter) {
+    if (!isPresenter && !isAudience) {
       loadInitial()
     }
   })
@@ -731,6 +734,8 @@
 
 {#if isPresenter}
   <Presenter />
+{:else if isAudience}
+  <AudienceWindow />
 {:else}
   <div class="app">
     <header class="toolbar">
@@ -1185,7 +1190,7 @@
   </div>
 {/if}
 
-<svelte:window onkeydown={isPresenter ? undefined : handleGlobalKey} />
+<svelte:window onkeydown={isPresenter || isAudience ? undefined : handleGlobalKey} />
 
 <style>
   :global(body) {
