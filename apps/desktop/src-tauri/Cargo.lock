@@ -3578,6 +3578,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
+name = "slides-animation"
+version = "0.1.0"
+dependencies = [
+ "slides-core",
+]
+
+[[package]]
 name = "slides-chart"
 version = "0.1.0"
 dependencies = [
@@ -3640,6 +3647,7 @@ name = "slides-render"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "slides-animation",
  "slides-chart",
  "slides-core",
  "twox-hash",

@@ -187,6 +187,78 @@ pub struct SlideSnapshot {
     pub notes: String,
     /// Shapes on this slide.
     pub shapes: Vec<ShapeSnapshot>,
+    /// Slide-to-slide transition played when advancing to this slide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition: Option<TransitionDto>,
+    /// Ordered build-in animation sequence for this slide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub animation: Option<AnimationDto>,
+}
+
+/// Snapshot of a slide-to-slide transition.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransitionDto {
+    /// Kind of transition.
+    pub kind: TransitionKindDto,
+    /// Duration in milliseconds.
+    pub duration_ms: u32,
+}
+
+/// The kind of slide-to-slide transition, mirroring [`slides_core::TransitionKind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitionKindDto {
+    /// No transition.
+    None,
+    /// Cross-fade between slides.
+    Fade,
+    /// Slide the new slide in.
+    Slide,
+    /// Push the old slide out as the new one enters.
+    Push,
+    /// Wipe reveal.
+    Wipe,
+}
+
+/// Snapshot of an ordered build-in animation sequence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimationDto {
+    /// Ordered build steps.
+    pub steps: Vec<BuildStepDto>,
+}
+
+/// Snapshot of a single build-in step.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildStepDto {
+    /// Index into `slide.shapes` of the shape this step reveals (or hides).
+    pub shape_index: usize,
+    /// The reveal or hide effect.
+    pub effect: BuildEffectDto,
+    /// Duration of the effect in milliseconds.
+    pub duration_ms: u32,
+}
+
+/// The reveal or hide effect for a build step, mirroring [`slides_core::BuildEffect`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildEffectDto {
+    /// Fade the shape in (opacity 0 -> 1).
+    Fade,
+    /// Slide the shape in from the left.
+    SlideInLeft,
+    /// Slide the shape in from the right.
+    SlideInRight,
+    /// Slide the shape in from the top.
+    SlideInTop,
+    /// Slide the shape in from the bottom.
+    SlideInBottom,
+    /// Toggle visibility hidden -> visible instantly.
+    Appear,
+    /// Hide a shape that was already visible (opacity 1 -> 0).
+    Disappear,
 }
 
 /// Snapshot of a shape for the frontend.
@@ -1410,6 +1482,115 @@ pub fn set_chart_title(
     Ok(snapshot)
 }
 
+/// Sets or clears the transition for a slide and returns the updated deck snapshot.
+///
+/// Pass `kind: None` (or omit it) to clear the transition.
+#[tauri::command]
+pub fn set_transition(
+    slide_id: String,
+    kind: Option<TransitionKindDto>,
+    duration_ms: u32,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let transition = kind.map(|k| slides_core::Transition::new(transition_kind_from_dto(k), duration_ms));
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let command = Box::new(slides_core::SetTransition::new(slide_id, transition));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Replaces the full build-in animation sequence for a slide and returns the
+/// updated deck snapshot. Pass an empty step list to clear the animation.
+#[tauri::command]
+pub fn set_slide_animation(
+    slide_id: String,
+    steps: Vec<BuildStepDto>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let animation = if steps.is_empty() {
+        None
+    } else {
+        Some(slides_core::Animation::new(
+            steps.into_iter().map(build_step_from_dto).collect(),
+        ))
+    };
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let command = Box::new(slides_core::SetSlideAnimation::new(slide_id, animation));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Appends a build step to a slide's animation sequence and returns the updated
+/// deck snapshot.
+#[tauri::command]
+pub fn add_build_step(
+    slide_id: String,
+    shape_index: usize,
+    effect: BuildEffectDto,
+    duration_ms: u32,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let step = slides_core::BuildStep::new(shape_index, build_effect_from_dto(effect), duration_ms);
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let command = Box::new(slides_core::AddBuildStep::new(slide_id, step));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Removes a build step from a slide's animation sequence by position and
+/// returns the updated deck snapshot.
+#[tauri::command]
+pub fn remove_build_step(
+    slide_id: String,
+    step_index: usize,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let command = Box::new(slides_core::RemoveBuildStepAt::new(slide_id, step_index));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Reorders a build step in a slide's animation sequence and returns the
+/// updated deck snapshot.
+#[tauri::command]
+pub fn move_build_step(
+    slide_id: String,
+    from: usize,
+    to: usize,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let command = Box::new(slides_core::MoveBuildStep::new(slide_id, from, to));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
 /// Renders a single slide to a deterministic SVG string.
 #[tauri::command]
 pub fn render_slide_svg(slide_id: String, state: State<'_, AppState>) -> Result<String, String> {
@@ -1720,6 +1901,8 @@ fn slide_to_dto(slide: &slides_core::Slide) -> SlideSnapshot {
         id: slide.id.clone(),
         notes: slide.notes.clone(),
         shapes: slide.shapes.iter().map(shape_to_dto).collect(),
+        transition: slide.transition.as_ref().map(transition_to_dto),
+        animation: slide.animation.as_ref().map(animation_to_dto),
     }
 }
 
@@ -2206,6 +2389,79 @@ fn chart_data_from_dto(dto: ChartDataDto) -> slides_core::ChartData {
                 })
                 .collect(),
         },
+    }
+}
+
+fn transition_to_dto(transition: &slides_core::Transition) -> TransitionDto {
+    TransitionDto {
+        kind: transition_kind_to_dto(transition.kind),
+        duration_ms: transition.duration_ms,
+    }
+}
+
+fn transition_kind_to_dto(kind: slides_core::TransitionKind) -> TransitionKindDto {
+    match kind {
+        slides_core::TransitionKind::None => TransitionKindDto::None,
+        slides_core::TransitionKind::Fade => TransitionKindDto::Fade,
+        slides_core::TransitionKind::Slide => TransitionKindDto::Slide,
+        slides_core::TransitionKind::Push => TransitionKindDto::Push,
+        slides_core::TransitionKind::Wipe => TransitionKindDto::Wipe,
+    }
+}
+
+fn transition_kind_from_dto(dto: TransitionKindDto) -> slides_core::TransitionKind {
+    match dto {
+        TransitionKindDto::None => slides_core::TransitionKind::None,
+        TransitionKindDto::Fade => slides_core::TransitionKind::Fade,
+        TransitionKindDto::Slide => slides_core::TransitionKind::Slide,
+        TransitionKindDto::Push => slides_core::TransitionKind::Push,
+        TransitionKindDto::Wipe => slides_core::TransitionKind::Wipe,
+    }
+}
+
+fn animation_to_dto(animation: &slides_core::Animation) -> AnimationDto {
+    AnimationDto {
+        steps: animation.steps.iter().map(build_step_to_dto).collect(),
+    }
+}
+
+fn build_step_to_dto(step: &slides_core::BuildStep) -> BuildStepDto {
+    BuildStepDto {
+        shape_index: step.shape_index,
+        effect: build_effect_to_dto(step.effect),
+        duration_ms: step.duration_ms,
+    }
+}
+
+fn build_effect_to_dto(effect: slides_core::BuildEffect) -> BuildEffectDto {
+    match effect {
+        slides_core::BuildEffect::Fade => BuildEffectDto::Fade,
+        slides_core::BuildEffect::SlideInLeft => BuildEffectDto::SlideInLeft,
+        slides_core::BuildEffect::SlideInRight => BuildEffectDto::SlideInRight,
+        slides_core::BuildEffect::SlideInTop => BuildEffectDto::SlideInTop,
+        slides_core::BuildEffect::SlideInBottom => BuildEffectDto::SlideInBottom,
+        slides_core::BuildEffect::Appear => BuildEffectDto::Appear,
+        slides_core::BuildEffect::Disappear => BuildEffectDto::Disappear,
+    }
+}
+
+fn build_step_from_dto(dto: BuildStepDto) -> slides_core::BuildStep {
+    slides_core::BuildStep::new(
+        dto.shape_index,
+        build_effect_from_dto(dto.effect),
+        dto.duration_ms,
+    )
+}
+
+fn build_effect_from_dto(dto: BuildEffectDto) -> slides_core::BuildEffect {
+    match dto {
+        BuildEffectDto::Fade => slides_core::BuildEffect::Fade,
+        BuildEffectDto::SlideInLeft => slides_core::BuildEffect::SlideInLeft,
+        BuildEffectDto::SlideInRight => slides_core::BuildEffect::SlideInRight,
+        BuildEffectDto::SlideInTop => slides_core::BuildEffect::SlideInTop,
+        BuildEffectDto::SlideInBottom => slides_core::BuildEffect::SlideInBottom,
+        BuildEffectDto::Appear => slides_core::BuildEffect::Appear,
+        BuildEffectDto::Disappear => slides_core::BuildEffect::Disappear,
     }
 }
 
