@@ -1,7 +1,19 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core'
+  import { emit } from '@tauri-apps/api/event'
   import SlideCanvas from './SlideCanvas.svelte'
-  import type { ColorDto, PresenterState, SlideSnapshot } from './lib/types'
+  import type { ColorDto, PresenterSettingsDto, PresenterState } from './lib/types'
+  import {
+    PRESENTER_EVENTS,
+    clamp01,
+    slideRectFromStage,
+    throttle,
+    type BlankMode,
+    type HighlighterStroke,
+    type LaserPayload,
+    type SlideRect,
+    type Vec2,
+  } from './lib/presenter'
 
   /** Presenter view state from Rust. */
   let presenterState = $state<PresenterState | null>(null)
@@ -11,8 +23,28 @@
   let timer = $state<ReturnType<typeof setInterval> | null>(null)
   /** Current build step index within the current slide; -1 = before first step. */
   let activeBuildStep = $state<number>(Infinity)
-  /** Slide id at the time the current build step was initialized; resets on slide change. */
-  let lastSlideId = $state<string | null>(null)
+
+  /** Bound main slide stage element, used for coordinate mapping and overlays. */
+  let stageEl = $state<HTMLElement | null>(null)
+  /** Rendered main slide box in stage-local pixels. */
+  let slideRect = $state<SlideRect | null>(null)
+
+  /** Whether the laser pointer tool is active. */
+  let laserOn = $state(false)
+  /** Whether the highlighter tool is active. */
+  let highlighterOn = $state(false)
+  /** Current audience blank mode. */
+  let blankMode = $state<BlankMode>('none')
+  /** Current laser position (normalized), or null when hidden. */
+  let laserPos = $state<Vec2 | null>(null)
+  /** Transient highlighter strokes (source of truth). */
+  let strokes = $state<HighlighterStroke[]>([])
+  /** Whether a highlighter stroke is currently being drawn. */
+  let drawing = $state(false)
+
+  /** Lazily-created throttled event emitters (capped to ~30fps). */
+  let emitLaser: ((payload: LaserPayload) => void) | null = null
+  let emitHighlighter: ((s: HighlighterStroke[]) => void) | null = null
 
   $effect(() => {
     refresh()
@@ -27,13 +59,72 @@
     }
   })
 
+  // Create the throttled emitters once. They broadcast to all windows; the
+  // audience window listens while the presenter owns the source of truth.
+  $effect(() => {
+    emitLaser = throttle((payload: LaserPayload) => {
+      void emit(PRESENTER_EVENTS.laser, payload)
+    }, 33)
+    emitHighlighter = throttle((s: HighlighterStroke[]) => {
+      void emit(PRESENTER_EVENTS.highlighter, { strokes: s })
+    }, 33)
+  })
+
+  // Keep the main slide box measurement current as the window resizes.
+  $effect(() => {
+    const stage = stageEl
+    if (!stage) return
+    const update = (): void => {
+      slideRect = slideRectFromStage(stage)
+    }
+    update()
+    const observer = new ResizeObserver(update)
+    observer.observe(stage)
+    return () => observer.disconnect()
+  })
+
+  // Re-measure after a slide change, since re-rendering resets the layout.
+  $effect(() => {
+    void presenterState?.currentSlide.id
+    if (stageEl) slideRect = slideRectFromStage(stageEl)
+  })
+
   /** Refreshes presenter state from the backend. */
   async function refresh(): Promise<void> {
     presenterState = await invoke<PresenterState>('get_presenter_state')
     if (presenterState) {
-      lastSlideId = presenterState.currentSlide.id
       activeBuildStep = Infinity
+      laserOn = presenterState.presenterSettings.laserPointer
+      highlighterOn = presenterState.presenterSettings.highlighter
     }
+  }
+
+  /** Current laser color from presenter settings. */
+  function laserColor(): string {
+    return presenterState?.presenterSettings.laserColor ?? '#ff0000'
+  }
+
+  /** Current highlighter color from presenter settings. */
+  function highlighterColor(): string {
+    return presenterState?.presenterSettings.highlighterColor ?? '#ffff00'
+  }
+
+  /** Broadcasts the full presenter state and build step to the audience window. */
+  function broadcastState(): void {
+    if (!presenterState) return
+    void emit(PRESENTER_EVENTS.state, presenterState)
+    void emit(PRESENTER_EVENTS.buildStep, { step: activeBuildStep })
+  }
+
+  /** Broadcasts only the build-step index. */
+  function broadcastBuildStep(): void {
+    void emit(PRESENTER_EVENTS.buildStep, { step: activeBuildStep })
+  }
+
+  /** Clears highlighter strokes locally and on the audience window. */
+  function clearStrokes(): void {
+    strokes = []
+    emitHighlighter?.([])
   }
 
   /** Advances the build timeline or moves to the next slide. */
@@ -43,13 +134,15 @@
     const maxStep = steps.length - 1
     if (activeBuildStep < maxStep) {
       activeBuildStep += 1
+      broadcastBuildStep()
       return
     }
     const result = await invoke<PresenterState>('presenter_next')
     if (result.slideNumber !== presenterState.slideNumber) {
       presenterState = result
-      lastSlideId = result.currentSlide.id
       activeBuildStep = -1
+      clearStrokes()
+      broadcastState()
     }
   }
 
@@ -59,8 +152,9 @@
     const result = await invoke<PresenterState>('presenter_previous')
     if (result.slideNumber !== presenterState.slideNumber) {
       presenterState = result
-      lastSlideId = result.currentSlide.id
       activeBuildStep = Infinity
+      clearStrokes()
+      broadcastState()
     }
   }
 
@@ -72,8 +166,9 @@
       presenterState = result
     }
     if (presenterState) {
-      lastSlideId = presenterState.currentSlide.id
       activeBuildStep = Infinity
+      clearStrokes()
+      broadcastState()
     }
   }
 
@@ -85,17 +180,120 @@
       presenterState = result
     }
     if (presenterState) {
-      lastSlideId = presenterState.currentSlide.id
       activeBuildStep = Infinity
+      clearStrokes()
+      broadcastState()
     }
   }
 
-  /** Closes the presenter window. */
+  /** Closes both presenter windows. */
   function close(): void {
+    void emit(PRESENTER_EVENTS.exit)
     window.close()
   }
 
-  /** Keyboard control for presenter navigation. */
+  /** Toggles the laser pointer and persists the new default to the deck. */
+  function toggleLaser(): void {
+    laserOn = !laserOn
+    if (!laserOn) {
+      laserPos = null
+      emitLaser?.({ x: 0, y: 0, visible: false, color: laserColor() })
+    }
+    persistSettings({ ...settings(), laserPointer: laserOn })
+  }
+
+  /** Toggles the highlighter and persists the new default to the deck. */
+  function toggleHighlighter(): void {
+    highlighterOn = !highlighterOn
+    if (!highlighterOn) drawing = false
+    persistSettings({ ...settings(), highlighter: highlighterOn })
+  }
+
+  /** Toggles the audience blank screen for the given color. */
+  function toggleBlank(mode: BlankMode): void {
+    blankMode = blankMode === mode ? 'none' : mode
+    void emit(PRESENTER_EVENTS.blank, { mode: blankMode })
+  }
+
+  /** Returns the current presenter settings DTO. */
+  function settings(): PresenterSettingsDto {
+    return (
+      presenterState?.presenterSettings ?? {
+        laserPointer: false,
+        laserColor: '#ff0000',
+        highlighter: false,
+        highlighterColor: '#ffff00',
+      }
+    )
+  }
+
+  /** Persists presenter settings to the deck (colors and tool defaults). */
+  async function persistSettings(next: PresenterSettingsDto): Promise<void> {
+    if (presenterState) presenterState.presenterSettings = next
+    try {
+      await invoke('set_presenter_settings', { settings: next })
+    } catch {
+      // Presenter settings are a convenience; ignore persistence errors.
+    }
+  }
+
+  /** Converts a pointer event to normalized slide coordinates. */
+  function pointerNormalized(event: PointerEvent): Vec2 | null {
+    const stage = stageEl
+    if (!stage) return null
+    const canvas = stage.querySelector<HTMLElement>('.canvas')
+    if (!canvas) return null
+    const rect = canvas.getBoundingClientRect()
+    if (rect.width === 0 || rect.height === 0) return null
+    return {
+      x: clamp01((event.clientX - rect.left) / rect.width),
+      y: clamp01((event.clientY - rect.top) / rect.height),
+    }
+  }
+
+  /** Begins a highlighter stroke. */
+  function onStagePointerDown(event: PointerEvent): void {
+    if (!highlighterOn) return
+    event.preventDefault()
+    event.stopPropagation()
+    const point = pointerNormalized(event)
+    if (!point) return
+    drawing = true
+    strokes = [...strokes, { points: [point], color: highlighterColor() }]
+    emitHighlighter?.(strokes)
+  }
+
+  /** Tracks the cursor for the laser or extends the active highlighter stroke. */
+  function onStagePointerMove(event: PointerEvent): void {
+    if (highlighterOn && drawing) {
+      const point = pointerNormalized(event)
+      if (!point || strokes.length === 0) return
+      strokes[strokes.length - 1].points.push(point)
+      strokes = [...strokes]
+      emitHighlighter?.(strokes)
+      return
+    }
+    if (!laserOn) return
+    const point = pointerNormalized(event)
+    if (!point) return
+    laserPos = point
+    emitLaser?.({ x: point.x, y: point.y, visible: true, color: laserColor() })
+  }
+
+  /** Hides the laser when the cursor leaves the slide. */
+  function onStagePointerLeave(): void {
+    if (laserOn) {
+      laserPos = null
+      emitLaser?.({ x: 0, y: 0, visible: false, color: laserColor() })
+    }
+  }
+
+  /** Ends the active highlighter stroke. */
+  function onWindowPointerUp(): void {
+    if (drawing) drawing = false
+  }
+
+  /** Keyboard control for presenter navigation and tools. */
   function handleKey(event: KeyboardEvent): void {
     if (event.key === 'ArrowRight' || event.key === 'ArrowDown' || event.key === ' ' || event.key === 'PageDown') {
       event.preventDefault()
@@ -109,6 +307,18 @@
     } else if (event.key === 'End') {
       event.preventDefault()
       last()
+    } else if (event.key === 'b' || event.key === 'B') {
+      event.preventDefault()
+      toggleBlank('black')
+    } else if (event.key === 'w' || event.key === 'W') {
+      event.preventDefault()
+      toggleBlank('white')
+    } else if (event.key === 'l' || event.key === 'L') {
+      event.preventDefault()
+      toggleLaser()
+    } else if (event.key === 'h' || event.key === 'H') {
+      event.preventDefault()
+      toggleHighlighter()
     } else if (event.key === 'Escape') {
       event.preventDefault()
       close()
@@ -126,7 +336,7 @@
 
   /** Returns a readable background color for a slide, or white. */
   function backgroundColor(): ColorDto {
-    return presenterState?.currentSlide ? { r: 255, g: 255, b: 255, a: 255 } : { r: 255, g: 255, b: 255, a: 255 }
+    return { r: 255, g: 255, b: 255, a: 255 }
   }
 
   /** CSS class for the transition kind of the current slide. */
@@ -139,13 +349,27 @@
   function transitionDurationMs(): number {
     return presenterState?.currentSlide.transition?.durationMs ?? 0
   }
+
+  /** Converts a stroke to an SVG `points` string in the 0..100 viewBox. */
+  function strokePoints(stroke: HighlighterStroke): string {
+    return stroke.points.map((p) => `${(p.x * 100).toFixed(2)},${(p.y * 100).toFixed(2)}`).join(' ')
+  }
 </script>
 
-<svelte:window onclick={next} />
+<svelte:window onclick={() => (highlighterOn ? undefined : next())} onpointerup={onWindowPointerUp} />
 
 <div class="presenter" role="application" aria-label="Presenter view" tabindex="-1">
   {#if presenterState}
-    <div class="stage">
+    <div
+      class="stage"
+      class:tool-active={laserOn || highlighterOn}
+      bind:this={stageEl}
+      role="group"
+      aria-label="Slide stage"
+      onpointerdown={onStagePointerDown}
+      onpointermove={onStagePointerMove}
+      onpointerleave={onStagePointerLeave}
+    >
       {#key presenterState.currentSlide.id}
         <div
           class="stage-content {transitionClass()}"
@@ -162,9 +386,80 @@
           />
         </div>
       {/key}
+
+      {#if slideRect && strokes.length > 0}
+        <svg
+          class="overlay highlighter-overlay"
+          viewBox="0 0 100 100"
+          preserveAspectRatio="none"
+          style:left="{slideRect.x}px"
+          style:top="{slideRect.y}px"
+          style:width="{slideRect.w}px"
+          style:height="{slideRect.h}px"
+          aria-hidden="true"
+        >
+          {#each strokes as stroke}
+            <polyline
+              points={strokePoints(stroke)}
+              fill="none"
+              stroke={stroke.color}
+              stroke-width="8"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              vector-effect="non-scaling-stroke"
+              opacity="0.55"
+            />
+          {/each}
+        </svg>
+      {/if}
+
+      {#if slideRect && laserOn && laserPos}
+        <div
+          class="overlay laser-dot"
+          style:left="{slideRect.x + laserPos.x * slideRect.w}px"
+          style:top="{slideRect.y + laserPos.y * slideRect.h}px"
+          style:background={laserColor()}
+          aria-hidden="true"
+        ></div>
+      {/if}
     </div>
 
     <div class="hud">
+      <div class="tools">
+        <button class="tool" class:on={laserOn} onclick={toggleLaser} type="button" title="Laser pointer (L)">
+          Laser
+        </button>
+        <label class="color" title="Laser color">
+          <input
+            type="color"
+            value={laserColor()}
+            onchange={(e) => persistSettings({ ...settings(), laserColor: e.currentTarget.value })}
+          />
+        </label>
+        <button
+          class="tool"
+          class:on={highlighterOn}
+          onclick={toggleHighlighter}
+          type="button"
+          title="Highlighter (H)"
+        >
+          Highlighter
+        </button>
+        <label class="color" title="Highlighter color">
+          <input
+            type="color"
+            value={highlighterColor()}
+            onchange={(e) =>
+              persistSettings({ ...settings(), highlighterColor: e.currentTarget.value })}
+          />
+        </label>
+        {#if blankMode !== 'none'}
+          <span class="badge" class:black={blankMode === 'black'} class:white={blankMode === 'white'}>
+            {blankMode === 'black' ? 'B' : 'W'}
+          </span>
+        {/if}
+      </div>
+
       <div class="next">
         {#if presenterState.nextSlide}
           <SlideCanvas
@@ -207,15 +502,70 @@
   }
   .stage {
     flex: 1;
+    position: relative;
     display: flex;
     align-items: center;
     justify-content: center;
+    user-select: none;
+    touch-action: none;
+  }
+  .stage.tool-active {
+    cursor: crosshair;
   }
   .hud {
     width: 320px;
     display: flex;
     flex-direction: column;
     gap: 1rem;
+  }
+  .tools {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+  }
+  .tool {
+    flex: 0 0 auto;
+  }
+  .tool.on {
+    background: #1f6feb;
+    border-color: #1f6feb;
+  }
+  .color {
+    display: inline-flex;
+    width: 28px;
+    height: 28px;
+    border: 1px solid #444;
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .color input {
+    width: 200%;
+    height: 200%;
+    margin: -25% 0 0 -25%;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+    background: none;
+  }
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.6rem;
+    height: 1.6rem;
+    border-radius: 4px;
+    font-weight: 700;
+    font-size: 0.9rem;
+    border: 1px solid #444;
+  }
+  .badge.black {
+    background: #000;
+    color: #fff;
+  }
+  .badge.white {
+    background: #fff;
+    color: #000;
   }
   .next {
     flex: 0 0 auto;
@@ -299,5 +649,21 @@
     to {
       clip-path: inset(0 0 0 0);
     }
+  }
+  .overlay {
+    position: absolute;
+    pointer-events: none;
+    z-index: 10;
+  }
+  .highlighter-overlay {
+    overflow: visible;
+  }
+  .laser-dot {
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    transform: translate(-50%, -50%);
+    box-shadow: 0 0 12px 4px rgba(0, 0, 0, 0.35);
+    mix-blend-mode: screen;
   }
 </style>

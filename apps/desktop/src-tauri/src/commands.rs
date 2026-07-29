@@ -116,6 +116,7 @@ impl AppState {
             sections: deck.sections.iter().map(section_to_dto).collect(),
             slides: deck.slides.iter().map(slide_to_dto).collect(),
             media,
+            presenter_settings: presenter_settings_to_dto(&deck.presenter_settings),
             warnings: Vec::new(),
         }
     }
@@ -183,6 +184,9 @@ pub struct DeckSnapshot {
     /// so the frontend can render images directly from the snapshot.
     #[serde(default)]
     pub media: BTreeMap<String, MediaEntryDto>,
+    /// Presenter settings (laser pointer, highlighter).
+    #[serde(default)]
+    pub presenter_settings: PresenterSettingsDto,
     /// Warnings from the last load (empty for most commands).
     pub warnings: Vec<WarningDto>,
 }
@@ -238,6 +242,67 @@ pub struct ColorDto {
     pub b: u8,
     /// Alpha channel.
     pub a: u8,
+}
+
+/// Presenter settings (laser pointer + highlighter), mirroring
+/// [`slides_core::PresenterSettings`]. Laser and highlighter colors are stored
+/// as CSS hex strings (e.g. `#ff0000`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PresenterSettingsDto {
+    /// Whether the laser pointer is enabled by default.
+    #[serde(default)]
+    pub laser_pointer: bool,
+    /// Laser pointer color as a CSS hex string. Defaults to red.
+    #[serde(default = "default_laser_color_dto")]
+    pub laser_color: String,
+    /// Whether the highlighter tool is enabled by default.
+    #[serde(default)]
+    pub highlighter: bool,
+    /// Highlighter color as a CSS hex string. Defaults to yellow.
+    #[serde(default = "default_highlighter_color_dto")]
+    pub highlighter_color: String,
+}
+
+impl Default for PresenterSettingsDto {
+    fn default() -> Self {
+        Self {
+            laser_pointer: false,
+            laser_color: default_laser_color_dto(),
+            highlighter: false,
+            highlighter_color: default_highlighter_color_dto(),
+        }
+    }
+}
+
+/// Default laser pointer color, matching the model default.
+fn default_laser_color_dto() -> String {
+    String::from("#ff0000")
+}
+
+/// Default highlighter color, matching the model default.
+fn default_highlighter_color_dto() -> String {
+    String::from("#ffff00")
+}
+
+/// Converts a model [`slides_core::PresenterSettings`] into its DTO.
+fn presenter_settings_to_dto(settings: &slides_core::PresenterSettings) -> PresenterSettingsDto {
+    PresenterSettingsDto {
+        laser_pointer: settings.laser_pointer,
+        laser_color: settings.laser_color.clone(),
+        highlighter: settings.highlighter,
+        highlighter_color: settings.highlighter_color.clone(),
+    }
+}
+
+/// Converts a [`PresenterSettingsDto`] into the model type.
+fn presenter_settings_from_dto(dto: &PresenterSettingsDto) -> slides_core::PresenterSettings {
+    slides_core::PresenterSettings {
+        laser_pointer: dto.laser_pointer,
+        laser_color: dto.laser_color.clone(),
+        highlighter: dto.highlighter,
+        highlighter_color: dto.highlighter_color.clone(),
+    }
 }
 
 /// Snapshot of a single slide.
@@ -852,6 +917,9 @@ pub struct PresenterState {
     /// Whether the deck is rendered in high-contrast mode.
     #[serde(default)]
     pub high_contrast: bool,
+    /// Presenter settings (laser pointer, highlighter colors and defaults).
+    #[serde(default)]
+    pub presenter_settings: PresenterSettingsDto,
 }
 
 /// Recovery snapshot metadata returned to the frontend.
@@ -1809,6 +1877,27 @@ pub fn set_high_contrast(
     Ok(snapshot)
 }
 
+/// Sets the deck's presenter settings (laser pointer and highlighter colors and
+/// defaults) and returns the updated deck snapshot. The change is applied via
+/// the verified [`slides_core::SetPresenterSettings`] command so it is undoable.
+#[tauri::command]
+pub fn set_presenter_settings(
+    settings: PresenterSettingsDto,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let command = Box::new(slides_core::SetPresenterSettings::new(
+        presenter_settings_from_dto(&settings),
+    ));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
 /// Undoes the most recent command and returns the updated deck snapshot.
 #[tauri::command]
 pub fn undo(app: AppHandle, state: State<'_, AppState>) -> Result<DeckSnapshot, String> {
@@ -1837,7 +1926,12 @@ pub fn get_loss_ledger(state: State<'_, AppState>) -> Option<Vec<WarningDto>> {
     })
 }
 
-/// Opens a fullscreen presenter window showing the current deck.
+/// Opens the dual-display presenter: a presenter control window and a
+/// separate fullscreen audience window, both driven from the current deck.
+///
+/// If the presenter windows are already open they are focused instead of being
+/// recreated (window labels must be unique). Navigation is owned by the
+/// presenter window; the audience window mirrors it over Tauri events.
 #[tauri::command]
 pub fn start_presenter(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     {
@@ -1847,12 +1941,33 @@ pub fn start_presenter(app: AppHandle, state: State<'_, AppState>) -> Result<(),
         }
     }
     *state.presenter_index.lock().map_err(|e| e.to_string())? = 0;
+
+    // If the presenter is already open, focus the existing windows instead of
+    // erroring on a duplicate window label.
+    if let Some(existing) = app.get_webview_window("presenter") {
+        let _ = existing.set_focus();
+        if let Some(audience) = app.get_webview_window("audience") {
+            let _ = audience.set_focus();
+        }
+        return Ok(());
+    }
+
     tauri::WebviewWindowBuilder::new(
         &app,
         "presenter",
         tauri::WebviewUrl::App("index.html#/presenter".into()),
     )
     .title("Presenter")
+    .inner_size(1100.0, 700.0)
+    .build()
+    .map_err(|e| e.to_string())?;
+
+    tauri::WebviewWindowBuilder::new(
+        &app,
+        "audience",
+        tauri::WebviewUrl::App("index.html#/audience".into()),
+    )
+    .title("900Slides — Audience")
     .fullscreen(true)
     .build()
     .map_err(|e| e.to_string())?;
@@ -2039,6 +2154,7 @@ fn presenter_state_at(state: &AppState) -> Result<PresenterState, String> {
         media: media_to_dto(&session.deck().media),
         slide_size: session.deck().slide_size.as_ref().map(slide_size_to_dto),
         high_contrast: session.deck().theme.high_contrast,
+        presenter_settings: presenter_settings_to_dto(&session.deck().presenter_settings),
     })
 }
 
