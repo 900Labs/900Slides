@@ -71,6 +71,8 @@ export interface RectDto {
 
 /** Text box shape snapshot. */
 export interface TextBoxSnapshot {
+  /** Stable shape id for cross-slide morph matching, when set. */
+  id?: string
   frame: RectDto
   paragraphs: ParagraphDto[]
 }
@@ -139,6 +141,8 @@ export interface CropDto {
 
 /** Image shape snapshot, referencing bytes in the deck media store. */
 export interface ImageShapeSnapshot {
+  /** Stable shape id for cross-slide morph matching, when set. */
+  id?: string
   transform: TransformDto
   mediaRef: string
   crop?: CropDto
@@ -146,6 +150,8 @@ export interface ImageShapeSnapshot {
 
 /** Geometric shape snapshot. */
 export interface GeometricShapeSnapshot {
+  /** Stable shape id for cross-slide morph matching, when set. */
+  id?: string
   transform: TransformDto
   geometry: GeometryDto
   style: StyleDto
@@ -185,6 +191,8 @@ export interface TableRowDto {
 
 /** Table shape snapshot: a grid of editable cells. */
 export interface TableShapeSnapshot {
+  /** Stable shape id for cross-slide morph matching, when set. */
+  id?: string
   transform: TransformDto
   rows: TableRowDto[]
   columnWidths: number[]
@@ -235,6 +243,8 @@ export type ChartDataDto = CategoryChartDataDto | XYChartDataDto
 
 /** Chart shape snapshot. */
 export interface ChartShapeSnapshot {
+  /** Stable shape id for cross-slide morph matching, when set. */
+  id?: string
   transform: TransformDto
   chartType: ChartTypeDto
   data: ChartDataDto
@@ -254,7 +264,7 @@ export interface ShapeSnapshot {
 }
 
 /** Slide-to-slide transition kind (mirrors slides-core TransitionKind). */
-export type TransitionKindDto = 'none' | 'fade' | 'slide' | 'push' | 'wipe'
+export type TransitionKindDto = 'none' | 'fade' | 'slide' | 'push' | 'wipe' | 'morph'
 
 /** Slide-to-slide transition. */
 export interface TransitionDto {
@@ -413,4 +423,23 @@ export interface MisspellingDto {
   word: string
   byteStart: number
   byteEnd: number
+}
+
+/** Interpolatable transform state for a morph (mirrors slides-animation MorphTransform). */
+export interface MorphTransformDto {
+  x: number
+  y: number
+  width: number
+  height: number
+  rotation: number
+}
+
+/** One shape's morph interpolation between two adjacent slides. */
+export interface MorphFrameDto {
+  /** The shape id being morphed (matches on at least one slide). */
+  shapeId: string
+  /** Source transform on the previous slide; absent for fade-in shapes. */
+  from?: MorphTransformDto
+  /** Target transform on the next slide; absent for fade-out shapes. */
+  to?: MorphTransformDto
 }

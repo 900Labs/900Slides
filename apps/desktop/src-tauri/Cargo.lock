@@ -3609,6 +3609,7 @@ dependencies = [
  "dirs 5.0.1",
  "serde",
  "serde_json",
+ "slides-animation",
  "slides-core",
  "slides-media",
  "slides-pptx",
