@@ -1,4 +1,4 @@
-import type { MorphFrameDto, SlideSnapshot } from './types'
+import type { MorphFrameDto, ProjectorFiltersDto, SlideSnapshot } from './types'
 
 /**
  * Shared contract for the dual-display presenter.
@@ -43,6 +43,8 @@ export const PRESENTER_EVENTS = {
   highlighter: 'presenter:highlighter',
   /** Audience blank mode. */
   blank: 'presenter:blank',
+  /** Projector CSS filters applied to the audience slide container. */
+  filters: 'presenter:filters',
   /** Magic Move morph payload: previous slide + interpolation frames. */
   morph: 'presenter:morph',
   /** Both windows should close. */
@@ -119,6 +121,40 @@ export function clamp01(v: number): number {
   return v
 }
 
+/** Neutral projector filters (no visible effect), matching the Rust default. */
+export function defaultProjectorFilters(): ProjectorFiltersDto {
+  return {
+    invert: false,
+    brightness: 1,
+    contrast: 1,
+    saturation: 1,
+    sepia: 0,
+    hueRotate: 0,
+  }
+}
+
+/** Trims floating-point noise from a slider value for a clean CSS number. */
+function cleanNumber(v: number): number {
+  return Number(v.toFixed(4))
+}
+
+/**
+ * Builds a CSS `filter` string for the audience window's slide container, e.g.
+ * `invert(1) brightness(1.2) contrast(1.1) saturate(0.9) sepia(0.2)
+ * hue-rotate(45deg)`. Only properties that differ from their neutral default
+ * are emitted, so a reset yields an empty string (clearing the filter).
+ */
+export function projectorFilterCss(filters: ProjectorFiltersDto): string {
+  const parts: string[] = []
+  if (filters.invert) parts.push('invert(1)')
+  if (filters.brightness !== 1) parts.push(`brightness(${cleanNumber(filters.brightness)})`)
+  if (filters.contrast !== 1) parts.push(`contrast(${cleanNumber(filters.contrast)})`)
+  if (filters.saturation !== 1) parts.push(`saturate(${cleanNumber(filters.saturation)})`)
+  if (filters.sepia !== 0) parts.push(`sepia(${cleanNumber(filters.sepia)})`)
+  if (filters.hueRotate !== 0) parts.push(`hue-rotate(${cleanNumber(filters.hueRotate)}deg)`)
+  return parts.join(' ')
+}
+
 /**
  * Leading + trailing throttle. The first call runs immediately; subsequent
  * calls within `ms` are coalesced into a single trailing call carrying the
@@ -153,6 +189,25 @@ export function throttle<A extends unknown[]>(
         }
       }, remaining)
     }
+  }
+}
+
+/**
+ * Trailing debounce: collapses a burst of calls into a single trailing call
+ * carrying the latest arguments, fired `ms` after the last call. Used to
+ * coalesce rapid slider drags into one persistence write.
+ */
+export function debounce<A extends unknown[]>(
+  fn: (...args: A) => void,
+  ms: number,
+): (...args: A) => void {
+  let handle: ReturnType<typeof setTimeout> | null = null
+  return (...args: A): void => {
+    if (handle) clearTimeout(handle)
+    handle = setTimeout(() => {
+      handle = null
+      fn(...args)
+    }, ms)
   }
 }
 

@@ -7,10 +7,14 @@
     MorphFrameDto,
     PresenterSettingsDto,
     PresenterState,
+    ProjectorFiltersDto,
   } from './lib/types'
   import {
     PRESENTER_EVENTS,
     clamp01,
+    debounce,
+    defaultProjectorFilters,
+    projectorFilterCss,
     runMorph,
     slideRectFromStage,
     throttle,
@@ -52,6 +56,13 @@
   /** Whether a highlighter stroke is currently being drawn. */
   let drawing = $state(false)
 
+  /** Whether the projector filter popover is open. */
+  let filterPanelOpen = $state(false)
+  /** Bound filter popover root, used to ignore clicks inside it. */
+  let filterPanelEl = $state<HTMLElement | null>(null)
+  /** Debounced persistence of projector filters (coalesces slider drags). */
+  let persistFilters: ((settings: PresenterSettingsDto) => void) | null = null
+
   /** Active Magic Move morph: the previous slide rendered as an overlay while
    *  matching shapes interpolate between slides. */
   let morph = $state<MorphPayload | null>(null)
@@ -84,6 +95,11 @@
     emitHighlighter = throttle((s: HighlighterStroke[]) => {
       void emit(PRESENTER_EVENTS.highlighter, { strokes: s })
     }, 33)
+    // Projector filter writes are debounced so a slider drag produces a single
+    // SetPresenterSettings call rather than one per input tick.
+    persistFilters = debounce((settings: PresenterSettingsDto) => {
+      void invoke('set_presenter_settings', { settings })
+    }, 300)
   })
 
   // Keep the main slide box measurement current as the window resizes.
@@ -318,8 +334,31 @@
         laserColor: '#ff0000',
         highlighter: false,
         highlighterColor: '#ffff00',
+        projectorFilters: defaultProjectorFilters(),
       }
     )
+  }
+
+  /** Returns the current projector filters (neutral when no deck is open). */
+  function currentFilters(): ProjectorFiltersDto {
+    return presenterState?.presenterSettings.projectorFilters ?? defaultProjectorFilters()
+  }
+
+  /**
+   * Applies a new projector filter set: updates the local source of truth,
+   * broadcasts it to the audience window for an immediate CSS update, and
+   * schedules a debounced persistence write. The presenter's own view is never
+   * filtered — only the audience (projector) window is.
+   */
+  function updateFilters(next: ProjectorFiltersDto): void {
+    if (!presenterState) return
+    const updated: PresenterSettingsDto = {
+      ...presenterState.presenterSettings,
+      projectorFilters: next,
+    }
+    presenterState.presenterSettings = updated
+    void emit(PRESENTER_EVENTS.filters, next)
+    persistFilters?.(updated)
   }
 
   /** Persists presenter settings to the deck (colors and tool defaults). */
@@ -388,6 +427,14 @@
     if (drawing) drawing = false
   }
 
+  /** Closes the filter popover on any outside click, then advances when not drawing. */
+  function onWindowClick(event: MouseEvent): void {
+    if (filterPanelEl && filterPanelEl.contains(event.target as Node)) return
+    filterPanelOpen = false
+    if (highlighterOn) return
+    next()
+  }
+
   /** Keyboard control for presenter navigation and tools. */
   function handleKey(event: KeyboardEvent): void {
     if (event.key === 'ArrowRight' || event.key === 'ArrowDown' || event.key === ' ' || event.key === 'PageDown') {
@@ -451,7 +498,7 @@
   }
 </script>
 
-<svelte:window onclick={() => (highlighterOn ? undefined : next())} onpointerup={onWindowPointerUp} />
+<svelte:window onclick={onWindowClick} onpointerup={onWindowPointerUp} />
 
 <div class="presenter" role="application" aria-label="Presenter view" tabindex="-1">
   {#if presenterState}
@@ -562,6 +609,99 @@
               persistSettings({ ...settings(), highlighterColor: e.currentTarget.value })}
           />
         </label>
+        <span class="filter-tool">
+          <button
+            class="tool"
+            class:on={filterPanelOpen}
+            onclick={(e) => {
+              e.stopPropagation()
+              filterPanelOpen = !filterPanelOpen
+            }}
+            type="button"
+            title="Projector filters"
+          >
+            Filters
+          </button>
+          {#if filterPanelOpen}
+            <div
+              class="filter-panel"
+              bind:this={filterPanelEl}
+            >
+              <label class="filter-row check">
+                <input
+                  type="checkbox"
+                  checked={currentFilters().invert}
+                  onchange={(e) =>
+                    updateFilters({ ...currentFilters(), invert: e.currentTarget.checked })}
+                />
+                Invert
+              </label>
+              <label class="filter-row">
+                <span class="filter-label">Brightness <em>{currentFilters().brightness.toFixed(2)}</em></span>
+                <input
+                  type="range"
+                  min="0"
+                  max="2"
+                  step="0.05"
+                  value={currentFilters().brightness}
+                  oninput={(e) =>
+                    updateFilters({ ...currentFilters(), brightness: parseFloat(e.currentTarget.value) })}
+                />
+              </label>
+              <label class="filter-row">
+                <span class="filter-label">Contrast <em>{currentFilters().contrast.toFixed(2)}</em></span>
+                <input
+                  type="range"
+                  min="0"
+                  max="2"
+                  step="0.05"
+                  value={currentFilters().contrast}
+                  oninput={(e) =>
+                    updateFilters({ ...currentFilters(), contrast: parseFloat(e.currentTarget.value) })}
+                />
+              </label>
+              <label class="filter-row">
+                <span class="filter-label">Saturation <em>{currentFilters().saturation.toFixed(2)}</em></span>
+                <input
+                  type="range"
+                  min="0"
+                  max="2"
+                  step="0.05"
+                  value={currentFilters().saturation}
+                  oninput={(e) =>
+                    updateFilters({ ...currentFilters(), saturation: parseFloat(e.currentTarget.value) })}
+                />
+              </label>
+              <label class="filter-row">
+                <span class="filter-label">Sepia <em>{currentFilters().sepia.toFixed(2)}</em></span>
+                <input
+                  type="range"
+                  min="0"
+                  max="1"
+                  step="0.05"
+                  value={currentFilters().sepia}
+                  oninput={(e) =>
+                    updateFilters({ ...currentFilters(), sepia: parseFloat(e.currentTarget.value) })}
+                />
+              </label>
+              <label class="filter-row">
+                <span class="filter-label">Hue rotate <em>{currentFilters().hueRotate.toFixed(0)}&deg;</em></span>
+                <input
+                  type="range"
+                  min="0"
+                  max="360"
+                  step="1"
+                  value={currentFilters().hueRotate}
+                  oninput={(e) =>
+                    updateFilters({ ...currentFilters(), hueRotate: parseFloat(e.currentTarget.value) })}
+                />
+              </label>
+              <button class="tool reset" type="button" onclick={() => updateFilters(defaultProjectorFilters())}>
+                Reset
+              </button>
+            </div>
+          {/if}
+        </span>
         {#if blankMode !== 'none'}
           <span class="badge" class:black={blankMode === 'black'} class:white={blankMode === 'white'}>
             {blankMode === 'black' ? 'B' : 'W'}
@@ -681,6 +821,52 @@
   .badge.white {
     background: #fff;
     color: #000;
+  }
+  .filter-tool {
+    position: relative;
+    display: inline-flex;
+  }
+  .filter-panel {
+    position: absolute;
+    top: calc(100% + 0.4rem);
+    left: 0;
+    z-index: 50;
+    width: 240px;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    padding: 0.75rem;
+    background: #1c1c1c;
+    border: 1px solid #444;
+    border-radius: 6px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  }
+  .filter-row {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    font-size: 0.85rem;
+  }
+  .filter-row.check {
+    flex-direction: row;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .filter-label {
+    display: flex;
+    justify-content: space-between;
+    font-variant-numeric: tabular-nums;
+  }
+  .filter-label em {
+    font-style: normal;
+    color: #9bc1ff;
+  }
+  .filter-row input[type='range'] {
+    width: 100%;
+    cursor: pointer;
+  }
+  .filter-panel .reset {
+    align-self: flex-end;
   }
   .next {
     flex: 0 0 auto;

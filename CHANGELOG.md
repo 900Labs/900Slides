@@ -20,9 +20,23 @@ This section tracks work toward v0.2.0 (editor completeness). See
 [`docs/sprint-records/wave-9.md`](docs/sprint-records/wave-9.md),
 [`docs/sprint-records/wave-10.md`](docs/sprint-records/wave-10.md), and
 [`docs/sprint-records/wave-11.md`](docs/sprint-records/wave-11.md), and
-[`docs/sprint-records/wave-12.md`](docs/sprint-records/wave-12.md).
+[`docs/sprint-records/wave-12.md`](docs/sprint-records/wave-12.md), and
+[`docs/sprint-records/wave-13.md`](docs/sprint-records/wave-13.md).
 
 ## [v0.3.0 — in progress]
+
+### Added — Wave 13 (projector CSS filter panel)
+
+- The presenter gains a **projector compensation filter panel**: invert,
+  brightness, contrast, saturation, sepia, and hue-rotate controls applied
+  to the audience window via CSS `filter`. A toggle button in the presenter
+  toolbar opens a popover with sliders + a reset button.
+- New `ProjectorFilters` type on `PresenterSettings` (additive,
+  `#[serde(default)]`) persists the settings on the deck. Slider changes
+  are debounced to coalesce into a single `SetPresenterSettings` call.
+- The CSS filter string only includes non-default properties (e.g.
+  `brightness(1)` is omitted) for clean output.
+- `docs/sprint-records/wave-13.md` documenting the wave scope.
 
 ### Added — Wave 12 (bundled fonts + stepped code highlighting)
 
