@@ -14,8 +14,9 @@ use std::hash::Hasher;
 use base64::Engine as _;
 use slides_core::{
     CellAlign, ChartShape, Color, DashStyle, Fill, GeometricShape, Geometry, HeadingLevel,
-    ImageShape, ListStyle, MediaStore, Outline, Paragraph, PassthroughObject, Rect, Run, Shadow,
-    Shape, Style, TableBorders, TableCell, TableShape, TextBox, Theme, VerticalAlign,
+    ImageShape, Layout, ListStyle, Master, MediaStore, Outline, Paragraph, PassthroughObject,
+    PlaceholderDef, Rect, Run, Shadow, Shape, Style, TableBorders, TableCell, TableShape, TextBox,
+    Theme, Transform, VerticalAlign,
 };
 
 /// Horizontal padding inside a text box, in EMU (0.1 inch).
@@ -40,22 +41,48 @@ const CODE_BLOCK_BACKGROUND: &str = "#f5f5f5";
 const SCRIPT_FONT_SIZE: &str = "0.7em";
 /// Fill color used for the header row when a header cell has no explicit fill.
 const TABLE_HEADER_FILL: &str = "#d9e1f2";
+/// Stroke color of placeholder layout guide rectangles (light gray).
+const PLACEHOLDER_GUIDE_STROKE: &str = "#cccccc";
+/// Dash pattern of placeholder layout guide rectangles.
+const PLACEHOLDER_GUIDE_DASH: &str = "4 4";
+/// Stroke width of placeholder layout guide rectangles.
+const PLACEHOLDER_GUIDE_STROKE_WIDTH: &str = "1";
+/// Fill color of placeholder layout guide labels (light gray).
+const PLACEHOLDER_GUIDE_LABEL_COLOR: &str = "#999999";
+/// Font size of placeholder layout guide labels, in EMU.
+const PLACEHOLDER_GUIDE_LABEL_SIZE: &str = "150000";
+/// CSS class tagging placeholder layout guide elements, so the editor can show
+/// them and export/presenter can hide them via CSS.
+const PLACEHOLDER_GUIDE_CLASS: &str = "layout-guide";
 
 /// Options controlling the dimensions of a rendered slide.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RenderOptions {
     /// Slide width, in EMU.
     pub width_emu: f64,
     /// Slide height, in EMU.
     pub height_emu: f64,
+    /// Deck slide master whose background layers are painted behind every
+    /// slide's content. Defaults to an empty master so call sites that do not
+    /// set it render identically to before (acceptance criterion: old decks
+    /// are visually unchanged).
+    pub master: Master,
+    /// The deck's named layouts. When a slide's `layout_ref` matches one of
+    /// these, that layout's placeholder frames are painted as light dashed
+    /// guides above the master background and below the slide content.
+    /// Defaults to empty so no guides are painted.
+    pub layouts: Vec<Layout>,
 }
 
 impl Default for RenderOptions {
-    /// The PPTX default 16:9 slide: 12,192,000 x 6,858,000 EMU.
+    /// The PPTX default 16:9 slide: 12,192,000 x 6,858,000 EMU, with no master
+    /// and no layouts (so rendering matches the pre-template behavior).
     fn default() -> Self {
         Self {
             width_emu: 12_192_000.0,
             height_emu: 6_858_000.0,
+            master: Master::default(),
+            layouts: Vec::new(),
         }
     }
 }
@@ -115,6 +142,26 @@ pub fn render_slide(
                 .or_insert((step_index, step.effect));
         }
     }
+
+    // Paint the master's background layers behind all slide content, but after
+    // the theme background rect (which is emitted directly into the SVG before
+    // `body`). A background shape with a drop shadow gets its own stable filter
+    // id, continuing the same counter the slide shapes use below so ids stay
+    // unique and deterministic.
+    for bg in &opts.master.background_shapes {
+        let filter_id = bg.style.shadow.as_ref().map(|shadow| {
+            let id = shadow_counter;
+            shadow_counter += 1;
+            push_shadow_filter(id, shadow, &mut defs);
+            id
+        });
+        render_geometry(bg.geometry, &bg.style, bg.transform, filter_id, &mut body);
+    }
+
+    // Paint placeholder layout guides (editor overlays) for the slide's layout,
+    // if any. These render above the master background but below the slide
+    // content so the slide's text appears on top of the guides.
+    render_layout_guides(slide, &opts.master, &opts.layouts, &mut body);
 
     for (shape_index, shape) in slide.shapes.iter().enumerate() {
         let mut frag = String::new();
@@ -490,13 +537,33 @@ fn push_run(run: &Run, out: &mut String) {
 
 /// Renders a geometric shape based on its [`Geometry`].
 fn render_geometric(geometric: &GeometricShape, filter_id: Option<usize>, out: &mut String) {
-    let frame = geometric.transform.frame;
+    render_geometry(
+        geometric.geometry,
+        &geometric.style,
+        geometric.transform,
+        filter_id,
+        out,
+    );
+}
+
+/// Renders a geometric primitive (fill, outline, rotation) from its parts.
+///
+/// This is the shared core used by both slide [`GeometricShape`]s and master
+/// [`BackgroundShape`](slides_core::BackgroundShape)s, which carry the same
+/// `geometry`, `style`, and `transform` fields.
+fn render_geometry(
+    geometry: Geometry,
+    style: &Style,
+    transform: Transform,
+    filter_id: Option<usize>,
+    out: &mut String,
+) {
+    let frame = transform.frame;
     let cx = frame.x + frame.width / 2.0;
     let cy = frame.y + frame.height / 2.0;
-    let style = &geometric.style;
-    let rotation = geometric.transform.rotation;
+    let rotation = transform.rotation;
 
-    match geometric.geometry {
+    match geometry {
         Geometry::Rectangle => {
             push_rect_open(out, frame.x, frame.y, frame.width, frame.height, None);
             push_style(out, style);
@@ -585,6 +652,59 @@ fn render_geometric(geometric: &GeometricShape, filter_id: Option<usize>, out: &
             out.push_str("/>");
         }
     }
+}
+
+/// Paints placeholder layout guides for the slide's layout, if any.
+///
+/// When `slide.layout_ref` names a layout present in `layouts`, that layout's
+/// placeholder frames are drawn as light dashed rectangles with a label. A
+/// layout that carries no placeholder overrides inherits the master's
+/// placeholder definitions. These are editor-only overlays: they are tagged
+/// with the [`PLACEHOLDER_GUIDE_CLASS`] CSS class so export and presenter views
+/// can hide them.
+fn render_layout_guides(
+    slide: &slides_core::Slide,
+    master: &Master,
+    layouts: &[Layout],
+    out: &mut String,
+) {
+    let Some(layout_name) = slide.layout_ref.as_deref() else {
+        return;
+    };
+    let Some(layout) = layouts
+        .iter()
+        .find(|candidate| candidate.name == layout_name)
+    else {
+        return;
+    };
+    // A layout may override the master's placeholders; when it has none of its
+    // own it inherits the master's definitions.
+    let placeholders = if layout.placeholders.is_empty() {
+        &master.placeholders
+    } else {
+        &layout.placeholders
+    };
+    for placeholder in placeholders {
+        render_placeholder_guide(placeholder, out);
+    }
+}
+
+/// Renders a single placeholder as a dashed guide rectangle with its name.
+fn render_placeholder_guide(placeholder: &PlaceholderDef, out: &mut String) {
+    let frame = placeholder.frame;
+    let x = fnum(frame.x);
+    let y = fnum(frame.y);
+    let width = fnum(frame.width);
+    let height = fnum(frame.height);
+    out.push_str(&format!(
+        "<rect x=\"{x}\" y=\"{y}\" width=\"{width}\" height=\"{height}\" fill=\"none\" stroke=\"{PLACEHOLDER_GUIDE_STROKE}\" stroke-width=\"{PLACEHOLDER_GUIDE_STROKE_WIDTH}\" stroke-dasharray=\"{PLACEHOLDER_GUIDE_DASH}\" class=\"{PLACEHOLDER_GUIDE_CLASS}\"/>"
+    ));
+    let label = escape_xml(&placeholder.name);
+    let label_x = fnum(frame.x + TEXT_PADDING_EMU);
+    let label_y = fnum(frame.y + TEXT_LINE_HEIGHT_EMU);
+    out.push_str(&format!(
+        "<text x=\"{label_x}\" y=\"{label_y}\" font-family=\"sans-serif\" font-size=\"{PLACEHOLDER_GUIDE_LABEL_SIZE}\" fill=\"{PLACEHOLDER_GUIDE_LABEL_COLOR}\" class=\"{PLACEHOLDER_GUIDE_CLASS}\">{label}</text>"
+    ));
 }
 
 /// Pushes the opening of a `<rect>` element up to (but not including) the
@@ -923,9 +1043,9 @@ fn render_cell_text(
 mod tests {
     use super::*;
     use slides_core::{
-        Animation, BorderEdge, BuildEffect, BuildStep, CategorySeries, CellAlign, ChartData,
-        ChartType, GeometricShape, HeadingLevel, ImageShape, MediaEntry, ParagraphStyle, Run,
-        TableBorders, TableShape, TextBox, Transform,
+        Animation, BackgroundShape, BorderEdge, BuildEffect, BuildStep, CategorySeries, CellAlign,
+        ChartData, ChartType, GeometricShape, HeadingLevel, ImageShape, Layout, Master, MediaEntry,
+        ParagraphStyle, PlaceholderDef, Run, TableBorders, TableShape, TextBox, Transform,
     };
 
     fn rect(x: f64, y: f64, w: f64, h: f64) -> Rect {
@@ -939,6 +1059,20 @@ mod tests {
             &MediaStore::new(),
             &RenderOptions::default(),
         )
+    }
+
+    /// Renders a slide with a custom master and layouts via RenderOptions.
+    fn render_with_master(
+        slide: &slides_core::Slide,
+        master: &Master,
+        layouts: &[Layout],
+    ) -> RenderedSlide {
+        let opts = RenderOptions {
+            master: master.clone(),
+            layouts: layouts.to_vec(),
+            ..RenderOptions::default()
+        };
+        render_slide(slide, &Theme::default(), &MediaStore::new(), &opts)
     }
 
     #[test]
@@ -1137,6 +1271,118 @@ mod tests {
         // Deterministic: same input -> identical output.
         assert_eq!(out.svg, render(&slide).svg);
         assert_eq!(out.hash, render(&slide).hash);
+    }
+
+    #[test]
+    fn master_background_shapes_appear_in_svg() {
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::TextBox(TextBox {
+            frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
+            paragraphs: vec![],
+        }));
+        let master = Master {
+            background_shapes: vec![BackgroundShape {
+                geometry: slides_core::Geometry::Rectangle,
+                style: slides_core::Style {
+                    fill: Some(slides_core::Fill::Solid(slides_core::Color::rgb(
+                        26, 26, 46,
+                    ))),
+                    ..Default::default()
+                },
+                transform: Transform {
+                    frame: rect(0.0, 0.0, 12_192_000.0, 6_858_000.0),
+                    rotation: 0.0,
+                },
+            }],
+            placeholders: Vec::new(),
+        };
+        let out = render_with_master(&slide, &master, &[]);
+        assert!(
+            out.svg.contains("fill=\"#1a1a2e\""),
+            "master background shape must be rendered"
+        );
+    }
+
+    #[test]
+    fn slide_content_renders_on_top_of_master() {
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::TextBox(TextBox {
+            frame: rect(100_000.0, 100_000.0, 500_000.0, 200_000.0),
+            paragraphs: vec![Paragraph {
+                runs: vec![Run::new("Hello")],
+                ..Default::default()
+            }],
+        }));
+        let master = Master {
+            background_shapes: vec![BackgroundShape {
+                geometry: slides_core::Geometry::Rectangle,
+                style: slides_core::Style {
+                    fill: Some(slides_core::Fill::Solid(slides_core::Color::rgb(
+                        26, 26, 46,
+                    ))),
+                    ..Default::default()
+                },
+                transform: Transform {
+                    frame: rect(0.0, 0.0, 12_192_000.0, 6_858_000.0),
+                    rotation: 0.0,
+                },
+            }],
+            placeholders: Vec::new(),
+        };
+        let out = render_with_master(&slide, &master, &[]);
+        let bg_pos = out.svg.find("fill=\"#1a1a2e\"").unwrap();
+        let text_pos = out.svg.find("Hello").unwrap();
+        assert!(
+            bg_pos < text_pos,
+            "master background must render before slide content"
+        );
+    }
+
+    #[test]
+    fn placeholder_guides_render_for_matching_layout() {
+        let slide = slides_core::Slide {
+            layout_ref: Some("Title and Content".to_string()),
+            ..slides_core::Slide::default()
+        };
+        let master = Master::default();
+        let layouts = vec![Layout {
+            name: "Title and Content".to_string(),
+            placeholders: vec![PlaceholderDef {
+                name: "title".to_string(),
+                frame: rect(100_000.0, 100_000.0, 9_000_000.0, 1_000_000.0),
+            }],
+        }];
+        let out = render_with_master(&slide, &master, &layouts);
+        assert!(
+            out.svg.contains("stroke-dasharray"),
+            "placeholder guides must render as dashed rects"
+        );
+    }
+
+    #[test]
+    fn no_placeholder_guides_without_layout_ref() {
+        let slide = slides_core::Slide::default();
+        let master = Master::default();
+        let layouts = vec![Layout {
+            name: "Title and Content".to_string(),
+            placeholders: vec![PlaceholderDef {
+                name: "title".to_string(),
+                frame: rect(100_000.0, 100_000.0, 9_000_000.0, 1_000_000.0),
+            }],
+        }];
+        let out = render_with_master(&slide, &master, &layouts);
+        assert!(
+            !out.svg.contains("stroke-dasharray"),
+            "no placeholder guides without layout_ref"
+        );
+    }
+
+    #[test]
+    fn empty_master_renders_no_extra_shapes() {
+        let slide = slides_core::Slide::default();
+        let empty_out = render_with_master(&slide, &Master::default(), &[]);
+        let default_out = render(&slide);
+        assert_eq!(empty_out.svg, default_out.svg);
     }
 
     #[test]

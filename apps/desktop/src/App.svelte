@@ -10,6 +10,7 @@
   import RichNotesEditor from './RichNotesEditor.svelte'
   import FindReplace from './FindReplace.svelte'
   import ShortcutsDialog from './ShortcutsDialog.svelte'
+  import TemplatePicker from './TemplatePicker.svelte'
   import type {
     AnimationDto,
     BuildEffectDto,
@@ -25,6 +26,7 @@
     SlideSectionDto,
     SlideSizeDto,
     SlideSnapshot,
+    TemplateInfoDto,
     TextBoxSnapshot,
     TransitionKindDto,
     WarningDto,
@@ -76,6 +78,10 @@
   let newSectionName = $state('')
   /** Slide id at which a new section will start. */
   let newSectionSlideId = $state<string>('')
+  /** Whether the template picker dialog is open. */
+  let showTemplatePicker = $state(false)
+  /** Built-in templates loaded for the picker. */
+  let templates = $state<TemplateInfoDto[]>([])
 
   /** Maximum grid dimension offered by the table size picker. */
   const PICKER_MAX = 6
@@ -110,6 +116,11 @@
   const highContrast = $derived<boolean>(deck?.theme.highContrast ?? false)
   /** Rich-text notes for the active slide, when present. */
   const activeRichNotes = $derived<ParagraphDto[] | undefined>(activeSlide?.richNotes)
+
+  /** Layouts available on the current deck (from its template). */
+  const deckLayouts = $derived(deck?.layouts ?? [])
+  /** Name of the layout the active slide uses, or '' when none. */
+  const activeLayoutRef = $derived<string>(activeSlide?.layoutRef ?? '')
 
   /** Preset aspect-ratio slide sizes, in EMU, matching the Rust constructors. */
   const ASPECT_PRESETS: Record<'16:9' | '4:3' | '16:10', SlideSizeDto> = {
@@ -182,13 +193,32 @@
     }
   }
 
-  /** Creates a new blank deck from the Rust model. */
-  async function newDeck(): Promise<void> {
-    deck = await invoke<DeckSnapshot>('new_deck')
+  /** Creates a new blank deck from the Rust model, optionally applying a template. */
+  async function newDeck(templateName?: string | null): Promise<void> {
+    const payload = templateName ? { template_name: templateName } : {}
+    deck = await invoke<DeckSnapshot>('new_deck', payload)
     activeIndex = 0
     warnings = deck?.warnings ?? []
     showWarnings = true
     showRecovery = false
+  }
+
+  /** Loads built-in templates and opens the template picker. */
+  async function openTemplatePicker(): Promise<void> {
+    if (templates.length === 0) {
+      try {
+        templates = await invoke<TemplateInfoDto[]>('list_templates')
+      } catch (err) {
+        console.error('Failed to list templates:', err)
+      }
+    }
+    showTemplatePicker = true
+  }
+
+  /** Creates a new deck from the picker's selected template (or blank). */
+  async function onSelectTemplate(templateName: string | null): Promise<void> {
+    showTemplatePicker = false
+    await newDeck(templateName)
   }
 
   /** Opens an existing .pptx file via the system dialog. */
@@ -543,6 +573,15 @@
     })
   }
 
+  /** Sets or clears the active slide's layout reference. Pass '' to clear. */
+  async function onSetSlideLayout(layoutName: string): Promise<void> {
+    if (!activeSlide) return
+    deck = await invoke<DeckSnapshot>('set_slide_layout', {
+      slide_id: activeSlide.id,
+      layout_name: layoutName === '' ? null : layoutName,
+    })
+  }
+
   /** Replaces the full animation sequence for the active slide. */
   async function onSetSlideAnimation(steps: BuildStepDto[]): Promise<void> {
     if (!activeSlide) return
@@ -739,7 +778,7 @@
 {:else}
   <div class="app">
     <header class="toolbar">
-      <button onclick={newDeck} type="button">New</button>
+      <button onclick={openTemplatePicker} type="button">New</button>
       <button onclick={onOpen} type="button">Open</button>
       <button onclick={onSave} type="button">Save</button>
       <button onclick={onUndo} type="button">Undo</button>
@@ -1049,6 +1088,24 @@
         {:else}
           <div class="panel-content" role="tabpanel">
             <div class="section">
+              <h3>Layout</h3>
+              {#if deckLayouts.length > 0}
+                <select
+                  value={activeLayoutRef}
+                  onchange={(event) => onSetSlideLayout((event.target as HTMLSelectElement).value)}
+                  title="Slide layout"
+                >
+                  <option value="">None</option>
+                  {#each deckLayouts as layout}
+                    <option value={layout.name}>{layout.name}</option>
+                  {/each}
+                </select>
+              {:else}
+                <p class="placeholder">No layouts. Apply a template to add layouts.</p>
+              {/if}
+            </div>
+
+            <div class="section">
               <h3>Transition</h3>
               <label class="field">
                 Kind
@@ -1186,6 +1243,14 @@
 
     {#if showShortcuts}
       <ShortcutsDialog onClose={() => (showShortcuts = false)} />
+    {/if}
+
+    {#if showTemplatePicker}
+      <TemplatePicker
+        {templates}
+        onSelect={onSelectTemplate}
+        onCancel={() => (showTemplatePicker = false)}
+      />
     {/if}
   </div>
 {/if}
