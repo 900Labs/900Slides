@@ -49,7 +49,9 @@ What v0.1.0 does:
 - Presents a deck locally in **dual-display mode**: a presenter window
   (controls, notes, timer, next-slide preview) and a separate fullscreen
   audience window. Includes a **laser pointer** (`L`), **highlighter**
-  (`H`), and **black/white slide** (`B`/`W`) for Q&A. Keyboard navigation
+  (`H`), **black/white slide** (`B`/`W`) for Q&A, and a **projector filter
+  panel** (invert, brightness, contrast, saturation, sepia, hue-rotate).
+  Keyboard navigation
   only.
 - Recovers work after a crash or accidental quit via debounced autosave
   snapshots and a startup recovery prompt.
