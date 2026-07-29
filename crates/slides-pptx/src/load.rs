@@ -841,6 +841,7 @@ fn parse_text_box(
                                 link,
                                 code: current_run_code,
                                 font_family: current_run_font.take(),
+                                ..Default::default()
                             });
                             current_run_bold = false;
                             current_run_italic = false;
@@ -968,6 +969,9 @@ struct ShapeProps {
     shadow: Option<Shadow>,
     src_rect: Option<Crop>,
     blip_embed: Option<String>,
+    /// Accessibility description (`descr` attribute of `<p:cNvPr>`), carried
+    /// onto [`ImageShape::alt_text`] for pictures.
+    descr: Option<String>,
 }
 
 /// Where a `<a:solidFill>` is currently being read.
@@ -1018,6 +1022,9 @@ fn parse_shape_props(captured: &str) -> ShapeProps {
                 match local.as_str() {
                     "spPr" => in_sp_pr = true,
                     "blipFill" => in_blip_fill = true,
+                    "cNvPr" => {
+                        props.descr = attr_by_local_name(e, "descr").filter(|d| !d.is_empty());
+                    }
                     "ln" if in_sp_pr => {
                         in_ln = true;
                         outline_w = parse_attr_f64(e, "w");
@@ -1240,6 +1247,7 @@ fn parse_pic(captured: &str, slide_rels: &SlideRels) -> Option<ImageShape> {
         transform: props.transform.unwrap_or_default(),
         media_ref: media_ref.clone(),
         crop: props.src_rect,
+        alt_text: props.descr,
     })
 }
 

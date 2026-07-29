@@ -283,6 +283,7 @@ fn load_save_round_trip() {
                 },
                 media_ref: "img1".to_string(),
                 crop: None,
+                alt_text: None,
             }),
             Shape::Geometric(GeometricShape {
                 id: "geo-1".to_string(),
