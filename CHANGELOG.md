@@ -21,9 +21,30 @@ This section tracks work toward v0.2.0 (editor completeness). See
 [`docs/sprint-records/wave-10.md`](docs/sprint-records/wave-10.md), and
 [`docs/sprint-records/wave-11.md`](docs/sprint-records/wave-11.md), and
 [`docs/sprint-records/wave-12.md`](docs/sprint-records/wave-12.md), and
-[`docs/sprint-records/wave-13.md`](docs/sprint-records/wave-13.md).
+[`docs/sprint-records/wave-13.md`](docs/sprint-records/wave-13.md), and
+[`docs/sprint-records/wave-14.md`](docs/sprint-records/wave-14.md).
 
 ## [v0.3.0 — in progress]
+
+### Added — Wave 14 (ODP import / export)
+
+- The `slides-odp` crate (no longer a stub) supports **opening `.odp`
+  files** (OpenDocument Presentation) into the `slides-core` model and
+  **exporting decks to `.odp`**. ODP is a ZIP+XML format using ODF
+  namespaces (`draw:page`, `draw:frame`, `text:p`).
+- **Reader** (`load`): unzips the archive, parses `content.xml`, maps
+  `draw:frame` elements to model shapes (TextBox, Image, Geometric, Table).
+  Converts ODP units (cm) to EMU. Unrecognized elements fall back to
+  Passthrough (no panic).
+- **Writer** (`save`): builds a valid ODP archive with `mimetype`,
+  `content.xml`, `META-INF/manifest.xml`, `styles.xml`, `meta.xml`, and
+  `Pictures/`. Maps model shapes to `draw:frame` elements. Deterministic
+  output (fixed metadata date, stable ZIP entry order).
+- Round-trip test (save → load → structural equality) verifies text, image,
+  geometric, and table shapes survive the conversion.
+- 17 unit tests (8 reader, 9 writer) including determinism and passthrough
+  safety.
+- `docs/sprint-records/wave-14.md` documenting the wave scope.
 
 ### Added — Wave 13 (projector CSS filter panel)
 
