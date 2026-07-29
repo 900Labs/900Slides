@@ -308,7 +308,7 @@ fn contrast_ratio(a: &Color, b: &Color) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_accessibility, IssueCategory, IssueSeverity, LARGE_TEXT_EMU};
+    use super::{check_accessibility, IssueCategory, IssueSeverity};
     use crate::{
         Color, Deck, HeadingLevel, ImageShape, Paragraph, ParagraphStyle, Rect, Run, Shape, Slide,
         TextBox, Transform,
