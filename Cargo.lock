@@ -1568,6 +1568,12 @@ dependencies = [
 [[package]]
 name = "slides-odp"
 version = "0.1.0"
+dependencies = [
+ "quick-xml",
+ "slides-core",
+ "thiserror",
+ "zip",
+]
 
 [[package]]
 name = "slides-pdf"
