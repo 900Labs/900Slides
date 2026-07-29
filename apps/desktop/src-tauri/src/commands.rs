@@ -3778,6 +3778,8 @@ fn run_from_dto(run: &RunDto) -> slides_core::Run {
             .map(|link| slides_core::Link::new_unchecked(link.url.clone())),
         code: run.code,
         font_family: run.font_family.clone(),
+        color: None,
+        font_size: None,
     }
 }
 
@@ -3833,6 +3835,107 @@ fn morph_transform_to_dto(transform: slides_animation::MorphTransform) -> MorphT
         height: transform.height,
         rotation: transform.rotation,
     }
+}
+
+/// One accessibility issue, ready for the frontend. Mirrors
+/// [`slides_core::accessibility::AccessibilityIssue`] but carries severity and
+/// category as lowercase strings so the UI can switch on them directly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccessibilityIssueDto {
+    /// Severity: `"error"`, `"warning"`, or `"suggestion"`.
+    pub severity: String,
+    /// Issue category, snake_case (e.g. `"missing_alt_text"`).
+    pub category: String,
+    /// Id of the slide the issue was found on, if applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slide_id: Option<String>,
+    /// Index of the offending shape within the slide, if applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape_index: Option<usize>,
+    /// Human-readable description of the issue.
+    pub message: String,
+    /// Optional suggested remediation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix_hint: Option<String>,
+}
+
+/// Result of checking a deck for accessibility, with a WCAG 2.2 AA conformance
+/// score. Mirrors [`slides_core::accessibility::AccessibilityReport`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccessibilityReportDto {
+    /// Every issue found, in document order.
+    pub issues: Vec<AccessibilityIssueDto>,
+    /// WCAG 2.2 AA conformance score (0–100). 100 means no issues.
+    pub score: u32,
+    /// Total number of slides in the deck.
+    pub total_slides: usize,
+    /// Number of slides that have at least one issue.
+    pub slides_with_issues: usize,
+}
+
+/// Lowercase string for an issue severity, for the frontend.
+fn severity_to_str(severity: slides_core::accessibility::IssueSeverity) -> &'static str {
+    match severity {
+        slides_core::accessibility::IssueSeverity::Error => "error",
+        slides_core::accessibility::IssueSeverity::Warning => "warning",
+        slides_core::accessibility::IssueSeverity::Suggestion => "suggestion",
+    }
+}
+
+/// Lowercase snake_case string for an issue category, for the frontend.
+fn category_to_str(category: slides_core::accessibility::IssueCategory) -> &'static str {
+    use slides_core::accessibility::IssueCategory;
+    match category {
+        IssueCategory::MissingAltText => "missing_alt_text",
+        IssueCategory::LowContrast => "low_contrast",
+        IssueCategory::MissingTitle => "missing_title",
+        IssueCategory::ReadingOrder => "reading_order",
+        IssueCategory::SmallText => "small_text",
+        IssueCategory::EmptySlide => "empty_slide",
+    }
+}
+
+/// Converts a model accessibility issue into its DTO.
+fn accessibility_issue_to_dto(
+    issue: &slides_core::accessibility::AccessibilityIssue,
+) -> AccessibilityIssueDto {
+    AccessibilityIssueDto {
+        severity: severity_to_str(issue.severity).to_string(),
+        category: category_to_str(issue.category).to_string(),
+        slide_id: issue.slide_id.clone(),
+        shape_index: issue.shape_index,
+        message: issue.message.clone(),
+        fix_hint: issue.fix_hint.clone(),
+    }
+}
+
+/// Converts a model accessibility report into its DTO.
+fn accessibility_report_to_dto(
+    report: &slides_core::accessibility::AccessibilityReport,
+) -> AccessibilityReportDto {
+    AccessibilityReportDto {
+        issues: report
+            .issues
+            .iter()
+            .map(accessibility_issue_to_dto)
+            .collect(),
+        score: report.score,
+        total_slides: report.total_slides,
+        slides_with_issues: report.slides_with_issues,
+    }
+}
+
+/// Checks the current deck for accessibility issues and returns a WCAG 2.2 AA
+/// report. Runs entirely offline against the in-memory deck model — no network,
+/// no telemetry.
+#[tauri::command]
+pub fn check_accessibility(state: State<'_, AppState>) -> Result<AccessibilityReportDto, String> {
+    let guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_ref().ok_or("no deck is open")?;
+    let report = slides_core::accessibility::check_accessibility(session.deck());
+    Ok(accessibility_report_to_dto(&report))
 }
 
 #[cfg(test)]
