@@ -1526,3 +1526,127 @@ fn clear_transition_then_save() {
         "cleared transition should be removed"
     );
 }
+
+#[test]
+fn save_morph_transition_round_trips() {
+    // Start from a slide carrying a fade transition; the model switches to
+    // Morph. Saving must emit a `p:morph` element with the model duration.
+    let slide_xml = slide_with_transition_and_timing(
+        Some(r#"<p:transition spd="500"><p:fade/></p:transition>"#),
+        None,
+    );
+    let slide = Slide {
+        id: "ppt/slides/slide1.xml".to_string(),
+        notes: String::new(),
+        shapes: vec![passthrough_shape()],
+        animation: None,
+        transition: Some(Transition::new(TransitionKind::Morph, 800)),
+        rich_notes: None,
+        layout_ref: None,
+    };
+    let mut session = session_from_slide_xml(&slide_xml, slide);
+    session.mark_slide_dirty("ppt/slides/slide1.xml");
+    let saved = save(&session).expect("save should succeed");
+
+    let saved_slide = String::from_utf8(entry_bytes(&saved, "ppt/slides/slide1.xml")).unwrap();
+    assert!(
+        saved_slide.contains(r#"<p:morph option="byObject"/>"#),
+        "saved slide should emit a p:morph transition"
+    );
+    assert!(
+        saved_slide.contains(r#"spd="800""#),
+        "saved morph transition should use the model duration"
+    );
+    assert!(
+        !saved_slide.contains("<p:fade/>"),
+        "saved slide should not keep the old fade transition"
+    );
+}
+
+#[test]
+fn save_morph_preserves_other_parts() {
+    let original_transition = r#"<p:transition spd="500"><p:fade/></p:transition>"#;
+    let slide_xml = slide_with_transition_and_timing(Some(original_transition), None);
+    let slide = Slide {
+        id: "ppt/slides/slide1.xml".to_string(),
+        notes: String::new(),
+        shapes: vec![passthrough_shape()],
+        animation: None,
+        transition: Some(Transition::new(TransitionKind::Morph, 750)),
+        rich_notes: None,
+        layout_ref: None,
+    };
+    let mut session = session_from_slide_xml(&slide_xml, slide);
+    session.mark_slide_dirty("ppt/slides/slide1.xml");
+    let saved = save(&session).expect("save should succeed");
+
+    // Every part except the edited slide (and the rewritten manifest/content
+    // types) must be byte-identical to the original package.
+    for name in zip_entries(&session.original_bytes) {
+        if name == "[Content_Types].xml"
+            || name == "customXml/item1.xml"
+            || name == "ppt/slides/slide1.xml"
+        {
+            continue;
+        }
+        assert_eq!(
+            entry_bytes(&session.original_bytes, &name),
+            entry_bytes(&saved, &name),
+            "{name} should be byte-identical"
+        );
+    }
+
+    // Within the edited slide, only the transition element should have
+    // changed: the rest of the XML is unchanged.
+    let original_slide = String::from_utf8(entry_bytes(
+        &session.original_bytes,
+        "ppt/slides/slide1.xml",
+    ))
+    .unwrap();
+    let saved_slide = String::from_utf8(entry_bytes(&saved, "ppt/slides/slide1.xml")).unwrap();
+    let expected_slide = original_slide.replace(
+        original_transition,
+        r#"<p:transition spd="750"><p:morph option="byObject"/></p:transition>"#,
+    );
+    assert_eq!(
+        saved_slide, expected_slide,
+        "only the transition element should differ"
+    );
+}
+
+#[test]
+fn load_save_morph_byte_identical() {
+    // Load a deck whose only slide uses a p:morph transition, then save with
+    // no edits. The morph transition is modeled, so nothing is dirty and the
+    // whole package must round-trip byte-for-byte.
+    let slide_xml = slide_with_transition_and_timing(
+        Some(r#"<p:transition spd="500"><p:morph option="byObject"/></p:transition>"#),
+        None,
+    );
+    let original = build_pptx(&slide_xml, None, &[]);
+    let session = load(&original).expect("load should succeed");
+    assert_eq!(
+        session.deck().slides[0]
+            .transition
+            .as_ref()
+            .expect("morph should be modeled on load"),
+        &Transition::new(TransitionKind::Morph, 500),
+    );
+
+    let saved = save(&session).expect("save should succeed");
+    assert_eq!(
+        zip_entries(&original),
+        zip_entries(&saved),
+        "no-edit save must not change the part set"
+    );
+    for name in zip_entries(&original) {
+        if name == "[Content_Types].xml" || name == "customXml/item1.xml" {
+            continue;
+        }
+        assert_eq!(
+            entry_bytes(&original, &name),
+            entry_bytes(&saved, &name),
+            "{name} should be byte-identical after a no-edit save"
+        );
+    }
+}
