@@ -263,6 +263,7 @@ fn round_trip_rich_text() {
 
     let slide_id = "ppt/slides/slide1.xml".to_string();
     let mut text_box = TextBox {
+        id: String::new(),
         frame: Rect::new(0.0, 0.0, 100.0, 100.0),
         paragraphs: vec![
             Paragraph {

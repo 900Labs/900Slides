@@ -608,18 +608,18 @@ fn write_model_shape<W: Write>(
     chart_rids: &HashMap<usize, String>,
     index: usize,
 ) -> Result<()> {
-    let id = 100_000 + index as i64;
+    let id = cnvpr_id_for(shape, index);
     match shape {
         Shape::Image(image) => {
             if let Some(embed) = rids.get(&image.media_ref) {
                 let name = format!("Picture {}", index + 1);
-                let xml = pic_element_xml(image, embed, id, &name);
+                let xml = pic_element_xml(image, embed, &id, &name);
                 writer.get_mut().write_all(xml.as_bytes())?;
             }
         }
         Shape::Geometric(geo) => {
             let name = format!("Shape {}", index + 1);
-            let xml = sp_element_xml(geo, id, &name);
+            let xml = sp_element_xml(geo, &id, &name);
             writer.get_mut().write_all(xml.as_bytes())?;
         }
         Shape::TextBox(text_box) => {
@@ -645,13 +645,13 @@ fn write_model_shape<W: Write>(
         }
         Shape::Table(table) => {
             let name = format!("Table {}", index + 1);
-            let xml = table_graphic_frame_xml(table, id, &name);
+            let xml = table_graphic_frame_xml(table, &id, &name);
             writer.get_mut().write_all(xml.as_bytes())?;
         }
         Shape::Chart(chart) => {
             if let Some(rid) = chart_rids.get(&index) {
                 let name = format!("Chart {}", index + 1);
-                let xml = chart_graphic_frame_xml(chart, id, &name, rid);
+                let xml = chart_graphic_frame_xml(chart, &id, &name, rid);
                 writer.get_mut().write_all(xml.as_bytes())?;
             }
         }
@@ -684,6 +684,21 @@ fn patch_chart_frame_xml<W: Write>(
 /// order resolution self-consistent.
 fn shape_id_for_index(index: usize) -> String {
     (100_000 + index as i64).to_string()
+}
+
+/// Returns the `p:cNvPr` id to emit for `shape` at `index`.
+///
+/// Prefers the shape's own stable id (preserved on round-trip for Magic Move
+/// matching); falls back to the generated index-based id when the shape has no
+/// id yet. The timing XML targets the same value via [`build_step_xml`] so build
+/// steps resolve to the correct shape after a save.
+fn cnvpr_id_for(shape: &Shape, index: usize) -> String {
+    let id = shape.id();
+    if id.is_empty() {
+        shape_id_for_index(index)
+    } else {
+        id.to_string()
+    }
 }
 
 /// Maps a model [`BuildEffect`] to the `filter` value used inside `p:animEffect`.
@@ -843,6 +858,12 @@ fn emit_transition_xml(transition: &Transition) -> String {
         TransitionKind::Wipe => "p:wipe",
         TransitionKind::Slide => "p:slide",
         TransitionKind::None => return String::new(),
+        TransitionKind::Morph => {
+            return format!(
+                r#"<p:transition spd="{}"><p:morph option="byObject"/></p:transition>"#,
+                transition.duration_ms
+            );
+        }
     };
     format!(
         r#"<p:transition spd="{}"><{}/></p:transition>"#,
@@ -851,11 +872,14 @@ fn emit_transition_xml(transition: &Transition) -> String {
 }
 
 /// Emits a fresh `p:timing` element from a model [`Animation`].
-fn emit_timing_xml(animation: &Animation) -> String {
+///
+/// `shapes` is the slide's shape list, used to resolve each build step's target
+/// shape to the same `p:cNvPr` id the saver emits for it (see [`cnvpr_id_for`]).
+fn emit_timing_xml(animation: &Animation, shapes: &[Shape]) -> String {
     let mut steps = String::new();
     let mut next_id = 3u32;
     for step in &animation.steps {
-        let step_xml = build_step_xml(step, next_id);
+        let step_xml = build_step_xml(step, next_id, shapes);
         next_id += 4;
         steps.push_str(&step_xml);
     }
@@ -865,8 +889,11 @@ fn emit_timing_xml(animation: &Animation) -> String {
 }
 
 /// Emits the nested `p:par`/`p:cTn` structure for a single build step.
-fn build_step_xml(step: &BuildStep, id_base: u32) -> String {
-    let spid = shape_id_for_index(step.shape_index);
+fn build_step_xml(step: &BuildStep, id_base: u32, shapes: &[Shape]) -> String {
+    let spid = shapes
+        .get(step.shape_index)
+        .map(|shape| cnvpr_id_for(shape, step.shape_index))
+        .unwrap_or_else(|| shape_id_for_index(step.shape_index));
     let filter = filter_for_effect(step.effect);
     let dur = step.duration_ms;
     let id_a = id_base;
@@ -927,9 +954,9 @@ fn patch_transition_and_timing(
                             let mut capture_writer = Writer::new(&mut captured);
                             copy_element(&mut reader, &start, &mut capture_writer, &mut buf)?;
                             if let Some(ref animation) = slide.animation {
-                                writer
-                                    .get_mut()
-                                    .write_all(emit_timing_xml(animation).as_bytes())?;
+                                writer.get_mut().write_all(
+                                    emit_timing_xml(animation, &slide.shapes).as_bytes(),
+                                )?;
                             }
                             buf.clear();
                             continue;
@@ -953,7 +980,7 @@ fn patch_transition_and_timing(
                         if let Some(ref animation) = slide.animation {
                             writer
                                 .get_mut()
-                                .write_all(emit_timing_xml(animation).as_bytes())?;
+                                .write_all(emit_timing_xml(animation, &slide.shapes).as_bytes())?;
                         }
                     }
                     writer.write_event(event)?;
@@ -1061,9 +1088,9 @@ fn patch_slide_xml(
                                 if matches!(shape, Shape::Table(_)) && local == "graphicFrame" =>
                             {
                                 if let Shape::Table(table) = shape {
-                                    let frame_id = 100_000 + shape_idx as i64;
+                                    let frame_id = cnvpr_id_for(shape, shape_idx);
                                     let name = format!("Table {}", shape_idx + 1);
-                                    let xml = table_graphic_frame_xml(table, frame_id, &name);
+                                    let xml = table_graphic_frame_xml(table, &frame_id, &name);
                                     writer.get_mut().write_all(xml.as_bytes())?;
                                 }
                                 Some(shape)
@@ -1292,19 +1319,19 @@ fn append_shape<W: Write>(
     chart_rids: &HashMap<usize, String>,
     index: usize,
 ) -> Result<()> {
-    let id = 100_000 + index as i64;
+    let id = cnvpr_id_for(shape, index);
     match shape {
         Shape::Image(image) => {
             let Some(embed) = rids.get(&image.media_ref) else {
                 return Ok(());
             };
             let name = format!("Picture {}", index + 1);
-            let xml = pic_element_xml(image, embed, id, &name);
+            let xml = pic_element_xml(image, embed, &id, &name);
             writer.get_mut().write_all(xml.as_bytes())?;
         }
         Shape::Geometric(geo) => {
             let name = format!("Shape {}", index + 1);
-            let xml = sp_element_xml(geo, id, &name);
+            let xml = sp_element_xml(geo, &id, &name);
             writer.get_mut().write_all(xml.as_bytes())?;
         }
         Shape::TextBox(text_box) => {
@@ -1328,13 +1355,13 @@ fn append_shape<W: Write>(
         Shape::Passthrough(_) => {}
         Shape::Table(table) => {
             let name = format!("Table {}", index + 1);
-            let xml = table_graphic_frame_xml(table, id, &name);
+            let xml = table_graphic_frame_xml(table, &id, &name);
             writer.get_mut().write_all(xml.as_bytes())?;
         }
         Shape::Chart(chart) => {
             if let Some(rid) = chart_rids.get(&index) {
                 let name = format!("Chart {}", index + 1);
-                let xml = chart_graphic_frame_xml(chart, id, &name, rid);
+                let xml = chart_graphic_frame_xml(chart, &id, &name, rid);
                 writer.get_mut().write_all(xml.as_bytes())?;
             }
         }
@@ -1487,7 +1514,7 @@ fn is_zero_crop(c: &Crop) -> bool {
 }
 
 /// Builds a complete `<p:pic>` element for an inserted image.
-fn pic_element_xml(image: &ImageShape, embed: &str, id: i64, name: &str) -> String {
+fn pic_element_xml(image: &ImageShape, embed: &str, id: &str, name: &str) -> String {
     format!(
         "<p:pic><p:nvPicPr><p:cNvPr id=\"{id}\" name=\"{name}\"/><p:cNvPicPr><a:picLocks/></p:cNvPicPr><p:nvPr/></p:nvPicPr>{}{}</p:pic>",
         blip_fill_xml(embed, image.crop.as_ref()),
@@ -1496,7 +1523,7 @@ fn pic_element_xml(image: &ImageShape, embed: &str, id: i64, name: &str) -> Stri
 }
 
 /// Builds a complete `<p:sp>` element for an inserted geometric shape.
-fn sp_element_xml(geo: &GeometricShape, id: i64, name: &str) -> String {
+fn sp_element_xml(geo: &GeometricShape, id: &str, name: &str) -> String {
     format!(
         "<p:sp><p:nvSpPr><p:cNvPr id=\"{id}\" name=\"{name}\"/><p:cNvSpPr><a:spLocks/></p:cNvSpPr><p:nvPr/></p:nvSpPr>{}<p:txBody><a:bodyPr/><a:lstStyle/><a:p/></p:txBody></p:sp>",
         geometric_sp_pr_xml(geo)
@@ -1510,7 +1537,7 @@ const TABLE_GRAPHIC_URI: &str = "http://schemas.openxmlformats.org/drawingml/200
 /// The frame carries a `p:xfrm` (off/ext plus rotation), and a `a:graphic`/
 /// `a:graphicData` block containing the full `a:tbl`. Tables are emitted only
 /// for dirty slides, so untouched frames stay byte-for-byte identical (§4.9).
-fn table_graphic_frame_xml(table: &TableShape, id: i64, name: &str) -> String {
+fn table_graphic_frame_xml(table: &TableShape, id: &str, name: &str) -> String {
     let f = table.transform.frame;
     let rot = if table.transform.rotation != 0.0 {
         format!(
