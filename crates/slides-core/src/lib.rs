@@ -36,6 +36,18 @@ pub struct Deck {
     /// defaults to all-off so old decks are unaffected.
     #[serde(default)]
     pub presenter_settings: PresenterSettings,
+    /// Built-in template this deck is based on (e.g. "default", "pitch").
+    /// Additive; old decks have no template and render identically to before.
+    #[serde(default)]
+    pub template: Option<String>,
+    /// The deck's available layouts, derived from its template. Additive and
+    /// skipped when empty so old decks serialize unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layouts: Vec<Layout>,
+    /// The deck's slide master: background layers and placeholder definitions.
+    /// Additive; old decks deserialize into an empty master.
+    #[serde(default)]
+    pub master: Master,
 }
 
 impl Default for Deck {
@@ -49,6 +61,9 @@ impl Default for Deck {
             sections: Vec::new(),
             media: MediaStore::default(),
             presenter_settings: PresenterSettings::default(),
+            template: None,
+            layouts: Vec::new(),
+            master: Master::default(),
         }
     }
 }
@@ -306,6 +321,11 @@ pub struct Slide {
     /// unchanged — a non-breaking, additive change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rich_notes: Option<Vec<Paragraph>>,
+    /// Name of the layout (from [`Deck::layouts`]) this slide uses, if any.
+    /// Defaults to `None` (`#[serde(default)]`) so old decks deserialize
+    /// unchanged — a non-breaking, additive change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout_ref: Option<String>,
 }
 
 /// A shape or content object placed on a slide.
@@ -955,6 +975,320 @@ pub struct Style {
     pub outline: Option<Outline>,
     /// Drop shadow, if any.
     pub shadow: Option<Shadow>,
+}
+
+/// Standard 16:9 widescreen slide width, in EMU.
+const TEMPLATE_SLIDE_WIDTH_EMU: f64 = 12_192_000.0;
+/// Standard 16:9 widescreen slide height, in EMU.
+const TEMPLATE_SLIDE_HEIGHT_EMU: f64 = 6_858_000.0;
+
+/// A slide master: background layers painted behind every slide in the deck,
+/// plus placeholder definitions.
+///
+/// Additive; old decks deserialize into an empty master via [`Master::default`].
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct Master {
+    /// Background shapes (painted first, behind all slide content).
+    #[serde(default)]
+    pub background_shapes: Vec<BackgroundShape>,
+    /// Named placeholders that layouts reference.
+    #[serde(default)]
+    pub placeholders: Vec<PlaceholderDef>,
+}
+
+impl Master {
+    /// A blank 16:9 master (no background shapes, no placeholders).
+    pub fn default_16_9() -> Self {
+        Self::default()
+    }
+}
+
+/// A simple background shape on a master (rectangles, accents).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BackgroundShape {
+    /// The geometric shape data.
+    pub geometry: Geometry,
+    /// Visual style of the background shape.
+    pub style: Style,
+    /// Position, size, and rotation of the background shape.
+    pub transform: Transform,
+}
+
+/// A named placeholder (e.g. "title", "content", "footer").
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlaceholderDef {
+    /// Placeholder name, referenced by layouts.
+    pub name: String,
+    /// Bounding rectangle of the placeholder, in EMU.
+    pub frame: Rect,
+}
+
+/// A named layout variant of the master.
+///
+/// A layout carries placeholder overrides keyed by placeholder name; the
+/// deck's [`Slide`]s reference a layout by name via [`Slide::layout_ref`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Layout {
+    /// Layout name (e.g. "Title Slide", "Title and Content", "Section Header").
+    pub name: String,
+    /// Placeholder overrides keyed by placeholder name.
+    #[serde(default)]
+    pub placeholders: Vec<PlaceholderDef>,
+}
+
+impl Default for Layout {
+    fn default() -> Self {
+        Self {
+            name: "Blank".to_string(),
+            placeholders: Vec::new(),
+        }
+    }
+}
+
+/// A built-in template definition: a name, a theme, a master, and layouts.
+pub struct TemplateDefinition {
+    /// Stable template identifier (e.g. "default", "educator").
+    pub name: &'static str,
+    /// Human-readable template name shown in the picker.
+    pub display_name: &'static str,
+    /// Theme applied by this template.
+    pub theme: Theme,
+    /// Slide master applied by this template.
+    pub master: Master,
+    /// Named layouts available in this template.
+    pub layouts: Vec<Layout>,
+}
+
+/// The six built-in templates, each with a theme, master, and layouts.
+///
+/// `TemplateRegistry` holds no state; it is a namespace for the registry
+/// accessors [`TemplateRegistry::names`] and [`TemplateRegistry::get`].
+pub struct TemplateRegistry;
+
+impl TemplateRegistry {
+    /// Returns the names of the six built-in templates, in canonical order.
+    pub fn names() -> Vec<&'static str> {
+        vec![
+            "default",
+            "educator",
+            "pitch",
+            "conference_talk",
+            "community_update",
+            "photo_essay",
+        ]
+    }
+
+    /// Returns the named built-in template, if it exists.
+    pub fn get(name: &str) -> Option<TemplateDefinition> {
+        match name {
+            "default" => Some(default_template()),
+            "educator" => Some(educator_template()),
+            "pitch" => Some(pitch_template()),
+            "conference_talk" => Some(conference_talk_template()),
+            "community_update" => Some(community_update_template()),
+            "photo_essay" => Some(photo_essay_template()),
+            _ => None,
+        }
+    }
+}
+
+/// Builds a named placeholder.
+fn placeholder(name: &str, frame: Rect) -> PlaceholderDef {
+    PlaceholderDef {
+        name: name.to_string(),
+        frame,
+    }
+}
+
+/// A standard "title" placeholder frame for 16:9 slides.
+fn title_placeholder() -> PlaceholderDef {
+    placeholder(
+        "title",
+        Rect::new(457_200.0, 457_200.0, 11_277_600.0, 1_143_000.0),
+    )
+}
+
+/// A standard "content" placeholder frame for 16:9 slides.
+fn content_placeholder() -> PlaceholderDef {
+    placeholder(
+        "content",
+        Rect::new(457_200.0, 1_828_800.0, 11_277_600.0, 4_343_400.0),
+    )
+}
+
+/// A standard "footer" placeholder frame for 16:9 slides.
+fn footer_placeholder() -> PlaceholderDef {
+    placeholder(
+        "footer",
+        Rect::new(457_200.0, 6_400_800.0, 11_277_600.0, 228_600.0),
+    )
+}
+
+/// Builds a master with a full-bleed background rectangle, a top accent bar,
+/// and the standard title/content/footer placeholders.
+fn master_with_accent(accent: Color, background: Color) -> Master {
+    Master {
+        background_shapes: vec![
+            BackgroundShape {
+                geometry: Geometry::Rectangle,
+                style: Style {
+                    fill: Some(Fill::Solid(background)),
+                    outline: None,
+                    shadow: None,
+                },
+                transform: Transform {
+                    frame: Rect::new(
+                        0.0,
+                        0.0,
+                        TEMPLATE_SLIDE_WIDTH_EMU,
+                        TEMPLATE_SLIDE_HEIGHT_EMU,
+                    ),
+                    rotation: 0.0,
+                },
+            },
+            BackgroundShape {
+                geometry: Geometry::Rectangle,
+                style: Style {
+                    fill: Some(Fill::Solid(accent)),
+                    outline: None,
+                    shadow: None,
+                },
+                transform: Transform {
+                    frame: Rect::new(0.0, 0.0, TEMPLATE_SLIDE_WIDTH_EMU, 95_250.0),
+                    rotation: 0.0,
+                },
+            },
+        ],
+        placeholders: vec![
+            title_placeholder(),
+            content_placeholder(),
+            footer_placeholder(),
+        ],
+    }
+}
+
+/// Builds a list of layouts from their names, each with no placeholder
+/// overrides (they inherit the master's placeholders).
+fn named_layouts(names: &[&str]) -> Vec<Layout> {
+    names
+        .iter()
+        .map(|name| Layout {
+            name: (*name).to_string(),
+            placeholders: Vec::new(),
+        })
+        .collect()
+}
+
+/// The default template: Calibri, blue accent, white background — matching
+/// [`Theme::default`] — with a blank master.
+fn default_template() -> TemplateDefinition {
+    TemplateDefinition {
+        name: "default",
+        display_name: "Default",
+        theme: Theme::default(),
+        master: Master::default(),
+        layouts: named_layouts(&["Title Slide", "Title and Content", "Blank"]),
+    }
+}
+
+/// The Educator template: serif (Georgia), warm cream background, orange
+/// accent.
+fn educator_template() -> TemplateDefinition {
+    let accent = Color::rgb(232, 122, 48);
+    let background = Color::rgb(250, 243, 224);
+    TemplateDefinition {
+        name: "educator",
+        display_name: "Educator",
+        theme: Theme {
+            background,
+            heading_font: "Georgia".to_string(),
+            body_font: "Georgia".to_string(),
+            accent_color: accent,
+            high_contrast: false,
+        },
+        master: master_with_accent(accent, background),
+        layouts: named_layouts(&["Lesson Title", "Bulleted Content", "Definition", "Exercise"]),
+    }
+}
+
+/// The Pitch template: sans-serif (Inter/Helvetica), dark background, teal
+/// accent.
+fn pitch_template() -> TemplateDefinition {
+    let accent = Color::rgb(45, 212, 191);
+    let background = Color::rgb(26, 26, 46);
+    TemplateDefinition {
+        name: "pitch",
+        display_name: "Pitch",
+        theme: Theme {
+            background,
+            heading_font: "Inter".to_string(),
+            body_font: "Helvetica".to_string(),
+            accent_color: accent,
+            high_contrast: false,
+        },
+        master: master_with_accent(accent, background),
+        layouts: named_layouts(&["Cover", "Problem/Solution", "Metrics", "Team", "Closing"]),
+    }
+}
+
+/// The Conference Talk template: monospace headings (JetBrains Mono/Consolas),
+/// dark background, green accent.
+fn conference_talk_template() -> TemplateDefinition {
+    let accent = Color::rgb(63, 185, 80);
+    let background = Color::rgb(13, 17, 23);
+    TemplateDefinition {
+        name: "conference_talk",
+        display_name: "Conference Talk",
+        theme: Theme {
+            background,
+            heading_font: "JetBrains Mono".to_string(),
+            body_font: "Consolas".to_string(),
+            accent_color: accent,
+            high_contrast: false,
+        },
+        master: master_with_accent(accent, background),
+        layouts: named_layouts(&["Title", "Code Block", "Big Idea", "Q&A"]),
+    }
+}
+
+/// The Community Update template: friendly sans (Verdana), light green
+/// background, dark green accent.
+fn community_update_template() -> TemplateDefinition {
+    let accent = Color::rgb(46, 125, 50);
+    let background = Color::rgb(232, 245, 225);
+    TemplateDefinition {
+        name: "community_update",
+        display_name: "Community Update",
+        theme: Theme {
+            background,
+            heading_font: "Verdana".to_string(),
+            body_font: "Verdana".to_string(),
+            accent_color: accent,
+            high_contrast: false,
+        },
+        master: master_with_accent(accent, background),
+        layouts: named_layouts(&["Welcome", "Announcements", "Events", "Call to Action"]),
+    }
+}
+
+/// The Photo Essay template: clean serif (Georgia) headings + sans body, black
+/// background, white text, neutral accent (photos are the focus).
+fn photo_essay_template() -> TemplateDefinition {
+    let accent = Color::rgb(200, 200, 200);
+    let background = Color::rgb(0, 0, 0);
+    TemplateDefinition {
+        name: "photo_essay",
+        display_name: "Photo Essay",
+        theme: Theme {
+            background,
+            heading_font: "Georgia".to_string(),
+            body_font: "Helvetica".to_string(),
+            accent_color: accent,
+            high_contrast: false,
+        },
+        master: master_with_accent(accent, background),
+        layouts: named_layouts(&["Cover", "Full Photo", "Captioned Photo", "Gallery"]),
+    }
 }
 
 /// A paragraph of text, made of runs and a list style.
@@ -3924,6 +4258,151 @@ impl Command for SetPresenterSettings {
     }
 }
 
+/// Applies a built-in template's theme, master, and layouts to the deck.
+///
+/// This is a deck-level command: it replaces the deck's `theme`, `master`,
+/// `layouts`, and `template` name. Validation rejects any name that is not one
+/// of the six built-ins ([`TemplateRegistry::names`]). The inverse snapshots
+/// the deck's prior theme, master, layouts, and template name.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetTemplate {
+    template_name: String,
+}
+
+impl SetTemplate {
+    /// Creates a new set-template command.
+    pub fn new(template_name: impl Into<String>) -> Self {
+        Self {
+            template_name: template_name.into(),
+        }
+    }
+}
+
+impl Command for SetTemplate {
+    fn apply(&self, deck: &mut Deck) {
+        let Some(definition) = TemplateRegistry::get(&self.template_name) else {
+            return;
+        };
+        deck.theme = definition.theme;
+        deck.master = definition.master;
+        deck.layouts = definition.layouts;
+        deck.template = Some(self.template_name.clone());
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        Box::new(RestoreTemplate {
+            theme: deck.theme.clone(),
+            master: deck.master.clone(),
+            layouts: deck.layouts.clone(),
+            template: deck.template.clone(),
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn validate(&self, _deck: &Deck) -> bool {
+        TemplateRegistry::names().contains(&self.template_name.as_str())
+    }
+}
+
+/// Restores the deck's prior theme, master, layouts, and template name.
+///
+/// This is the inverse of [`SetTemplate`]; it is not normally constructed
+/// directly by callers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct RestoreTemplate {
+    theme: Theme,
+    master: Master,
+    layouts: Vec<Layout>,
+    template: Option<String>,
+}
+
+impl Command for RestoreTemplate {
+    fn apply(&self, deck: &mut Deck) {
+        deck.theme = self.theme.clone();
+        deck.master = self.master.clone();
+        deck.layouts = self.layouts.clone();
+        deck.template = self.template.clone();
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        Box::new(RestoreTemplate {
+            theme: deck.theme.clone(),
+            master: deck.master.clone(),
+            layouts: deck.layouts.clone(),
+            template: deck.template.clone(),
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn validate(&self, _deck: &Deck) -> bool {
+        true
+    }
+}
+
+/// Sets or clears a slide's layout reference.
+///
+/// Pass `Some(name)` to assign a layout (the name must be one of the deck's
+/// [`Deck::layouts`]) or `None` to clear it. The inverse snapshots the slide's
+/// prior `Option<String>` layout reference.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetSlideLayout {
+    slide_id: String,
+    layout_name: Option<String>,
+}
+
+impl SetSlideLayout {
+    /// Creates a new set-slide-layout command. Pass `None` to clear the
+    /// slide's layout reference.
+    pub fn new(slide_id: impl Into<String>, layout_name: Option<String>) -> Self {
+        Self {
+            slide_id: slide_id.into(),
+            layout_name,
+        }
+    }
+}
+
+impl Command for SetSlideLayout {
+    fn apply(&self, deck: &mut Deck) {
+        if let Some(slide) = deck.slide_mut(&self.slide_id) {
+            slide.layout_ref = self.layout_name.clone();
+        }
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        let prior = deck
+            .slide(&self.slide_id)
+            .and_then(|slide| slide.layout_ref.clone());
+        Box::new(Self {
+            slide_id: self.slide_id.clone(),
+            layout_name: prior,
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        if deck.slide(&self.slide_id).is_none() {
+            return false;
+        }
+        match &self.layout_name {
+            None => true,
+            Some(name) => deck.layouts.iter().any(|layout| layout.name == *name),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3959,6 +4438,7 @@ mod tests {
             animation: None,
             transition: None,
             rich_notes: None,
+            layout_ref: None,
         });
 
         let json = serde_json::to_string(&deck).expect("serialize deck");
@@ -3983,6 +4463,7 @@ mod tests {
             animation: None,
             transition: None,
             rich_notes: None,
+            layout_ref: None,
         });
 
         let mut bus = CommandBus::default();
@@ -4020,6 +4501,7 @@ mod tests {
             animation: None,
             transition: None,
             rich_notes: None,
+            layout_ref: None,
         });
 
         let mut bus = CommandBus::default();
@@ -4054,6 +4536,7 @@ mod tests {
             animation: None,
             transition: None,
             rich_notes: None,
+            layout_ref: None,
         });
 
         let mut bus = CommandBus::default();
@@ -4092,6 +4575,7 @@ mod tests {
             animation: None,
             transition: None,
             rich_notes: None,
+            layout_ref: None,
         });
 
         let mut bus = CommandBus::default();
@@ -4143,6 +4627,7 @@ mod tests {
             animation: None,
             transition: None,
             rich_notes: None,
+            layout_ref: None,
         }
     }
 
@@ -4712,6 +5197,7 @@ mod tests {
             animation: None,
             transition: None,
             rich_notes: None,
+            layout_ref: None,
         });
 
         let mut value = serde_json::to_value(&deck).expect("serialize to value");
@@ -4832,6 +5318,7 @@ mod tests {
             animation: None,
             transition: None,
             rich_notes: None,
+            layout_ref: None,
         });
         let original = deck.clone();
 
@@ -4883,6 +5370,7 @@ mod tests {
             animation: None,
             transition: None,
             rich_notes: None,
+            layout_ref: None,
         });
 
         let mut bus = CommandBus::default();
@@ -4924,6 +5412,7 @@ mod tests {
             animation: None,
             transition: None,
             rich_notes: None,
+            layout_ref: None,
         });
 
         let mut bus = CommandBus::default();
@@ -7215,5 +7704,271 @@ mod tests {
         let chr: SetHighContrast =
             serde_json::from_str(&chj).expect("deserialize set-high-contrast");
         assert_eq!(cmd_hc, chr);
+    }
+
+    #[test]
+    fn old_deck_without_template_fields_deserializes() {
+        // A deck serialized before the Wave 9 template fields existed (no
+        // `template`, `layouts`, `master`, or `layout_ref`) must round-trip
+        // unchanged, with the new fields defaulting in.
+        let old_json = r#"{
+            "schema_version": 1,
+            "id": "old-deck",
+            "theme": {
+                "background": {"r": 255, "g": 255, "b": 255, "a": 255},
+                "heading_font": "Calibri",
+                "body_font": "Calibri",
+                "accent_color": {"r": 0, "g": 112, "b": 192, "a": 255}
+            },
+            "slides": [{"id": "s1", "notes": "", "shapes": []}]
+        }"#;
+        let deck: Deck = serde_json::from_str(old_json).expect("old deck deserializes");
+        assert_eq!(deck.template, None);
+        assert!(deck.layouts.is_empty());
+        assert_eq!(deck.master, Master::default());
+        assert_eq!(deck.slides[0].layout_ref, None);
+        assert_eq!(deck.schema_version, SCHEMA_VERSION);
+
+        let round_json = serde_json::to_string(&deck).expect("serialize deck");
+        let restored: Deck = serde_json::from_str(&round_json).expect("deserialize deck");
+        assert_eq!(deck, restored);
+    }
+
+    #[test]
+    fn template_registry_has_six_templates() {
+        let names = TemplateRegistry::names();
+        assert_eq!(
+            names,
+            vec![
+                "default",
+                "educator",
+                "pitch",
+                "conference_talk",
+                "community_update",
+                "photo_essay",
+            ]
+        );
+        for name in &names {
+            assert!(
+                TemplateRegistry::get(name).is_some(),
+                "{name} should resolve"
+            );
+        }
+        assert!(TemplateRegistry::get("does-not-exist").is_none());
+
+        let display_names: Vec<&str> = names
+            .iter()
+            .filter_map(|name| TemplateRegistry::get(name).map(|d| d.display_name))
+            .collect();
+        assert_eq!(display_names.len(), 6);
+        let unique: std::collections::HashSet<&str> = display_names.iter().copied().collect();
+        assert_eq!(unique.len(), 6, "display names should be distinct");
+    }
+
+    #[test]
+    fn template_registry_get_returns_distinct_themes() {
+        let default = TemplateRegistry::get("default").expect("default template");
+        assert_eq!(default.theme, Theme::default());
+
+        // Pitch is dark.
+        let pitch = TemplateRegistry::get("pitch").expect("pitch template");
+        assert_eq!(pitch.theme.background, Color::rgb(26, 26, 46));
+        assert_ne!(pitch.theme.accent_color, default.theme.accent_color);
+        assert_ne!(pitch.theme.heading_font, default.theme.heading_font);
+
+        // Educator is warm: cream background, orange accent.
+        let educator = TemplateRegistry::get("educator").expect("educator template");
+        assert!(educator.theme.background.r > 240);
+        assert!(educator.theme.background.g > 230);
+        assert_eq!(educator.theme.accent_color, Color::rgb(232, 122, 48));
+
+        // Photo Essay is black.
+        let photo = TemplateRegistry::get("photo_essay").expect("photo essay template");
+        assert_eq!(photo.theme.background, Color::rgb(0, 0, 0));
+
+        // All six themes are distinct.
+        let mut themes: Vec<Theme> = TemplateRegistry::names()
+            .into_iter()
+            .map(|name| TemplateRegistry::get(name).unwrap().theme)
+            .collect();
+        let total = themes.len();
+        themes.dedup();
+        assert_eq!(
+            themes.len(),
+            total,
+            "all six template themes should be distinct"
+        );
+    }
+
+    #[test]
+    fn set_template_applies_and_undoes() {
+        let mut deck = Deck::new();
+        let original = deck.clone();
+        assert_ne!(deck.theme.background, Color::rgb(26, 26, 46));
+
+        let mut bus = CommandBus::default();
+        let cmd = Box::new(SetTemplate::new("pitch"));
+        assert!(cmd.validate(&deck));
+        bus.apply(cmd, &mut deck).expect("apply should succeed");
+
+        let pitch = TemplateRegistry::get("pitch").unwrap();
+        assert_eq!(deck.theme, pitch.theme, "deck theme should be pitch");
+        assert_eq!(deck.master, pitch.master);
+        assert_eq!(deck.layouts.len(), pitch.layouts.len());
+        assert_eq!(deck.template.as_deref(), Some("pitch"));
+
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(
+            deck, original,
+            "undo should restore the original deck exactly"
+        );
+    }
+
+    #[test]
+    fn set_template_rejects_unknown_name() {
+        let mut deck = Deck::new();
+        let mut bus = CommandBus::default();
+        let cmd = Box::new(SetTemplate::new("nope"));
+        assert!(!cmd.validate(&deck));
+        assert_eq!(bus.apply(cmd, &mut deck), Err(CommandError::InvalidCommand));
+        assert!(deck.template.is_none());
+        assert_eq!(bus.undo_len(), 0);
+    }
+
+    #[test]
+    fn set_slide_layout_applies_and_undoes() {
+        let mut deck = Deck::new();
+        // Use the default template's layouts so a layout name validates.
+        let def = TemplateRegistry::get("default").unwrap();
+        deck.layouts = def.layouts.clone();
+        deck.slides.push(slide_with("s1", vec![geo_rectangle()]));
+        assert!(deck.slides[0].layout_ref.is_none());
+
+        let mut bus = CommandBus::default();
+        let cmd = Box::new(SetSlideLayout::new(
+            "s1",
+            Some("Title and Content".to_string()),
+        ));
+        bus.apply(cmd, &mut deck).expect("apply should succeed");
+        assert_eq!(
+            deck.slides[0].layout_ref.as_deref(),
+            Some("Title and Content")
+        );
+
+        assert!(bus.undo(&mut deck).is_some());
+        assert!(deck.slides[0].layout_ref.is_none());
+
+        // Clearing via None also round-trips.
+        deck.slides[0].layout_ref = Some("Blank".to_string());
+        let cmd = Box::new(SetSlideLayout::new("s1", None));
+        bus.apply(cmd, &mut deck)
+            .expect("apply clear should succeed");
+        assert!(deck.slides[0].layout_ref.is_none());
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck.slides[0].layout_ref.as_deref(), Some("Blank"));
+    }
+
+    #[test]
+    fn set_slide_layout_rejects_missing_slide_and_unknown_layout() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with("s1", vec![geo_rectangle()]));
+
+        let mut bus = CommandBus::default();
+
+        // Missing slide.
+        let missing = Box::new(SetSlideLayout::new("ghost", Some("Blank".to_string())));
+        assert!(!missing.validate(&deck));
+        assert_eq!(
+            bus.apply(missing, &mut deck),
+            Err(CommandError::InvalidCommand)
+        );
+
+        // Unknown layout name (deck has no layouts).
+        let unknown = Box::new(SetSlideLayout::new("s1", Some("Nope".to_string())));
+        assert!(!unknown.validate(&deck));
+        assert_eq!(
+            bus.apply(unknown, &mut deck),
+            Err(CommandError::InvalidCommand)
+        );
+
+        assert!(deck.slides[0].layout_ref.is_none());
+        assert_eq!(bus.undo_len(), 0);
+    }
+
+    #[test]
+    fn deck_with_template_and_layouts_round_trips() {
+        let mut deck = Deck::new();
+        let pitch = TemplateRegistry::get("pitch").unwrap();
+        deck.theme = pitch.theme.clone();
+        deck.master = pitch.master.clone();
+        deck.layouts = pitch.layouts.clone();
+        deck.template = Some("pitch".to_string());
+        let mut slide = slide_with("s1", vec![geo_rectangle()]);
+        slide.layout_ref = Some("Cover".to_string());
+        deck.slides.push(slide);
+
+        let json = serde_json::to_string(&deck).expect("serialize deck");
+        let restored: Deck = serde_json::from_str(&json).expect("deserialize deck");
+        assert_eq!(deck, restored);
+        assert_eq!(restored.template.as_deref(), Some("pitch"));
+        assert_eq!(restored.layouts.len(), pitch.layouts.len());
+        assert!(!restored.master.background_shapes.is_empty());
+        assert_eq!(restored.slides[0].layout_ref.as_deref(), Some("Cover"));
+        assert!(json.contains("\"template\""));
+        assert!(json.contains("\"layouts\""));
+        assert!(json.contains("\"layout_ref\""));
+    }
+
+    #[test]
+    fn master_and_layout_serialize_and_deserialize() {
+        let master = Master {
+            background_shapes: vec![BackgroundShape {
+                geometry: Geometry::Rectangle,
+                style: Style {
+                    fill: Some(Fill::Solid(Color::rgb(26, 26, 46))),
+                    outline: None,
+                    shadow: None,
+                },
+                transform: Transform {
+                    frame: Rect::new(0.0, 0.0, 12_192_000.0, 6_858_000.0),
+                    rotation: 0.0,
+                },
+            }],
+            placeholders: vec![
+                PlaceholderDef {
+                    name: "title".to_string(),
+                    frame: Rect::new(457_200.0, 457_200.0, 11_277_600.0, 1_143_000.0),
+                },
+                PlaceholderDef {
+                    name: "content".to_string(),
+                    frame: Rect::new(457_200.0, 1_828_800.0, 11_277_600.0, 4_343_400.0),
+                },
+            ],
+        };
+        let mj = serde_json::to_string(&master).expect("serialize master");
+        let mr: Master = serde_json::from_str(&mj).expect("deserialize master");
+        assert_eq!(master, mr);
+        assert!(mj.contains("\"background_shapes\""));
+        assert!(mj.contains("\"placeholders\""));
+
+        // Empty master default-constructs and round-trips.
+        let empty = Master::default();
+        assert!(empty.background_shapes.is_empty());
+        let ej = serde_json::to_string(&empty).expect("serialize empty master");
+        let er: Master = serde_json::from_str(&ej).expect("deserialize empty master");
+        assert_eq!(empty, er);
+
+        let layout = Layout {
+            name: "Title and Content".to_string(),
+            placeholders: vec![PlaceholderDef {
+                name: "content".to_string(),
+                frame: Rect::new(0.0, 0.0, 100.0, 100.0),
+            }],
+        };
+        let lj = serde_json::to_string(&layout).expect("serialize layout");
+        let lr: Layout = serde_json::from_str(&lj).expect("deserialize layout");
+        assert_eq!(layout, lr);
+        assert_eq!(Layout::default().name, "Blank");
+        assert_eq!(Master::default_16_9(), Master::default());
     }
 }
