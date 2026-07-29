@@ -63,6 +63,7 @@ pub fn parse_transition(xml: &str, slide_id: &str, ledger: &mut LossLedger) -> O
         Some("push") => Some(TransitionKind::Push),
         Some("wipe") => Some(TransitionKind::Wipe),
         Some("pull") | Some("slide") => Some(TransitionKind::Slide),
+        Some("morph") => Some(TransitionKind::Morph),
         None | Some("cut") => None,
         Some(other) => {
             ledger.add(LossWarning::new(
@@ -351,9 +352,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_transition_morph_maps_to_model() {
+        let mut ledger = LossLedger::new();
+        let xml =
+            r#"<p:transition xmlns:p="p" spd="slow"><p:morph option="byObject"/></p:transition>"#;
+        assert_eq!(
+            parse_transition(xml, "s1", &mut ledger),
+            Some(Transition {
+                kind: TransitionKind::Morph,
+                duration_ms: 1000,
+            })
+        );
+        assert!(ledger.is_empty(), "morph should not warn");
+    }
+
+    #[test]
     fn parse_transition_unknown_variant_warns() {
         let mut ledger = LossLedger::new();
-        let xml = "<p:transition xmlns:p=\"p\"><p:morph/></p:transition>";
+        let xml = "<p:transition xmlns:p=\"p\"><p:zoom/></p:transition>";
         assert_eq!(parse_transition(xml, "s1", &mut ledger), None);
         assert!(!ledger.is_empty());
     }
