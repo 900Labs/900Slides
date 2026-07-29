@@ -1921,6 +1921,7 @@ fn render_options(deck: &slides_core::Deck) -> slides_render::RenderOptions {
         slides_render::RenderOptions {
             width_emu: size.width_emu,
             height_emu: size.height_emu,
+            ..slides_render::RenderOptions::default()
         }
     } else {
         slides_render::RenderOptions::default()
