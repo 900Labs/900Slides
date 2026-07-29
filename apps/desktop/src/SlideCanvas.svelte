@@ -29,6 +29,7 @@
     TextBoxSnapshot,
     VerticalAlignDto,
   } from './lib/types'
+  import { codeLineState } from './lib/codeSteps'
 
   /** Props for the slide canvas. */
   interface Props {
@@ -62,6 +63,8 @@
     readonly?: boolean
     /** Current build step index for presenter playback. */
     activeBuildStep?: number
+    /** Active code-step index (0-based) for stepped code highlighting. */
+    codeActiveStep?: number
     /** Deck slide size (aspect ratio). Defaults to 16:9 when unset. */
     slideSize?: SlideSizeDto
     /** Whether the deck is rendered in high-contrast mode. */
@@ -79,6 +82,7 @@
     onSelectShape,
     readonly = false,
     activeBuildStep = Infinity,
+    codeActiveStep = 0,
     slideSize,
     highContrast = false,
   }: Props = $props()
@@ -262,6 +266,7 @@
       a.heading === b.heading &&
       a.blockquote === b.blockquote &&
       a.codeBlock === b.codeBlock &&
+      a.codeStepRanges === b.codeStepRanges &&
       a.indentLevel === b.indentLevel
     )
   }
@@ -278,6 +283,18 @@
     if (style.blockquote) classes.push('blockquote')
     if (style.codeBlock) classes.push('code-block')
     return classes.join(' ')
+  }
+
+  /** Class for a readonly paragraph, combining its base style with the active
+   *  code-step highlight/dim state (line is 0-based paragraph index). */
+  function readonlyParagraphClass(style: ParagraphStyleDto, lineIndex: number): string {
+    const base = paragraphClass(style)
+    if (!style.codeBlock) return base
+    const ranges = style.codeStepRanges
+    if (!ranges || ranges.trim() === '') return base
+    const state = codeLineState(ranges, codeActiveStep, lineIndex + 1)
+    const stepClass = state === 'active' ? 'code-step-active' : state === 'dimmed' ? 'code-step-dimmed' : ''
+    return [base, stepClass].filter(Boolean).join(' ')
   }
 
   /** Class name for a run based on its style. */
@@ -862,7 +879,10 @@
     const cached = chartSvgCache.get(key)
     if (cached !== undefined) return cached
 
-    const svg = await invoke<string>('render_slide_svg', { slide_id: slide.id })
+    const svg = await invoke<string>('render_slide_svg', {
+      slide_id: slide.id,
+      code_active_step: codeActiveStep,
+    })
     const parsed = new DOMParser().parseFromString(svg, 'image/svg+xml')
     const svgs = Array.from(parsed.querySelectorAll('svg'))
     // The first <svg> is the slide root; nested <svg> elements are charts.
@@ -913,8 +933,8 @@
       >
         {#if readonly}
           <div class="text-box-readonly">
-            {#each textBox.paragraphs as paragraph}
-              <p class={paragraphClass(paragraph.style)}>
+            {#each textBox.paragraphs as paragraph, pIndex}
+              <p class={readonlyParagraphClass(paragraph.style, pIndex)}>
                 {#each paragraph.runs as run}
                   <span class={runClass(run)}>{run.text}</span>
                 {/each}
@@ -1275,6 +1295,12 @@
     font-family: 'Courier New', monospace;
     background: #f5f5f5;
     padding: 0.25rem;
+  }
+  .text-box-readonly p.code-step-active {
+    background: #fff3cd;
+  }
+  .text-box-readonly p.code-step-dimmed {
+    opacity: 0.4;
   }
   .passthrough {
     position: absolute;
