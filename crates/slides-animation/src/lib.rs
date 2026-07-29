@@ -12,7 +12,9 @@
 //! [`Vec<BuildFrame>`] output. [`css_class`] and [`keyframes`] return static
 //! [`&str`] and are therefore deterministic by construction.
 
-use slides_core::{Animation, BuildEffect, BuildStep};
+use std::collections::{BTreeMap, BTreeSet};
+
+use slides_core::{Animation, BuildEffect, BuildStep, Rect, Shape, Slide, Transform};
 
 /// Returns the crate version.
 pub fn version() -> &'static str {
@@ -115,10 +117,135 @@ pub fn css_class_for_step(step_index: usize) -> String {
     format!("build-{step_index}")
 }
 
+/// A morph frame: one shape's interpolation from the previous slide to the
+/// next.
+///
+/// Deterministic: the same slide pair always produces identical frames.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MorphFrame {
+    /// The shape id being morphed (matches on both slides).
+    pub shape_id: String,
+    /// Source transform (on the previous slide). `None` if the shape is new on
+    /// the next slide (fade-in).
+    pub from: Option<MorphTransform>,
+    /// Target transform (on the next slide). `None` if the shape is being
+    /// removed (fade-out).
+    pub to: Option<MorphTransform>,
+}
+
+/// Interpolatable transform state for a morph.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MorphTransform {
+    /// Horizontal position, in EMU.
+    pub x: f64,
+    /// Vertical position, in EMU.
+    pub y: f64,
+    /// Width, in EMU.
+    pub width: f64,
+    /// Height, in EMU.
+    pub height: f64,
+    /// Rotation around the frame center, in degrees.
+    pub rotation: f64,
+}
+
+/// Computes the morph frame sequence for a transition from `prev` to `next`.
+///
+/// Matches shapes by stable id. Shapes present on both slides interpolate
+/// (`from: Some`, `to: Some`); shapes only on `next` fade in
+/// (`from: None`, `to: Some`); shapes only on `prev` fade out
+/// (`from: Some`, `to: None`).
+///
+/// [`Shape::Passthrough`] objects and shapes with an empty id are skipped.
+/// Deterministic: the matching pass uses [`BTreeMap`]s and the union of ids is
+/// drawn from a [`BTreeSet`], so the result is sorted by `shape_id`
+/// alphabetically — no [`HashMap`](std::collections::HashMap) iteration is
+/// involved in the output ordering.
+pub fn morph_timeline(prev: &Slide, next: &Slide) -> Vec<MorphFrame> {
+    let prev_map = collect_transforms(prev);
+    let next_map = collect_transforms(next);
+
+    let mut ids: BTreeSet<String> = BTreeSet::new();
+    ids.extend(prev_map.keys().cloned());
+    ids.extend(next_map.keys().cloned());
+
+    ids.into_iter()
+        .map(|id| {
+            let from = prev_map.get(&id).cloned();
+            let to = next_map.get(&id).cloned();
+            MorphFrame {
+                shape_id: id,
+                from,
+                to,
+            }
+        })
+        .collect()
+}
+
+/// Collects the id-addressed morph transforms for a slide's shapes.
+///
+/// [`Shape::Passthrough`] objects and shapes with an empty id are skipped. The
+/// result is a [`BTreeMap`] so iteration order is stable.
+fn collect_transforms(slide: &Slide) -> BTreeMap<String, MorphTransform> {
+    let mut map = BTreeMap::new();
+    for shape in &slide.shapes {
+        let id = shape.id();
+        if id.is_empty() {
+            continue;
+        }
+        if let Some(transform) = shape_transform(shape) {
+            map.insert(id.to_string(), transform);
+        }
+    }
+    map
+}
+
+/// Extracts a [`MorphTransform`] from a shape, or `None` for
+/// [`Shape::Passthrough`].
+///
+/// [`Shape::TextBox`] carries only a [`Rect`] (no rotation), so its rotation is
+/// `0.0`; every other editable variant exposes a [`Transform`].
+fn shape_transform(shape: &Shape) -> Option<MorphTransform> {
+    match shape {
+        Shape::TextBox(text_box) => Some(rect_to_morph(&text_box.frame, 0.0)),
+        Shape::Image(image) => Some(transform_to_morph(&image.transform)),
+        Shape::Geometric(geometric) => Some(transform_to_morph(&geometric.transform)),
+        Shape::Table(table) => Some(transform_to_morph(&table.transform)),
+        Shape::Chart(chart) => Some(transform_to_morph(&chart.transform)),
+        Shape::Passthrough(_) => None,
+    }
+}
+
+/// Builds a [`MorphTransform`] from a [`Rect`] and an explicit rotation.
+fn rect_to_morph(frame: &Rect, rotation: f64) -> MorphTransform {
+    MorphTransform {
+        x: frame.x,
+        y: frame.y,
+        width: frame.width,
+        height: frame.height,
+        rotation,
+    }
+}
+
+/// Builds a [`MorphTransform`] from a shape [`Transform`].
+fn transform_to_morph(transform: &Transform) -> MorphTransform {
+    rect_to_morph(&transform.frame, transform.rotation)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slides_core::{Animation, BuildEffect, BuildStep};
+    use slides_core::{
+        Animation, BuildEffect, BuildStep, GeometricShape, Geometry, PassthroughObject, Rect,
+        Shape, Style, TextBox, Transform,
+    };
+
+    /// Builds a slide carrying `shapes`, with all other fields defaulted.
+    fn slide(shapes: Vec<Shape>) -> Slide {
+        Slide {
+            shapes,
+            ..Slide::default()
+        }
+    }
 
     #[test]
     fn deterministic_timeline_same_input_same_output() {
@@ -238,5 +365,183 @@ mod tests {
         assert_eq!(timeline[0].start_ms, 0);
         assert_eq!(timeline[0].end_ms, 400);
         assert_eq!(timeline[0].effect, BuildEffect::Disappear);
+    }
+
+    #[test]
+    fn morph_timeline_matching_shape_interpolates() {
+        let prev = slide(vec![Shape::Geometric(GeometricShape {
+            id: "shape-1".to_string(),
+            transform: Transform {
+                frame: Rect::new(0.0, 0.0, 100.0, 50.0),
+                rotation: 0.0,
+            },
+            geometry: Geometry::Rectangle,
+            style: Style::default(),
+        })]);
+        let next = slide(vec![Shape::Geometric(GeometricShape {
+            id: "shape-1".to_string(),
+            transform: Transform {
+                frame: Rect::new(200.0, 100.0, 100.0, 50.0),
+                rotation: 45.0,
+            },
+            geometry: Geometry::Rectangle,
+            style: Style::default(),
+        })]);
+
+        let frames = morph_timeline(&prev, &next);
+
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].shape_id, "shape-1");
+        assert_eq!(
+            frames[0].from,
+            Some(MorphTransform {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 50.0,
+                rotation: 0.0,
+            })
+        );
+        assert_eq!(
+            frames[0].to,
+            Some(MorphTransform {
+                x: 200.0,
+                y: 100.0,
+                width: 100.0,
+                height: 50.0,
+                rotation: 45.0,
+            })
+        );
+    }
+
+    #[test]
+    fn morph_timeline_new_shape_fades_in() {
+        let prev = slide(vec![]);
+        let next = slide(vec![Shape::TextBox(TextBox {
+            id: "shape-1".to_string(),
+            frame: Rect::new(10.0, 20.0, 30.0, 40.0),
+            paragraphs: vec![],
+        })]);
+
+        let frames = morph_timeline(&prev, &next);
+
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].shape_id, "shape-1");
+        assert!(frames[0].from.is_none());
+        assert!(frames[0].to.is_some());
+    }
+
+    #[test]
+    fn morph_timeline_removed_shape_fades_out() {
+        let prev = slide(vec![Shape::TextBox(TextBox {
+            id: "shape-1".to_string(),
+            frame: Rect::new(10.0, 20.0, 30.0, 40.0),
+            paragraphs: vec![],
+        })]);
+        let next = slide(vec![]);
+
+        let frames = morph_timeline(&prev, &next);
+
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].shape_id, "shape-1");
+        assert!(frames[0].from.is_some());
+        assert!(frames[0].to.is_none());
+    }
+
+    #[test]
+    fn morph_timeline_empty_ids_skipped() {
+        let prev = slide(vec![Shape::TextBox(TextBox {
+            id: String::new(),
+            frame: Rect::new(0.0, 0.0, 10.0, 10.0),
+            paragraphs: vec![],
+        })]);
+        let next = slide(vec![Shape::TextBox(TextBox {
+            id: String::new(),
+            frame: Rect::new(1.0, 1.0, 10.0, 10.0),
+            paragraphs: vec![],
+        })]);
+
+        let frames = morph_timeline(&prev, &next);
+
+        assert!(frames.is_empty(), "shapes with empty ids must not match");
+    }
+
+    #[test]
+    fn morph_timeline_passthrough_skipped() {
+        let prev = slide(vec![Shape::Passthrough(PassthroughObject {
+            id: "passthrough-1".to_string(),
+            label: String::new(),
+            source_part: String::new(),
+            raw_bytes: vec![],
+            frame: Some(Rect::new(0.0, 0.0, 10.0, 10.0)),
+        })]);
+        let next = slide(vec![Shape::Passthrough(PassthroughObject {
+            id: "passthrough-1".to_string(),
+            label: String::new(),
+            source_part: String::new(),
+            raw_bytes: vec![],
+            frame: Some(Rect::new(5.0, 5.0, 10.0, 10.0)),
+        })]);
+
+        let frames = morph_timeline(&prev, &next);
+
+        assert!(frames.is_empty(), "passthrough shapes must not be included");
+    }
+
+    #[test]
+    fn morph_timeline_deterministic() {
+        let make = || {
+            slide(vec![
+                Shape::TextBox(TextBox {
+                    id: "charlie".to_string(),
+                    frame: Rect::new(0.0, 0.0, 10.0, 10.0),
+                    paragraphs: vec![],
+                }),
+                Shape::TextBox(TextBox {
+                    id: "alpha".to_string(),
+                    frame: Rect::new(1.0, 1.0, 10.0, 10.0),
+                    paragraphs: vec![],
+                }),
+                Shape::TextBox(TextBox {
+                    id: "bravo".to_string(),
+                    frame: Rect::new(2.0, 2.0, 10.0, 10.0),
+                    paragraphs: vec![],
+                }),
+            ])
+        };
+        let prev = make();
+        let next = make();
+
+        let first = morph_timeline(&prev, &next);
+        let second = morph_timeline(&prev, &next);
+
+        assert_eq!(first, second);
+        let ids: Vec<&str> = first.iter().map(|f| f.shape_id.as_str()).collect();
+        assert_eq!(ids, vec!["alpha", "bravo", "charlie"]);
+    }
+
+    #[test]
+    fn morph_timeline_no_matching_ids_returns_empty() {
+        let prev = slide(vec![Shape::TextBox(TextBox {
+            id: "only-prev".to_string(),
+            frame: Rect::new(0.0, 0.0, 10.0, 10.0),
+            paragraphs: vec![],
+        })]);
+        let next = slide(vec![Shape::TextBox(TextBox {
+            id: "only-next".to_string(),
+            frame: Rect::new(5.0, 5.0, 10.0, 10.0),
+            paragraphs: vec![],
+        })]);
+
+        let frames = morph_timeline(&prev, &next);
+
+        // No shape id is shared, so there are no interpolation (both-sided) frames.
+        assert!(
+            frames.iter().all(|f| !(f.from.is_some() && f.to.is_some())),
+            "no matching ids means no interpolation frames"
+        );
+        // Each slide's shape surfaces as a single-sided frame, sorted by id.
+        let ids: Vec<&str> = frames.iter().map(|f| f.shape_id.as_str()).collect();
+        assert_eq!(ids, vec!["only-next", "only-prev"]);
     }
 }
