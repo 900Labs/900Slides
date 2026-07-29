@@ -183,6 +183,56 @@ pub struct PresenterSettings {
     /// Highlighter color (hex). Defaults to yellow.
     #[serde(default = "default_highlighter_color")]
     pub highlighter_color: String,
+    /// Projector compensation filters (brightness, contrast, etc.).
+    #[serde(default)]
+    pub projector_filters: ProjectorFilters,
+}
+
+/// CSS filters applied to the audience window for projector compensation.
+/// Persisted per-deck via `PresenterSettings`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectorFilters {
+    /// Invert all colors.
+    #[serde(default)]
+    pub invert: bool,
+    /// Brightness multiplier (1.0 = normal, 0.0 = black, 2.0 = double).
+    #[serde(default = "default_brightness")]
+    pub brightness: f64,
+    /// Contrast multiplier (1.0 = normal).
+    #[serde(default = "default_contrast")]
+    pub contrast: f64,
+    /// Saturation multiplier (1.0 = normal, 0.0 = grayscale).
+    #[serde(default = "default_saturation")]
+    pub saturation: f64,
+    /// Sepia intensity (0.0 = none, 1.0 = full sepia).
+    #[serde(default)]
+    pub sepia: f64,
+    /// Hue rotation in degrees (0.0 = none, 360.0 = full rotation).
+    #[serde(default)]
+    pub hue_rotate: f64,
+}
+
+impl Default for ProjectorFilters {
+    fn default() -> Self {
+        Self {
+            invert: false,
+            brightness: default_brightness(),
+            contrast: default_contrast(),
+            saturation: default_saturation(),
+            sepia: 0.0,
+            hue_rotate: 0.0,
+        }
+    }
+}
+
+fn default_brightness() -> f64 {
+    1.0
+}
+fn default_contrast() -> f64 {
+    1.0
+}
+fn default_saturation() -> f64 {
+    1.0
 }
 
 impl Default for PresenterSettings {
@@ -192,6 +242,7 @@ impl Default for PresenterSettings {
             laser_color: default_laser_color(),
             highlighter: false,
             highlighter_color: default_highlighter_color(),
+            projector_filters: ProjectorFilters::default(),
         }
     }
 }
@@ -7455,6 +7506,7 @@ mod tests {
             laser_color: "#00ff00".to_string(),
             highlighter: true,
             highlighter_color: "#0000ff".to_string(),
+            projector_filters: ProjectorFilters::default(),
         };
         let mut bus = CommandBus::default();
         bus.apply(
