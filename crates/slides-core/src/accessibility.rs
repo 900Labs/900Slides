@@ -91,7 +91,7 @@ pub struct AccessibilityReport {
 /// Checks a deck for accessibility issues and returns a report with a WCAG 2.2
 /// AA conformance score.
 ///
-/// Runs entirely against the in-memory deck model — no telemetry, no network.
+/// Runs entirely against the in-memory deck model — fully offline.
 #[must_use]
 pub fn check_accessibility(deck: &Deck) -> AccessibilityReport {
     let background = deck.theme.background;

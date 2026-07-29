@@ -3929,7 +3929,7 @@ fn accessibility_report_to_dto(
 
 /// Checks the current deck for accessibility issues and returns a WCAG 2.2 AA
 /// report. Runs entirely offline against the in-memory deck model — no network,
-/// no telemetry.
+/// fully offline.
 #[tauri::command]
 pub fn check_accessibility(state: State<'_, AppState>) -> Result<AccessibilityReportDto, String> {
     let guard = state.session.lock().map_err(|e| e.to_string())?;
