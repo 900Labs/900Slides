@@ -235,6 +235,8 @@ const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relati
 #[cfg(test)]
 mod chart_tests;
 #[cfg(test)]
+mod comment_tests;
+#[cfg(test)]
 mod rich_text_tests;
 #[cfg(test)]
 mod table_tests;

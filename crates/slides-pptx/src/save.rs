@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read, Write};
 
-use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
+use quick_xml::events::{BytesCData, BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::{Reader, Writer};
 use slides_core::{
     Animation, BorderEdge, BuildEffect, BuildStep, CellAlign, Crop, DashStyle, Fill,
@@ -467,7 +467,31 @@ fn write_manifest(session: &Session) -> Vec<u8> {
             session.deck.schema_version.to_string().as_str(),
         ));
         elem.push_attribute(("deckId", session.deck.id.as_str()));
-        writer.write_event(Event::Empty(elem)).ok();
+
+        if session.deck.comments.is_empty() {
+            // No comments: emit the same self-closing element as before so the
+            // byte-for-byte round-trip guarantee holds for untouched decks.
+            writer.write_event(Event::Empty(elem)).ok();
+        } else {
+            writer.write_event(Event::Start(elem)).ok();
+            // Serialize the thread list to JSON and embed it verbatim inside a
+            // CDATA section of <comments>. This keeps complex nested comment
+            // data out of hand-written XML while staying inside the manifest.
+            let json =
+                serde_json::to_string(&session.deck.comments).unwrap_or_else(|_| "[]".to_string());
+            writer
+                .write_event(Event::Start(BytesStart::new("comments")))
+                .ok();
+            writer
+                .write_event(Event::CData(BytesCData::new(json.as_str())))
+                .ok();
+            writer
+                .write_event(Event::End(BytesEnd::new("comments")))
+                .ok();
+            writer
+                .write_event(Event::End(BytesEnd::new("manifest")))
+                .ok();
+        }
     }
     out
 }
