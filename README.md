@@ -107,8 +107,9 @@ visibility:
 
 ## How to use it
 
-1. Choose **New** for a blank deck with one editable text box, or **Open** to
-   load an existing `.pptx` file.
+1. Choose **New** to create a deck from one of six built-in templates
+   (Default, Educator, Pitch, Conference Talk, Community Update, Photo Essay),
+   or **Open** to load an existing `.pptx` file.
 2. Click a text box on the slide canvas and type.
 3. Edits are sent to the Rust backend on each change; the canvas re-renders
    from the returned snapshot. Undo with the toolbar button.

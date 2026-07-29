@@ -16,7 +16,30 @@ This section tracks work toward v0.2.0 (editor completeness). See
 [`docs/sprint-records/wave-5.md`](docs/sprint-records/wave-5.md), and
 [`docs/sprint-records/wave-6.md`](docs/sprint-records/wave-6.md), and
 [`docs/sprint-records/wave-7.md`](docs/sprint-records/wave-7.md), and
-[`docs/sprint-records/wave-8.md`](docs/sprint-records/wave-8.md).
+[`docs/sprint-records/wave-8.md`](docs/sprint-records/wave-8.md), and
+[`docs/sprint-records/wave-9.md`](docs/sprint-records/wave-9.md).
+
+### Added — Wave 9 (templates and slide masters)
+
+- A **template system** with six built-in templates: Default, Educator,
+  Pitch, Conference Talk, Community Update, and Photo Essay. Each has a
+  distinct theme (colors, fonts), a slide master (background layers), and
+  3–5 named layouts. New types: `Master`, `BackgroundShape`,
+  `PlaceholderDef`, `Layout`, `TemplateDefinition`, and `TemplateRegistry`.
+  All additive; old decks default to an empty master and no layouts.
+- `Deck` gains `template`, `layouts`, and `master` fields (`#[serde(default)]`).
+  `Slide` gains `layout_ref`. `RenderOptions` carries the master and layouts
+  for background painting.
+- The renderer paints master background shapes behind slide content and
+  renders dashed placeholder guides for the slide's active layout (editor
+  only, not in presenter output).
+- Two reversible commands: `SetTemplate` (applies a built-in template's
+  theme, master, and layouts) and `SetSlideLayout` (sets a slide's layout).
+- Desktop: a **template picker** (grid with theme previews) shown when
+  creating a new deck, and a **layout picker** in the slide context menu.
+  Three Tauri commands (`list_templates`, `set_template`, `set_slide_layout`).
+- `docs/sprint-records/wave-9.md` documenting the wave scope and acceptance
+  criteria.
 
 ### Added — Wave 8 (dual-display presenter)
 
