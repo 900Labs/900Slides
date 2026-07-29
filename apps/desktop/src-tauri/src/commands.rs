@@ -1967,6 +1967,77 @@ pub fn render_slide_svg(slide_id: String, state: State<'_, AppState>) -> Result<
     Ok(rendered.svg)
 }
 
+/// Exports the current slide as a standalone SVG document and writes it to
+/// `file_path`.
+///
+/// The slide is rendered through the same pipeline as the editor (deck
+/// `slide_size`, high-contrast override), then serialized as standalone SVG by
+/// [`slides_pdf::export_slide_svg`] and written to disk.
+#[tauri::command]
+pub fn export_svg(
+    slide_id: String,
+    file_path: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let svg = {
+        let guard = state.session.lock().map_err(|e| e.to_string())?;
+        let session = guard.as_ref().ok_or("no deck is open")?;
+        let deck = session.deck();
+        let slide = deck.slide(&slide_id).ok_or("slide not found")?;
+        let opts = render_options(deck);
+        let theme = high_contrast_theme(deck);
+        slides_pdf::export_slide_svg(slide, &theme, &deck.media, &opts)
+    };
+    fs::write(&file_path, svg).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Exports the current slide as a PNG image at the given scale and writes it to
+/// `file_path`.
+///
+/// `scale = 1.0` renders at native EMU resolution (96 DPI); `2.0` is retina.
+/// The SVG is rasterized via `slides_pdf` and the resulting PNG bytes are
+/// written to disk.
+#[tauri::command]
+pub fn export_png(
+    slide_id: String,
+    scale: f64,
+    file_path: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let bytes = {
+        let guard = state.session.lock().map_err(|e| e.to_string())?;
+        let session = guard.as_ref().ok_or("no deck is open")?;
+        let deck = session.deck();
+        let slide = deck.slide(&slide_id).ok_or("slide not found")?;
+        let opts = render_options(deck);
+        let theme = high_contrast_theme(deck);
+        slides_pdf::export_slide_png(slide, &theme, &deck.media, &opts, scale)
+            .map_err(|e| e.to_string())?
+    };
+    fs::write(&file_path, bytes).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Exports the entire deck as a multi-page PDF and writes it to `file_path`.
+///
+/// Each slide is rasterized at retina resolution and placed as a full-page
+/// image in a `printpdf` document, one page per slide. The PDF bytes are then
+/// written to disk. The session lock is released before the disk write so a
+/// slow write does not block the editor.
+#[tauri::command]
+pub fn export_pdf(file_path: String, state: State<'_, AppState>) -> Result<(), String> {
+    let bytes = {
+        let guard = state.session.lock().map_err(|e| e.to_string())?;
+        let session = guard.as_ref().ok_or("no deck is open")?;
+        let deck = session.deck();
+        let opts = render_options(deck);
+        slides_pdf::export_deck_pdf(deck, &opts).map_err(|e| e.to_string())?
+    };
+    fs::write(&file_path, bytes).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Builds render dimensions for a deck: the deck's `slide_size` when set, else
 /// the default 16:9.
 fn render_options(deck: &slides_core::Deck) -> slides_render::RenderOptions {

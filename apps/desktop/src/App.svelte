@@ -82,6 +82,12 @@
   let showTemplatePicker = $state(false)
   /** Built-in templates loaded for the picker. */
   let templates = $state<TemplateInfoDto[]>([])
+  /** Whether the export dropdown menu is open. */
+  let showExportMenu = $state(false)
+  /** Which export is currently running (`''` when idle). */
+  let exporting = $state<'' | 'svg' | 'png' | 'pdf'>('')
+  /** Human-readable error from the last export, shown until dismissed. */
+  let exportError = $state('')
 
   /** Maximum grid dimension offered by the table size picker. */
   const PICKER_MAX = 6
@@ -241,6 +247,64 @@
     })
     if (typeof path !== 'string') return
     await invoke('save_deck', { path })
+  }
+
+  /** Filename stem used as the default for export save dialogs. */
+  function exportStem(): string {
+    return deck?.id || 'deck'
+  }
+
+  /** Guards an export: disables the menu, surfaces errors, clears the busy flag. */
+  async function runExport(kind: 'svg' | 'png' | 'pdf', task: () => Promise<void>): Promise<void> {
+    exporting = kind
+    exportError = ''
+    try {
+      await task()
+    } catch (error) {
+      exportError = error instanceof Error ? error.message : String(error)
+    } finally {
+      exporting = ''
+    }
+  }
+
+  /** Exports the current slide as a standalone SVG via the system save dialog. */
+  async function onExportSvg(): Promise<void> {
+    showExportMenu = false
+    const slide = deck?.slides[activeIndex]
+    if (!slide) return
+    const path = await save({
+      defaultPath: `${exportStem()}-slide-${activeIndex + 1}.svg`,
+      filters: [{ name: 'SVG', extensions: ['svg'] }],
+    })
+    if (typeof path !== 'string') return
+    await runExport('svg', () => invoke('export_svg', { slideId: slide.id, filePath: path }))
+  }
+
+  /** Exports the current slide as a 2x PNG via the system save dialog. */
+  async function onExportPng(): Promise<void> {
+    showExportMenu = false
+    const slide = deck?.slides[activeIndex]
+    if (!slide) return
+    const path = await save({
+      defaultPath: `${exportStem()}-slide-${activeIndex + 1}.png`,
+      filters: [{ name: 'PNG', extensions: ['png'] }],
+    })
+    if (typeof path !== 'string') return
+    await runExport('png', () =>
+      invoke('export_png', { slideId: slide.id, scale: 2, filePath: path }),
+    )
+  }
+
+  /** Exports the entire deck as a multi-page PDF via the system save dialog. */
+  async function onExportPdf(): Promise<void> {
+    showExportMenu = false
+    if (!deck) return
+    const path = await save({
+      defaultPath: `${exportStem()}.pdf`,
+      filters: [{ name: 'PDF', extensions: ['pdf'] }],
+    })
+    if (typeof path !== 'string') return
+    await runExport('pdf', () => invoke('export_pdf', { filePath: path }))
   }
 
   /** Undoes the last edit and refreshes from the returned snapshot. */
@@ -931,6 +995,35 @@
         >
           Find
         </button>
+        <span class="export-picker-wrap">
+          <button
+            onclick={() => (showExportMenu = !showExportMenu)}
+            type="button"
+            disabled={!deck || exporting !== ''}
+            title="Export the current slide or the whole deck"
+          >
+            Export
+          </button>
+          {#if showExportMenu}
+            <button
+              class="picker-backdrop"
+              onclick={() => (showExportMenu = false)}
+              type="button"
+              aria-label="Close export menu"
+            ></button>
+            <div class="export-dropdown" role="menu" aria-label="Export format">
+              <button onclick={onExportSvg} type="button" role="menuitem" title="Current slide as SVG">
+                SVG (current slide)
+              </button>
+              <button onclick={onExportPng} type="button" role="menuitem" title="Current slide as 2x PNG">
+                PNG (current slide, 2x)
+              </button>
+              <button onclick={onExportPdf} type="button" role="menuitem" title="Entire deck as PDF">
+                PDF (entire deck)
+              </button>
+            </div>
+          {/if}
+        </span>
         <button onclick={() => (showShortcuts = true)} type="button" title="Keyboard shortcuts (?)">
           ?
         </button>
@@ -943,6 +1036,19 @@
         onchange={handleImageSelected}
       />
     </header>
+
+    {#if exporting !== ''}
+      <div class="banner export-progress" role="status" aria-live="polite">
+        Exporting {exporting.toUpperCase()}…
+        {#if exporting === 'pdf'}Rendering every slide as a PDF page can take a moment.{/if}
+      </div>
+    {/if}
+    {#if exportError}
+      <div class="banner" role="alert">
+        <strong>Export failed:</strong> {exportError}
+        <button onclick={() => (exportError = '')} type="button">Dismiss</button>
+      </div>
+    {/if}
 
     {#if showWarnings && warnings.length > 0}
       <div class="banner" role="alert">
@@ -1387,6 +1493,41 @@
   .chart-dropdown button:hover {
     background: #f0f0f0;
   }
+  .export-picker-wrap {
+    position: relative;
+    display: inline-flex;
+  }
+  .export-picker-wrap button:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+  .export-dropdown {
+    position: absolute;
+    top: 100%;
+    right: 0;
+    z-index: 10;
+    margin-top: 0.25rem;
+    display: flex;
+    flex-direction: column;
+    min-width: 200px;
+    background: #fff;
+    border: 1px solid #ccc;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  }
+  .export-dropdown button {
+    text-align: left;
+    background: none;
+    border: none;
+    border-bottom: 1px solid #eee;
+    padding: 0.4rem 0.8rem;
+    cursor: pointer;
+  }
+  .export-dropdown button:last-child {
+    border-bottom: none;
+  }
+  .export-dropdown button:hover {
+    background: #f0f0f0;
+  }
   .shape-label {
     font-size: 0.85rem;
     color: #555;
@@ -1406,6 +1547,10 @@
     margin: 0;
     padding-left: 1rem;
     flex: 1;
+  }
+  .export-progress {
+    background: #d1ecf1;
+    border-bottom-color: #9ecfe0;
   }
   .workspace {
     display: flex;
