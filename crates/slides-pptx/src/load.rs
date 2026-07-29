@@ -523,6 +523,15 @@ fn parse_slide(
         buf.clear();
     }
 
+    // Assign the extracted OOXML `p:cNvPr` ids to each shape so Magic Move can
+    // match shapes across slides by stable id. `shape_ids` is parallel to
+    // `shapes` in document order. Passthrough objects already carry their id;
+    // assigning again is harmless (same value) and keeps every variant
+    // consistent.
+    for (shape, id) in shapes.iter_mut().zip(shape_ids.iter()) {
+        shape.set_id(id.clone());
+    }
+
     // Map OOXML shape ids (p:cNvPr id) to model shape indices (document order).
     let id_to_index: HashMap<String, usize> = shape_ids
         .iter()
@@ -845,6 +854,7 @@ fn parse_text_box(
     }
 
     Ok(TextBox {
+        id: String::new(),
         frame: frame.unwrap_or_else(|| Rect::new(0.0, 0.0, 0.0, 0.0)),
         paragraphs,
     })
@@ -1218,6 +1228,7 @@ fn parse_pic(captured: &str, slide_rels: &SlideRels) -> Option<ImageShape> {
     let embed = props.blip_embed.as_deref()?;
     let media_ref = slide_rels.media_by_rid.get(embed)?;
     Some(ImageShape {
+        id: String::new(),
         transform: props.transform.unwrap_or_default(),
         media_ref: media_ref.clone(),
         crop: props.src_rect,
@@ -1246,6 +1257,7 @@ fn parse_geometric(captured: &str) -> Option<GeometricShape> {
         return None;
     }
     Some(GeometricShape {
+        id: String::new(),
         transform,
         geometry,
         style: Style {

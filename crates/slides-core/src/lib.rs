@@ -346,9 +346,49 @@ pub enum Shape {
     Chart(ChartShape),
 }
 
+impl Shape {
+    /// Returns the stable id of this shape.
+    ///
+    /// For editable variants this is the shape's own `id`; for
+    /// [`Shape::Passthrough`] it is the passthrough object's id.
+    pub fn id(&self) -> &str {
+        match self {
+            Shape::TextBox(text_box) => &text_box.id,
+            Shape::Passthrough(passthrough) => &passthrough.id,
+            Shape::Image(image) => &image.id,
+            Shape::Geometric(geometric) => &geometric.id,
+            Shape::Table(table) => &table.id,
+            Shape::Chart(chart) => &chart.id,
+        }
+    }
+
+    /// Sets the stable id of this shape.
+    ///
+    /// For [`Shape::Passthrough`], sets the passthrough object's id.
+    pub fn set_id(&mut self, id: String) {
+        match self {
+            Shape::TextBox(text_box) => text_box.id = id,
+            Shape::Passthrough(passthrough) => passthrough.id = id,
+            Shape::Image(image) => image.id = id,
+            Shape::Geometric(geometric) => geometric.id = id,
+            Shape::Table(table) => table.id = id,
+            Shape::Chart(chart) => chart.id = id,
+        }
+    }
+
+    /// Generates a new unique shape id (UUID v4 without hyphens).
+    pub fn generate_id() -> String {
+        Uuid::new_v4().simple().to_string()
+    }
+}
+
 /// An editable text box shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TextBox {
+    /// Stable identifier for cross-slide matching (Magic Move). Defaults to
+    /// empty string so old decks deserialize unchanged.
+    #[serde(default)]
+    pub id: String,
     /// Bounding rectangle of the text box, in EMU.
     pub frame: Rect,
     /// Paragraphs of text inside the box.
@@ -358,6 +398,10 @@ pub struct TextBox {
 /// An image placed on a slide, referencing bytes in the deck's [`MediaStore`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImageShape {
+    /// Stable identifier for cross-slide matching (Magic Move). Defaults to
+    /// empty string so old decks deserialize unchanged.
+    #[serde(default)]
+    pub id: String,
     /// Position, size, and rotation of the image.
     pub transform: Transform,
     /// Key of this image's bytes in the deck's [`MediaStore`].
@@ -369,6 +413,10 @@ pub struct ImageShape {
 /// A geometric shape placed on a slide.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GeometricShape {
+    /// Stable identifier for cross-slide matching (Magic Move). Defaults to
+    /// empty string so old decks deserialize unchanged.
+    #[serde(default)]
+    pub id: String,
     /// Position, size, and rotation of the shape.
     pub transform: Transform,
     /// Primitive geometry of the shape.
@@ -412,6 +460,10 @@ pub enum TableError {
 /// A table shape: a grid of cells with per-column widths and per-row heights.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TableShape {
+    /// Stable identifier for cross-slide matching (Magic Move). Defaults to
+    /// empty string so old decks deserialize unchanged.
+    #[serde(default)]
+    pub id: String,
     /// Placement of the table on the slide.
     pub transform: Transform,
     /// Rows, top to bottom. Must be non-empty.
@@ -457,6 +509,7 @@ impl TableShape {
             });
         }
         Ok(Self {
+            id: String::new(),
             transform,
             rows,
             column_widths,
@@ -483,6 +536,7 @@ impl TableShape {
             .collect::<Vec<_>>();
         let column_widths = (0..cols).map(|_| column_width).collect::<Vec<_>>();
         Self {
+            id: String::new(),
             transform: Transform {
                 frame,
                 rotation: 0.0,
@@ -742,6 +796,10 @@ impl XYPoint {
 /// A chart shape placed on a slide.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChartShape {
+    /// Stable identifier for cross-slide matching (Magic Move). Defaults to
+    /// empty string so old decks deserialize unchanged.
+    #[serde(default)]
+    pub id: String,
     /// Position, size, and rotation of the chart.
     pub transform: Transform,
     /// Kind of chart.
@@ -767,6 +825,7 @@ impl ChartShape {
     ) -> Result<Self, ChartError> {
         Self::validate_parts(chart_type, &data)?;
         Ok(Self {
+            id: String::new(),
             transform,
             chart_type,
             data,
@@ -1611,6 +1670,9 @@ pub enum TransitionKind {
     Push,
     /// Wipe reveal.
     Wipe,
+    /// Magic Move: interpolate shapes that share a stable id with the
+    /// preceding slide.
+    Morph,
 }
 
 /// A build-in animation sequence for a slide: an ordered list of steps.
@@ -2348,6 +2410,7 @@ impl Command for DeleteShape {
         });
         let shape = shape.unwrap_or_else(|| {
             Shape::Geometric(GeometricShape {
+                id: String::new(),
                 transform: Transform::default(),
                 geometry: Geometry::Rectangle,
                 style: Style::default(),
@@ -2609,6 +2672,7 @@ impl Command for InsertImage {
         }
         if let Some(slide) = deck.slide_mut(&self.slide_id) {
             slide.shapes.push(Shape::Image(ImageShape {
+                id: Shape::generate_id(),
                 transform: self.transform,
                 media_ref: self.media_key.clone(),
                 crop: self.crop.clone(),
@@ -4412,6 +4476,7 @@ mod tests {
         let _deck = Deck::new();
         let _slide = Slide::default();
         let _shape = Shape::TextBox(TextBox {
+            id: String::new(),
             frame: Rect::new(0.0, 0.0, 100.0, 100.0),
             paragraphs: Vec::new(),
         });
@@ -4425,6 +4490,7 @@ mod tests {
             id: "slide-1".to_string(),
             notes: "speaker note".to_string(),
             shapes: vec![Shape::TextBox(TextBox {
+                id: String::new(),
                 frame: Rect::new(0.0, 0.0, 914_400.0, 457_200.0),
                 paragraphs: vec![Paragraph {
                     runs: vec![
@@ -4453,6 +4519,7 @@ mod tests {
             id: "s1".to_string(),
             notes: String::new(),
             shapes: vec![Shape::TextBox(TextBox {
+                id: String::new(),
                 frame: Rect::new(0.0, 0.0, 100.0, 100.0),
                 paragraphs: vec![Paragraph {
                     runs: vec![Run::new("before")],
@@ -4491,6 +4558,7 @@ mod tests {
             id: "s1".to_string(),
             notes: String::new(),
             shapes: vec![Shape::TextBox(TextBox {
+                id: String::new(),
                 frame: Rect::new(0.0, 0.0, 100.0, 100.0),
                 paragraphs: vec![Paragraph {
                     runs: vec![Run::new("seed")],
@@ -4526,6 +4594,7 @@ mod tests {
             id: "s1".to_string(),
             notes: String::new(),
             shapes: vec![Shape::TextBox(TextBox {
+                id: String::new(),
                 frame: Rect::new(0.0, 0.0, 100.0, 100.0),
                 paragraphs: vec![Paragraph {
                     runs: vec![Run::new("seed")],
@@ -4558,6 +4627,7 @@ mod tests {
             id: "s1".to_string(),
             notes: String::new(),
             shapes: vec![Shape::TextBox(TextBox {
+                id: String::new(),
                 frame: Rect::new(0.0, 0.0, 100.0, 100.0),
                 paragraphs: vec![
                     Paragraph {
@@ -4642,6 +4712,7 @@ mod tests {
 
     fn geo_rectangle() -> Shape {
         Shape::Geometric(GeometricShape {
+            id: String::new(),
             transform: Transform::default(),
             geometry: Geometry::Rectangle,
             style: Style::default(),
@@ -4693,6 +4764,7 @@ mod tests {
             "s1",
             vec![
                 Shape::Geometric(GeometricShape {
+                    id: String::new(),
                     transform: Transform {
                         frame: Rect::new(100.0, 100.0, 200.0, 200.0),
                         rotation: 12.5,
@@ -4715,6 +4787,7 @@ mod tests {
                     },
                 }),
                 Shape::Image(ImageShape {
+                    id: String::new(),
                     transform: Transform {
                         frame: Rect::new(0.0, 0.0, 914_400.0, 685_800.0),
                         rotation: 0.0,
@@ -4745,6 +4818,7 @@ mod tests {
         deck.slides.push(slide_with(
             "s1",
             vec![Shape::TextBox(TextBox {
+                id: String::new(),
                 frame: Rect::new(0.0, 0.0, 100.0, 100.0),
                 paragraphs: Vec::new(),
             })],
@@ -4805,6 +4879,7 @@ mod tests {
         deck.slides.push(slide_with(
             "s1",
             vec![Shape::Image(ImageShape {
+                id: String::new(),
                 transform: Transform::default(),
                 media_ref: "only".to_string(),
                 crop: None,
@@ -4836,6 +4911,7 @@ mod tests {
             .insert("shared".to_string(), sample_media_entry());
         let image = || {
             Shape::Image(ImageShape {
+                id: String::new(),
                 transform: Transform::default(),
                 media_ref: "shared".to_string(),
                 crop: None,
@@ -4872,10 +4948,12 @@ mod tests {
             "s1",
             vec![
                 Shape::TextBox(TextBox {
+                    id: String::new(),
                     frame: Rect::new(0.0, 0.0, 10.0, 10.0),
                     paragraphs: Vec::new(),
                 }),
                 Shape::Geometric(GeometricShape {
+                    id: String::new(),
                     transform: Transform {
                         frame: Rect::new(0.0, 0.0, 10.0, 10.0),
                         rotation: 0.0,
@@ -4884,6 +4962,7 @@ mod tests {
                     style: Style::default(),
                 }),
                 Shape::Image(ImageShape {
+                    id: String::new(),
                     transform: Transform {
                         frame: Rect::new(0.0, 0.0, 10.0, 10.0),
                         rotation: 0.0,
@@ -4935,6 +5014,7 @@ mod tests {
         deck.slides.push(slide_with(
             "s1",
             vec![Shape::Geometric(GeometricShape {
+                id: String::new(),
                 transform: Transform::default(),
                 geometry: Geometry::Ellipse,
                 style: Style::default(),
@@ -4971,10 +5051,12 @@ mod tests {
             "s1",
             vec![
                 Shape::TextBox(TextBox {
+                    id: String::new(),
                     frame: Rect::new(0.0, 0.0, 1.0, 1.0),
                     paragraphs: Vec::new(),
                 }),
                 Shape::Image(ImageShape {
+                    id: String::new(),
                     transform: Transform::default(),
                     media_ref: "m".to_string(),
                     crop: None,
@@ -5187,6 +5269,7 @@ mod tests {
             id: "s1".to_string(),
             notes: String::new(),
             shapes: vec![Shape::TextBox(TextBox {
+                id: String::new(),
                 frame: Rect::new(0.0, 0.0, 100.0, 100.0),
                 paragraphs: vec![Paragraph {
                     runs: vec![Run::new("legacy").bold().italic()],
@@ -5308,6 +5391,7 @@ mod tests {
             id: "s1".to_string(),
             notes: String::new(),
             shapes: vec![Shape::TextBox(TextBox {
+                id: String::new(),
                 frame: Rect::new(0.0, 0.0, 100.0, 100.0),
                 paragraphs: vec![Paragraph {
                     runs: vec![Run::new("seed").bold().strikethrough().superscript()],
@@ -5360,6 +5444,7 @@ mod tests {
             id: "s1".to_string(),
             notes: String::new(),
             shapes: vec![Shape::TextBox(TextBox {
+                id: String::new(),
                 frame: Rect::new(0.0, 0.0, 100.0, 100.0),
                 paragraphs: vec![Paragraph {
                     runs: vec![Run::new("seed").bold()],
@@ -5396,6 +5481,7 @@ mod tests {
             notes: String::new(),
             shapes: vec![
                 Shape::TextBox(TextBox {
+                    id: String::new(),
                     frame: Rect::new(0.0, 0.0, 100.0, 100.0),
                     paragraphs: vec![Paragraph {
                         runs: vec![Run::new("seed")],
@@ -5404,6 +5490,7 @@ mod tests {
                     }],
                 }),
                 Shape::Geometric(GeometricShape {
+                    id: String::new(),
                     transform: Transform::default(),
                     geometry: Geometry::Rectangle,
                     style: Style::default(),
@@ -5595,10 +5682,12 @@ mod tests {
             "s1",
             vec![
                 Shape::TextBox(TextBox {
+                    id: String::new(),
                     frame: Rect::new(0.0, 0.0, 100.0, 100.0),
                     paragraphs: Vec::new(),
                 }),
                 Shape::Image(ImageShape {
+                    id: String::new(),
                     transform: Transform::default(),
                     media_ref: "m".to_string(),
                     crop: None,
@@ -5643,6 +5732,7 @@ mod tests {
         deck.slides.push(slide_with("s1", Vec::new()));
 
         let bad = TableShape {
+            id: String::new(),
             transform: Transform::default(),
             rows: vec![
                 TableRow {
@@ -6412,6 +6502,7 @@ mod tests {
         deck.slides.push(slide_with("s1", Vec::new()));
 
         let bad = ChartShape {
+            id: String::new(),
             transform: Transform::default(),
             chart_type: ChartType::Column,
             data: ChartData::Category {
@@ -7970,5 +8061,135 @@ mod tests {
         assert_eq!(layout, lr);
         assert_eq!(Layout::default().name, "Blank");
         assert_eq!(Master::default_16_9(), Master::default());
+    }
+
+    #[test]
+    fn shape_id_accessor_returns_id() {
+        let shape = Shape::TextBox(TextBox {
+            id: "test-1".to_string(),
+            frame: Rect::new(0.0, 0.0, 100.0, 100.0),
+            paragraphs: Vec::new(),
+        });
+        assert_eq!(shape.id(), "test-1");
+
+        // Passthrough exposes its own id through the same accessor.
+        let passthrough = Shape::Passthrough(PassthroughObject {
+            id: "p-7".to_string(),
+            label: "sp".to_string(),
+            source_part: String::new(),
+            raw_bytes: Vec::new(),
+            frame: None,
+        });
+        assert_eq!(passthrough.id(), "p-7");
+    }
+
+    #[test]
+    fn shape_set_id_updates() {
+        let mut shape = Shape::Geometric(GeometricShape {
+            id: String::new(),
+            transform: Transform::default(),
+            geometry: Geometry::Rectangle,
+            style: Style::default(),
+        });
+        assert_eq!(shape.id(), "");
+        shape.set_id("geo-42".to_string());
+        assert_eq!(shape.id(), "geo-42");
+    }
+
+    #[test]
+    fn shape_generate_id_returns_unique() {
+        let a = Shape::generate_id();
+        let b = Shape::generate_id();
+        assert!(!a.is_empty());
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn morph_transition_kind_serializes() {
+        let json = serde_json::to_string(&TransitionKind::Morph).expect("serialize Morph");
+        assert_eq!(json, "\"morph\"");
+        let back: TransitionKind = serde_json::from_str(&json).expect("deserialize Morph");
+        assert_eq!(back, TransitionKind::Morph);
+    }
+
+    #[test]
+    fn transition_with_morph_round_trips() {
+        let slide = Slide {
+            id: "s1".to_string(),
+            notes: String::new(),
+            shapes: Vec::new(),
+            animation: None,
+            transition: Some(Transition::new(TransitionKind::Morph, 800)),
+            rich_notes: None,
+            layout_ref: None,
+        };
+        let json = serde_json::to_string(&slide).expect("serialize slide");
+        let restored: Slide = serde_json::from_str(&json).expect("deserialize slide");
+        assert_eq!(slide, restored);
+        let transition = restored.transition.expect("transition present");
+        assert_eq!(transition.kind, TransitionKind::Morph);
+        assert_eq!(transition.duration_ms, 800);
+    }
+
+    #[test]
+    fn old_deck_without_shape_ids_deserializes() {
+        // A deck whose shapes carry stable ids.
+        let slide = Slide {
+            id: "s1".to_string(),
+            notes: String::new(),
+            shapes: vec![
+                Shape::TextBox(TextBox {
+                    id: "tb-1".to_string(),
+                    frame: Rect::new(0.0, 0.0, 100.0, 100.0),
+                    paragraphs: Vec::new(),
+                }),
+                Shape::Geometric(GeometricShape {
+                    id: "geo-1".to_string(),
+                    transform: Transform::default(),
+                    geometry: Geometry::Rectangle,
+                    style: Style::default(),
+                }),
+                Shape::Image(ImageShape {
+                    id: "img-1".to_string(),
+                    transform: Transform::default(),
+                    media_ref: "key".to_string(),
+                    crop: None,
+                }),
+            ],
+            animation: None,
+            transition: None,
+            rich_notes: None,
+            layout_ref: None,
+        };
+        let mut deck = Deck::new();
+        deck.slides.push(slide);
+
+        let mut value = serde_json::to_value(&deck).expect("serialize to value");
+        // Strip every shape's `id` from its content object, simulating an old
+        // deck serialized before the id field existed.
+        if let Some(slides) = value.get_mut("slides").and_then(|s| s.as_array_mut()) {
+            for slide in slides {
+                if let Some(shapes) = slide.get_mut("shapes").and_then(|s| s.as_array_mut()) {
+                    for shape in shapes {
+                        if let Some(content) =
+                            shape.get_mut("value").and_then(|v| v.as_object_mut())
+                        {
+                            content.remove("id");
+                        }
+                    }
+                }
+            }
+        }
+        let stripped = serde_json::to_string(&value).expect("re-serialize stripped deck");
+        let restored: Deck = serde_json::from_str(&stripped).expect("deserialize stripped deck");
+        for shape in &restored.slides[0].shapes {
+            assert!(
+                shape.id().is_empty(),
+                "old deck shape should deserialize with empty id, got {:?}",
+                shape.id()
+            );
+        }
+        // The deck is otherwise valid.
+        assert_eq!(restored.slides[0].shapes.len(), 3);
     }
 }

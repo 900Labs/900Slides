@@ -337,6 +337,7 @@ fn deck_round_trip_serialization() {
         id: "slide-1".to_string(),
         notes: "note".to_string(),
         shapes: vec![Shape::TextBox(TextBox {
+            id: String::new(),
             frame: Rect::new(0.0, 0.0, 100.0, 100.0),
             paragraphs: vec![Paragraph {
                 runs: vec![Run::new("test").bold().italic().underline()],
@@ -1178,6 +1179,7 @@ fn insert_geometric_then_save_round_trips() {
     let mut session = load(&blank).expect("load blank");
     let slide_id = "ppt/slides/slide1.xml".to_string();
     let geo = GeometricShape {
+        id: String::new(),
         transform: Transform {
             frame: Rect::new(100_000.0, 100_000.0, 914_400.0, 914_400.0),
             rotation: 0.0,
@@ -1494,8 +1496,8 @@ fn save_edits_animation_patches_timing() {
         "timing should reflect fade effect"
     );
     assert!(
-        saved_slide.contains(r#"spid="100000""#),
-        "timing should target generated shape id"
+        saved_slide.contains(r#"spid="2""#),
+        "timing should target the shape's cNvPr id"
     );
 }
 

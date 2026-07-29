@@ -1079,6 +1079,7 @@ mod tests {
     fn text_box_renders_run_formatting_and_escapes_xml() {
         let mut slide = slides_core::Slide::default();
         slide.shapes.push(Shape::TextBox(TextBox {
+            id: String::new(),
             frame: rect(100_000.0, 100_000.0, 4_000_000.0, 1_000_000.0),
             paragraphs: vec![Paragraph {
                 runs: vec![
@@ -1121,6 +1122,7 @@ mod tests {
     fn rectangle_renders_fill() {
         let mut slide = slides_core::Slide::default();
         slide.shapes.push(Shape::Geometric(GeometricShape {
+            id: String::new(),
             transform: Transform {
                 frame: rect(100_000.0, 100_000.0, 2_000_000.0, 1_000_000.0),
                 rotation: 0.0,
@@ -1142,6 +1144,7 @@ mod tests {
     fn ellipse_renders() {
         let mut slide = slides_core::Slide::default();
         slide.shapes.push(Shape::Geometric(GeometricShape {
+            id: String::new(),
             transform: Transform {
                 frame: rect(0.0, 0.0, 1_000_000.0, 1_000_000.0),
                 rotation: 0.0,
@@ -1169,6 +1172,7 @@ mod tests {
 
         let mut slide = slides_core::Slide::default();
         slide.shapes.push(Shape::Image(ImageShape {
+            id: String::new(),
             transform: Transform {
                 frame: rect(0.0, 0.0, 1_000_000.0, 1_000_000.0),
                 rotation: 0.0,
@@ -1177,6 +1181,7 @@ mod tests {
             crop: None,
         }));
         slide.shapes.push(Shape::Image(ImageShape {
+            id: String::new(),
             transform: Transform {
                 frame: rect(0.0, 0.0, 1_000_000.0, 1_000_000.0),
                 rotation: 0.0,
@@ -1237,10 +1242,12 @@ mod tests {
         // Two text boxes; shape index 1 gets a fade build step.
         let mut slide = slides_core::Slide::default();
         slide.shapes.push(Shape::TextBox(TextBox {
+            id: String::new(),
             frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
             paragraphs: vec![],
         }));
         slide.shapes.push(Shape::TextBox(TextBox {
+            id: String::new(),
             frame: rect(0.0, 600_000.0, 1_000_000.0, 500_000.0),
             paragraphs: vec![],
         }));
@@ -1277,6 +1284,7 @@ mod tests {
     fn master_background_shapes_appear_in_svg() {
         let mut slide = slides_core::Slide::default();
         slide.shapes.push(Shape::TextBox(TextBox {
+            id: String::new(),
             frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
             paragraphs: vec![],
         }));
@@ -1307,6 +1315,7 @@ mod tests {
     fn slide_content_renders_on_top_of_master() {
         let mut slide = slides_core::Slide::default();
         slide.shapes.push(Shape::TextBox(TextBox {
+            id: String::new(),
             frame: rect(100_000.0, 100_000.0, 500_000.0, 200_000.0),
             paragraphs: vec![Paragraph {
                 runs: vec![Run::new("Hello")],
@@ -1389,6 +1398,7 @@ mod tests {
     fn slide_without_animation_emits_no_build_hooks() {
         let mut slide = slides_core::Slide::default();
         slide.shapes.push(Shape::TextBox(TextBox {
+            id: String::new(),
             frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
             paragraphs: vec![],
         }));
@@ -1419,6 +1429,7 @@ mod tests {
     fn rendering_is_deterministic() {
         let mut slide = slides_core::Slide::default();
         slide.shapes.push(Shape::TextBox(TextBox {
+            id: String::new(),
             frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
             paragraphs: vec![Paragraph {
                 runs: vec![Run::new("hello")],
@@ -1427,6 +1438,7 @@ mod tests {
             }],
         }));
         slide.shapes.push(Shape::Geometric(GeometricShape {
+            id: String::new(),
             transform: Transform {
                 frame: rect(0.0, 0.0, 500_000.0, 500_000.0),
                 rotation: 0.0,
@@ -1449,6 +1461,7 @@ mod tests {
     fn theme_background_is_painted_first() {
         let mut slide = slides_core::Slide::default();
         slide.shapes.push(Shape::Geometric(GeometricShape {
+            id: String::new(),
             transform: Transform {
                 frame: rect(100_000.0, 100_000.0, 500_000.0, 500_000.0),
                 rotation: 0.0,
@@ -1471,6 +1484,7 @@ mod tests {
     fn rotation_emits_transform() {
         let mut slide = slides_core::Slide::default();
         slide.shapes.push(Shape::Geometric(GeometricShape {
+            id: String::new(),
             transform: Transform {
                 frame: rect(0.0, 0.0, 1_000_000.0, 1_000_000.0),
                 rotation: 45.0,
@@ -1487,6 +1501,7 @@ mod tests {
     fn shadow_emits_filter_def_and_reference() {
         let mut slide = slides_core::Slide::default();
         slide.shapes.push(Shape::Geometric(GeometricShape {
+            id: String::new(),
             transform: Transform {
                 frame: rect(0.0, 0.0, 1_000_000.0, 1_000_000.0),
                 rotation: 0.0,
@@ -1522,6 +1537,7 @@ mod tests {
     fn strikethrough_renders() {
         let mut slide = slides_core::Slide::default();
         slide.shapes.push(Shape::TextBox(TextBox {
+            id: String::new(),
             frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
             paragraphs: vec![Paragraph {
                 runs: vec![Run {
@@ -1542,6 +1558,7 @@ mod tests {
     fn underline_and_strikethrough_combine() {
         let mut slide = slides_core::Slide::default();
         slide.shapes.push(Shape::TextBox(TextBox {
+            id: String::new(),
             frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
             paragraphs: vec![Paragraph {
                 runs: vec![Run {
@@ -1565,6 +1582,7 @@ mod tests {
     fn superscript_renders() {
         let mut slide = slides_core::Slide::default();
         slide.shapes.push(Shape::TextBox(TextBox {
+            id: String::new(),
             frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
             paragraphs: vec![Paragraph {
                 runs: vec![Run::new("x").superscript()],
@@ -1582,6 +1600,7 @@ mod tests {
     fn subscript_renders() {
         let mut slide = slides_core::Slide::default();
         slide.shapes.push(Shape::TextBox(TextBox {
+            id: String::new(),
             frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
             paragraphs: vec![Paragraph {
                 runs: vec![Run::new("2").subscript()],
@@ -1599,6 +1618,7 @@ mod tests {
     fn link_renders_anchor() {
         let mut slide = slides_core::Slide::default();
         slide.shapes.push(Shape::TextBox(TextBox {
+            id: String::new(),
             frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
             paragraphs: vec![Paragraph {
                 runs: vec![Run::new("click").link("#slide-2").unwrap()],
@@ -1617,6 +1637,7 @@ mod tests {
     fn link_url_is_escaped() {
         let mut slide = slides_core::Slide::default();
         slide.shapes.push(Shape::TextBox(TextBox {
+            id: String::new(),
             frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
             paragraphs: vec![Paragraph {
                 runs: vec![Run::new("params")
@@ -1636,6 +1657,7 @@ mod tests {
     fn inline_code_renders_monospace() {
         let mut slide = slides_core::Slide::default();
         slide.shapes.push(Shape::TextBox(TextBox {
+            id: String::new(),
             frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
             paragraphs: vec![Paragraph {
                 runs: vec![Run::new("code").code()],
@@ -1652,6 +1674,7 @@ mod tests {
     fn inline_code_uses_run_font_family() {
         let mut slide = slides_core::Slide::default();
         slide.shapes.push(Shape::TextBox(TextBox {
+            id: String::new(),
             frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
             paragraphs: vec![Paragraph {
                 runs: vec![Run::new("code").font("Fira Code").code()],
@@ -1672,6 +1695,7 @@ mod tests {
             ..Default::default()
         };
         slide.shapes.push(Shape::TextBox(TextBox {
+            id: String::new(),
             frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
             paragraphs: vec![Paragraph {
                 runs: vec![Run::new("Title")],
@@ -1694,6 +1718,7 @@ mod tests {
             ..Default::default()
         };
         slide.shapes.push(Shape::TextBox(TextBox {
+            id: String::new(),
             frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
             paragraphs: vec![Paragraph {
                 runs: vec![Run::new("quote")],
@@ -1716,6 +1741,7 @@ mod tests {
             ..Default::default()
         };
         slide.shapes.push(Shape::TextBox(TextBox {
+            id: String::new(),
             frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
             paragraphs: vec![Paragraph {
                 runs: vec![Run::new("fn main() {}")],
@@ -1738,6 +1764,7 @@ mod tests {
             ..Default::default()
         };
         slide.shapes.push(Shape::TextBox(TextBox {
+            id: String::new(),
             frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
             paragraphs: vec![Paragraph {
                 runs: vec![Run::new("indented")],
@@ -1927,6 +1954,7 @@ mod tests {
         let mut slide = slides_core::Slide::default();
         slide.shapes.push(Shape::Table(sample_table()));
         slide.shapes.push(Shape::Geometric(GeometricShape {
+            id: String::new(),
             transform: Transform {
                 frame: rect(0.0, 0.0, 500_000.0, 500_000.0),
                 rotation: 0.0,
@@ -1975,6 +2003,7 @@ mod tests {
     #[test]
     fn empty_table_renders_frame_rect_without_panicking() {
         let table = TableShape {
+            id: String::new(),
             transform: Transform {
                 frame: rect(0.0, 0.0, 2_000_000.0, 1_000_000.0),
                 rotation: 0.0,
