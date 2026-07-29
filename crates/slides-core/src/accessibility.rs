@@ -13,10 +13,10 @@ use crate::{Color, Deck, Shape, Slide};
 
 /// Font size, in EMU, at and above which WCAG treats non-bold text as "large"
 /// (18 pt). 1 pt = 12,700 EMU.
-const LARGE_TEXT_EMU: f64 = 2_286_000.0;
+const LARGE_TEXT_EMU: f64 = 228_600.0;
 /// Font size, in EMU, at and above which WCAG treats *bold* text as "large"
 /// (14 pt bold).
-const LARGE_BOLD_TEXT_EMU: f64 = 1_778_000.0;
+const LARGE_BOLD_TEXT_EMU: f64 = 177_800.0;
 /// Minimum body text size, in EMU, before the checker flags it as too small
 /// (12 pt).
 const SMALL_TEXT_EMU: f64 = 152_400.0;
@@ -464,12 +464,11 @@ mod tests {
 
     #[test]
     fn large_text_uses_lower_threshold() {
-        // Gray on white fails the 4.5:1 normal threshold but passes the 3:1
-        // large-text threshold. A 24 pt run should not be flagged.
+        // #808080 on white is ~3.95:1 — below 4.5:1 (normal threshold) but
+        // above 3:1 (large-text threshold). A 24 pt run should NOT be flagged.
         let run = Run::new("big")
-            .color(Color::rgb(118, 118, 118))
-            .font_size(LARGE_TEXT_EMU);
-        // Contrast of #767676 vs white is ~4.54:1 — above 3:1, below 4.5:1.
+            .color(Color::rgb(128, 128, 128))
+            .font_size(304_800.0); // 24 pt = 24 * 12700
         let deck = single_slide_deck(vec![Shape::TextBox(text_box_at(
             0.0,
             vec![Paragraph {
