@@ -77,6 +77,11 @@ fn main() {
             commands::restore_version,
             commands::name_version,
             commands::diff_versions,
+            commands::add_comment,
+            commands::reply_to_comment,
+            commands::set_comment_resolved,
+            commands::assign_comment,
+            commands::delete_comment_thread,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

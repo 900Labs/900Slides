@@ -357,6 +357,42 @@ export interface MediaEntryDto {
 /** Map of media reference to its base64-encoded entry. */
 export type MediaMap = Record<string, MediaEntryDto>
 
+/** Where a comment thread is anchored. Mirrors slides-core CommentAnchor. */
+export type CommentAnchorDto =
+  | { kind: 'slide'; slideId: string }
+  | { kind: 'shape'; slideId: string; shapeId: string }
+  | {
+      kind: 'text_range'
+      slideId: string
+      shapeId: string
+      /** Inclusive byte offset into the text box's concatenated text. */
+      start: number
+      /** Exclusive byte offset into the text box's concatenated text. */
+      end: number
+    }
+
+/** A single comment in a thread. Mirrors slides-core Comment. */
+export interface CommentDto {
+  id: string
+  author: string
+  body: string
+  /** ISO 8601 UTC timestamp. */
+  timestamp: string
+  resolved: boolean
+}
+
+/** A comment thread anchored to a target within the deck. Mirrors CommentThread. */
+export interface CommentThreadDto {
+  id: string
+  anchor: CommentAnchorDto
+  /** The root comment followed by its replies, in chronological order. */
+  comments: CommentDto[]
+  /** Optional assignee (free-text name). */
+  assignedTo?: string
+  /** Whether the entire thread is resolved. */
+  resolved: boolean
+}
+
 /** Deck snapshot returned by every mutating command. */
 export interface DeckSnapshot {
   id: string
@@ -376,6 +412,8 @@ export interface DeckSnapshot {
   media: MediaMap
   /** Presenter settings (laser pointer + highlighter). */
   presenterSettings: PresenterSettingsDto
+  /** Comment threads on this deck, anchored to slides, shapes, or text ranges. */
+  comments: CommentThreadDto[]
   warnings: WarningDto[]
 }
 
