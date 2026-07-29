@@ -20,6 +20,7 @@ slides-core = { path = "../../../crates/slides-core" }
 slides-pptx = { path = "../../../crates/slides-pptx" }
 slides-media = { path = "../../../crates/slides-media" }
 slides-render = { path = "../../../crates/slides-render" }
+slides-pdf = { path = "../../../crates/slides-pdf" }
 slides-spell = { path = "../../../crates/slides-spell" }
 slides-animation = { path = "../../../crates/slides-animation" }
 
