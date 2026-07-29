@@ -21,7 +21,8 @@ the deck model, lossless PPTX editing, a basic editor, and recovery.
 
 What v0.1.0 does:
 
-- Opens `.pptx` files and edits **text boxes**: paragraphs, bold, italic,
+- Opens `.pptx` files and **`.odp`** files (OpenDocument Presentation) and
+  edits **text boxes**: paragraphs, bold, italic,
   underline, strikethrough, super/subscript, inline code, links, headings
   (H1-H6), blockquotes, fenced code blocks (with stepped line-range
   highlighting), and indent levels.
@@ -167,7 +168,7 @@ application:
 apps/desktop/             Desktop UI and Tauri command boundary
 crates/slides-core/       Deck model, commands, undo, theme
 crates/slides-pptx/       PPTX load and save (native format)
-crates/slides-odp/        ODP import / export conversion boundary (stub)
+crates/slides-odp/        ODP (OpenDocument Presentation) import and export
 crates/slides-pdf/        SVG, PNG, and PDF export
 crates/slides-render/     Deterministic slide rendering to SVG
 crates/slides-animation/  Deterministic build-in timeline and CSS playback
