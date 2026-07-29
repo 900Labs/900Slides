@@ -15,6 +15,7 @@ dirs = "5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
+sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 slides-core = { path = "../../../crates/slides-core" }
 slides-pptx = { path = "../../../crates/slides-pptx" }

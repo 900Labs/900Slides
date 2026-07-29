@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod versions;
 
 use tauri::Manager;
 
@@ -71,6 +72,11 @@ fn main() {
             commands::spell_check,
             commands::spell_suggest,
             commands::spell_add_word,
+            commands::list_versions,
+            commands::get_version,
+            commands::restore_version,
+            commands::name_version,
+            commands::diff_versions,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

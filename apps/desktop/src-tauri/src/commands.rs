@@ -46,6 +46,9 @@ pub struct AppState {
     /// Path to the newline-delimited user dictionary file. `spell_add_word`
     /// appends learned words here; on startup the checker reloads them.
     pub user_dictionary_path: PathBuf,
+    /// 900Slides app-data root (`<data_dir>/900Slides`). Version-history
+    /// snapshots are stored under `<version_dir>/versions/<deck_id>/`.
+    pub version_dir: PathBuf,
 }
 
 /// Cached media snapshot, keyed by a content fingerprint of the deck's media.
@@ -90,6 +93,7 @@ impl AppState {
             media_cache: Mutex::new(MediaCache::default()),
             spell: Mutex::new(slides_spell::SpellChecker::new()),
             user_dictionary_path,
+            version_dir: app_dir,
         }
     }
 }
@@ -1245,10 +1249,125 @@ pub fn save_deck(path: String, state: State<'_, AppState>) -> Result<(), String>
     let bytes = slides_pptx::save(session).map_err(|e| e.to_string())?;
     session.commit_save(bytes.clone());
     let deck_id = session.deck().id.clone();
+    // Record a content-addressed version snapshot (deduplicated by hash).
+    // Errors here never block the PPTX save itself.
+    let _ = crate::versions::save_snapshot(&state.version_dir, &deck_id, session.deck());
     drop(guard);
     fs::write(&path, bytes).map_err(|e| e.to_string())?;
     retire_recovery(&state, &deck_id);
     Ok(())
+}
+
+/// Frontend DTOs for version history. The canonical definitions live in
+/// [`crate::versions`]; these aliases expose the command return types under
+/// the conventional `...Dto` names used by the rest of this module. The nested
+/// per-slide diff shape (`SlideDiff`) is carried inside [`VersionDiffDto`].
+pub use crate::versions::{SnapshotInfo as VersionInfoDto, VersionDiff as VersionDiffDto};
+
+/// Replaces the entire deck model with a captured one. Used by
+/// [`restore_version`] so a restore is reversible via the undo bus: the
+/// command's `inverse` captures the deck's prior state.
+#[derive(Debug)]
+struct RestoreDeck {
+    replacement: Box<slides_core::Deck>,
+}
+
+impl RestoreDeck {
+    /// Wraps the deck model that will replace the current one on `apply`.
+    fn new(replacement: slides_core::Deck) -> Self {
+        Self {
+            replacement: Box::new(replacement),
+        }
+    }
+}
+
+impl slides_core::Command for RestoreDeck {
+    fn apply(&self, deck: &mut slides_core::Deck) {
+        *deck = (*self.replacement).clone();
+    }
+
+    fn inverse(&self, deck: &slides_core::Deck) -> Box<dyn slides_core::Command> {
+        Box::new(Self::new(deck.clone()))
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self.replacement.as_ref()).map_or(0, |s| s.len())
+    }
+}
+
+/// Lists every saved version for the current deck, newest first. Reads only
+/// the deck's index file — no snapshot payloads.
+#[tauri::command]
+pub fn list_versions(state: State<'_, AppState>) -> Result<Vec<VersionInfoDto>, String> {
+    let deck_id = {
+        let guard = state.session.lock().map_err(|e| e.to_string())?;
+        guard.as_ref().ok_or("no deck is open")?.deck().id.clone()
+    };
+    crate::versions::list_snapshots(&state.version_dir, &deck_id)
+}
+
+/// Loads a saved version's deck model and returns it as a read-only snapshot.
+#[tauri::command]
+pub fn get_version(hash: String, state: State<'_, AppState>) -> Result<DeckSnapshot, String> {
+    let deck_id = {
+        let guard = state.session.lock().map_err(|e| e.to_string())?;
+        guard.as_ref().ok_or("no deck is open")?.deck().id.clone()
+    };
+    let deck = crate::versions::load_snapshot(&state.version_dir, &deck_id, &hash)?;
+    Ok(state.snapshot(&deck))
+}
+
+/// Restores a saved version into the current session. The swap goes through
+/// the command bus so it is undoable. Returns the resulting deck snapshot.
+#[tauri::command]
+pub fn restore_version(
+    hash: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let deck_id = session.deck().id.clone();
+    // Capture the current slide ids so slides removed by the restore are still
+    // regenerated on the next PPTX save.
+    let prior_slide_ids: Vec<String> = session.deck().slides.iter().map(|s| s.id.clone()).collect();
+    let restored = crate::versions::load_snapshot(&state.version_dir, &deck_id, &hash)?;
+    let restored_ids: Vec<String> = restored.slides.iter().map(|s| s.id.clone()).collect();
+    let command = Box::new(RestoreDeck::new(restored));
+    session.execute(command).map_err(|e| e.to_string())?;
+    for id in prior_slide_ids.iter().chain(restored_ids.iter()) {
+        session.mark_slide_dirty(id);
+    }
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Assigns (or replaces) a user-assigned label on a saved version.
+#[tauri::command]
+pub fn name_version(hash: String, name: String, state: State<'_, AppState>) -> Result<(), String> {
+    let deck_id = {
+        let guard = state.session.lock().map_err(|e| e.to_string())?;
+        guard.as_ref().ok_or("no deck is open")?.deck().id.clone()
+    };
+    crate::versions::name_snapshot(&state.version_dir, &deck_id, &hash, &name)
+}
+
+/// Returns a structural diff between two saved versions of the current deck.
+#[tauri::command]
+pub fn diff_versions(
+    hash_a: String,
+    hash_b: String,
+    state: State<'_, AppState>,
+) -> Result<VersionDiffDto, String> {
+    let deck_id = {
+        let guard = state.session.lock().map_err(|e| e.to_string())?;
+        guard.as_ref().ok_or("no deck is open")?.deck().id.clone()
+    };
+    let deck_a = crate::versions::load_snapshot(&state.version_dir, &deck_id, &hash_a)?;
+    let deck_b = crate::versions::load_snapshot(&state.version_dir, &deck_id, &hash_b)?;
+    Ok(crate::versions::diff_snapshots(&deck_a, &deck_b))
 }
 
 /// Internal command that atomically replaces a chart's data and type. Used

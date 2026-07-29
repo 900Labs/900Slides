@@ -438,6 +438,35 @@ export interface RecoverySnapshot {
   deckId: string
 }
 
+/** Metadata for one saved version of the current deck. */
+export interface VersionInfoDto {
+  /** Content hash (SHA-256) of the version's deck JSON. */
+  hash: string
+  /** ISO 8601 UTC timestamp of the save that created this version. */
+  timestamp: string
+  /** Optional user-assigned label. */
+  name?: string
+}
+
+/** One slide's structural change between two versions. */
+export interface SlideDiffDto {
+  slideId: string
+  shapesAdded: number
+  shapesRemoved: number
+  /** Text excerpts that differ between the two versions of the slide. */
+  textChanged: string[]
+}
+
+/** Structural diff between two deck versions. */
+export interface VersionDiffDto {
+  /** Slide ids present only in the second version. */
+  slidesAdded: string[]
+  /** Slide ids present only in the first version. */
+  slidesRemoved: string[]
+  /** Slides present in both versions whose content differs. */
+  slidesModified: SlideDiffDto[]
+}
+
 /** A misspelled word with its byte span within the checked text. */
 export interface MisspellingDto {
   word: string

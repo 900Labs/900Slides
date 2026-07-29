@@ -24,6 +24,21 @@ This section tracks work toward v0.2.0 (editor completeness). See
 [`docs/sprint-records/wave-13.md`](docs/sprint-records/wave-13.md), and
 [`docs/sprint-records/wave-14.md`](docs/sprint-records/wave-14.md).
 
+## [v0.4.0 — in progress]
+
+### Added — Wave 16 (local version history)
+
+- Every save now creates a **content-addressed snapshot** (SHA-256 of the
+  serialized deck). Identical saves are deduplicated. Snapshots are stored
+  locally under the app data directory — no cloud, no sync.
+- The **Version History** panel (File → Version History) lists all snapshots
+  chronologically with timestamps and optional names.
+- **Restore** a version — replaces the deck, reversible via undo.
+- **Name** a version (e.g. "Before client review").
+- **Diff** two versions — shows structural changes (slides/sections/shapes
+  added, removed, modified).
+- `docs/sprint-records/wave-16.md` documenting the wave scope.
+
 ## [0.3.0] — 2026-07-29
 
 ### Added — Wave 14 (ODP import / export)
