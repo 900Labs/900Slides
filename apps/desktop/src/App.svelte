@@ -21,6 +21,7 @@
     DeckSnapshot,
     HeadingLevelDto,
     ParagraphDto,
+    ParagraphStyleDto,
     RecoverySnapshot,
     RunDto,
     SlideSectionDto,
@@ -88,6 +89,15 @@
   let exporting = $state<'' | 'svg' | 'png' | 'pdf'>('')
   /** Human-readable error from the last export, shown until dismissed. */
   let exportError = $state('')
+  /** Active text-box paragraph the cursor is in, so the toolbar can show and
+   *  edit paragraph-level options (e.g. code-step ranges) for it. */
+  let activeTextTarget = $state<{
+    shapeIndex: number
+    paragraphIndex: number
+    style: ParagraphStyleDto
+  } | null>(null)
+  /** Bound step-ranges input, so committing the value does not hide it. */
+  let codeStepsInput = $state<HTMLInputElement | null>(null)
 
   /** Maximum grid dimension offered by the table size picker. */
   const PICKER_MAX = 6
@@ -345,6 +355,58 @@
     return paragraph.runs.length - 1
   }
 
+  /** Captures the paragraph the cursor is currently in, so the toolbar can show
+   *  and edit its paragraph-level style (e.g. code-step ranges). It updates the
+   *  target whenever a slide text area is focused and keeps it while the
+   *  step-ranges input itself is focused (so committing the value does not hide
+   *  the field). When focus is elsewhere the previous capture is retained until
+   *  a slide change clears it. */
+  function refreshActiveTextTarget(): void {
+    const active = document.activeElement
+    if (codeStepsInput && active === codeStepsInput) return
+    if (!(active instanceof HTMLTextAreaElement)) return
+    const slideId = active.dataset.slideId
+    const shapeIndexRaw = active.dataset.shapeIndex
+    if (!slideId || shapeIndexRaw === undefined || !activeSlide) return
+    const shapeIndex = Number(shapeIndexRaw)
+    const shape = activeSlide.shapes[shapeIndex]
+    if (!shape || shape.kind !== 'text_box') return
+    const textBox = shape.value as TextBoxSnapshot
+    const selection = active.selectionStart ?? 0
+    const linesBefore = active.value.slice(0, selection).split('\n')
+    const paragraphIndex = Math.max(0, linesBefore.length - 1)
+    const paragraph = textBox.paragraphs[paragraphIndex]
+    if (!paragraph) return
+    activeTextTarget = { shapeIndex, paragraphIndex, style: paragraph.style }
+  }
+
+  /** Id of the slide the capture was taken from, so a slide change clears it. */
+  let lastCapturedSlideId: string | undefined
+
+  // Track the focused paragraph as the cursor moves between text boxes and
+  // lines, so the code-step field reflects the active code block.
+  $effect(() => {
+    const handler = (): void => refreshActiveTextTarget()
+    document.addEventListener('selectionchange', handler)
+    document.addEventListener('focusin', handler)
+    return () => {
+      document.removeEventListener('selectionchange', handler)
+      document.removeEventListener('focusin', handler)
+    }
+  })
+
+  // Clear stale captures on slide changes, and re-capture after any edit so the
+  // field stays in sync with the now-updated paragraph.
+  $effect(() => {
+    void deck
+    const slideId = activeSlide?.id
+    if (slideId !== lastCapturedSlideId) {
+      activeTextTarget = null
+      lastCapturedSlideId = slideId
+    }
+    refreshActiveTextTarget()
+  })
+
   /** Identifies the active text box, paragraph, and run from the focused textarea. */
   function getTextTarget():
     | {
@@ -467,6 +529,24 @@
       paragraph_index: target.paragraphIndex,
       style,
     })
+  }
+
+  /** Commits the typed stepped-code ranges (e.g. "1-3|4|5,7") to the active
+   *  code-block paragraph. An empty value clears the ranges. */
+  async function onCodeStepRangesChange(event: Event): Promise<void> {
+    if (!activeTextTarget || !activeSlide) return
+    const value = (event.target as HTMLInputElement).value
+    const style: ParagraphStyleDto = {
+      ...activeTextTarget.style,
+      codeStepRanges: value.trim() === '' ? undefined : value,
+    }
+    deck = await invoke<DeckSnapshot>('set_paragraph_style', {
+      slide_id: activeSlide.id,
+      shape_index: activeTextTarget.shapeIndex,
+      paragraph_index: activeTextTarget.paragraphIndex,
+      style,
+    })
+    activeTextTarget = { ...activeTextTarget, style }
   }
 
   /** Opens the file picker to choose an image to insert onto the active slide. */
@@ -959,6 +1039,17 @@
         </select>
         <button onclick={() => toggleParagraphFlag('blockquote')} type="button" title="Blockquote">Quote</button>
         <button onclick={() => toggleParagraphFlag('codeBlock')} type="button" title="Code block">Block</button>
+        {#if activeTextTarget?.style.codeBlock}
+          <input
+            bind:this={codeStepsInput}
+            class="code-steps-input"
+            type="text"
+            value={activeTextTarget.style.codeStepRanges ?? ''}
+            placeholder="Steps: 1-3|4|5,7"
+            title="Stepped code ranges (pipe = next step, comma = same step, e.g. 1-3|4|5,7)"
+            onchange={onCodeStepRangesChange}
+          />
+        {/if}
       </span>
       <span class="toolbar-divider"></span>
       <span class="deck-group">
@@ -1401,6 +1492,12 @@
   }
   .text-group select {
     padding: 0.3rem 0.4rem;
+  }
+  .code-steps-input {
+    width: 9rem;
+    padding: 0.3rem 0.4rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.8rem;
   }
   .table-group {
     display: flex;

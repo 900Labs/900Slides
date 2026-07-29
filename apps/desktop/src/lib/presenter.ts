@@ -35,6 +35,8 @@ export const PRESENTER_EVENTS = {
   state: 'presenter:state',
   /** Current build-step index, emitted when the build timeline advances. */
   buildStep: 'presenter:build-step',
+  /** Current code-step index, emitted when stepped code highlighting advances. */
+  codeStep: 'presenter:code-step',
   /** Laser pointer position / visibility (throttled). */
   laser: 'presenter:laser',
   /** Full highlighter stroke list (throttled while drawing). */

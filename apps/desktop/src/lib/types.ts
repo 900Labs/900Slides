@@ -39,6 +39,8 @@ export interface ParagraphStyleDto {
   heading?: HeadingLevelDto
   blockquote: boolean
   codeBlock: boolean
+  /** Stepped code highlighting ranges for a code block (e.g. '1-3|4|5,7'). */
+  codeStepRanges?: string
   indentLevel: number
 }
 
