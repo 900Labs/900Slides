@@ -54,6 +54,19 @@ const PLACEHOLDER_GUIDE_LABEL_SIZE: &str = "150000";
 /// CSS class tagging placeholder layout guide elements, so the editor can show
 /// them and export/presenter can hide them via CSS.
 const PLACEHOLDER_GUIDE_CLASS: &str = "layout-guide";
+/// Bundled SIL Open Font License sans family, embedded in the binary so
+/// rendered SVGs display identically in any viewer without external fonts.
+const INTER_REGULAR: &[u8] = include_bytes!("../fonts/Inter-Regular.ttf");
+/// Bundled SIL Open Font License serif family.
+const SOURCE_SERIF_REGULAR: &[u8] = include_bytes!("../fonts/SourceSerif4-Regular.ttf");
+/// Bundled SIL Open Font License monospace family.
+const JETBRAINS_MONO_REGULAR: &[u8] = include_bytes!("../fonts/JetBrainsMono-Regular.ttf");
+/// MIME type used for embedded TrueType font data URIs.
+const FONT_TTF_MIME: &str = "font/ttf";
+/// Background color applied to code lines in the active step.
+const CODE_STEP_HIGHLIGHT: &str = "#fff3cd";
+/// Opacity applied to code lines not in the active step (dimmed).
+const CODE_STEP_DIM_OPACITY: &str = "0.4";
 
 /// Options controlling the dimensions of a rendered slide.
 #[derive(Debug, Clone, PartialEq)]
@@ -175,7 +188,9 @@ pub fn render_slide(
     for (shape_index, shape) in slide.shapes.iter().enumerate() {
         let mut frag = String::new();
         match shape {
-            Shape::TextBox(text_box) => render_text_box(text_box, theme, &mut frag),
+            Shape::TextBox(text_box) => {
+                render_text_box(text_box, theme, opts.code_active_step, &mut frag)
+            }
             Shape::Passthrough(object) => render_passthrough(object, &mut frag),
             Shape::Image(image) => render_image(image, media, &mut frag),
             Shape::Geometric(geometric) => {
@@ -236,6 +251,9 @@ pub fn render_slide(
         h = fnum(height),
         fill = hex_color(&theme.background)
     ));
+    if opts.embed_fonts {
+        defs.push_str(&embedded_font_styles());
+    }
     if !defs.is_empty() {
         svg.push_str("<defs>");
         svg.push_str(&defs);
@@ -252,6 +270,43 @@ pub fn render_slide(
     let hash = hasher.finish();
 
     RenderedSlide { svg, hash }
+}
+
+/// Builds a single `@font-face` rule binding the CSS font-family `name` to the
+/// base64-encoded font `data`. The same font data can be bound under several
+/// names (aliases) so the theme's existing `font-family` attributes resolve to
+/// the bundled fonts without changing the render logic.
+fn font_face_css(name: &str, data: &[u8]) -> String {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(data);
+    format!(
+        "@font-face {{ font-family: '{name}'; src: url(data:{mime};base64,{b64}) format('truetype'); }}",
+        mime = FONT_TTF_MIME
+    )
+}
+
+/// Builds the `<style>` block of `@font-face` declarations for the three bundled
+/// fonts, including aliases for the common theme font-family names so existing
+/// `font-family` attributes resolve to the bundled families. Output is fully
+/// deterministic (fixed alias order, deterministic base64 encoding).
+fn embedded_font_styles() -> String {
+    // Sans family aliases -> bundled Inter.
+    const SANS_ALIASES: &[&str] = &["Inter", "Calibri", "Helvetica", "Verdana", "Arial"];
+    // Serif family aliases -> bundled Source Serif 4.
+    const SERIF_ALIASES: &[&str] = &["Source Serif 4", "Georgia"];
+    // Monospace family aliases -> bundled JetBrains Mono.
+    const MONO_ALIASES: &[&str] = &["JetBrains Mono", "Courier New", "Consolas"];
+    let mut css = String::from("<style>");
+    for name in SANS_ALIASES {
+        css.push_str(&font_face_css(name, INTER_REGULAR));
+    }
+    for name in SERIF_ALIASES {
+        css.push_str(&font_face_css(name, SOURCE_SERIF_REGULAR));
+    }
+    for name in MONO_ALIASES {
+        css.push_str(&font_face_css(name, JETBRAINS_MONO_REGULAR));
+    }
+    css.push_str("</style>");
+    css
 }
 
 /// Renders a chart by delegating to [`slides_chart::render_chart_svg`] and
@@ -380,8 +435,78 @@ fn push_dash_array(out: &mut String, dash: &DashStyle) {
     }
 }
 
+/// Render state of a code line relative to the active step.
+enum CodeStepState {
+    /// The line belongs to the active step and is highlighted.
+    Active,
+    /// The line is not in the active step (or in no step at all) and is dimmed.
+    Dimmed,
+    /// No stepping applies; the line renders normally.
+    Neutral,
+}
+
+/// Parses a stepped code range string (e.g. `"1-3|4|5,7"`) into one step per
+/// pipe-separated segment. Within a step, comma-separated entries are either a
+/// single line number (`"5"`) or an inclusive range (`"1-3"`). Whitespace is
+/// tolerated and malformed entries are skipped. An empty (or all-whitespace)
+/// input yields no steps.
+fn parse_code_steps(ranges: &str) -> Vec<Vec<std::ops::RangeInclusive<usize>>> {
+    let trimmed = ranges.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let mut steps = Vec::new();
+    for segment in trimmed.split('|') {
+        let mut step_ranges = Vec::new();
+        for entry in segment.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let range = match entry.split_once('-') {
+                Some((start, end)) => {
+                    match (start.trim().parse::<usize>(), end.trim().parse::<usize>()) {
+                        (Ok(start), Ok(end)) => start..=end,
+                        _ => continue,
+                    }
+                }
+                None => match entry.parse::<usize>() {
+                    Ok(n) => n..=n,
+                    Err(_) => continue,
+                },
+            };
+            step_ranges.push(range);
+        }
+        steps.push(step_ranges);
+    }
+    steps
+}
+
+/// Returns the render state for a 1-based `line` given a parsed `steps` table
+/// and the `active_step` index (0-based). When `steps` is empty no stepping
+/// applies. A line in the active step is [`CodeStepState::Active`]; otherwise it
+/// is [`CodeStepState::Dimmed`] (covering lines in other steps and lines in no
+/// step at all).
+fn line_step_state(
+    steps: &[Vec<std::ops::RangeInclusive<usize>>],
+    active_step: usize,
+    line: usize,
+) -> CodeStepState {
+    if steps.is_empty() {
+        return CodeStepState::Neutral;
+    }
+    let in_active = steps
+        .get(active_step)
+        .is_some_and(|ranges| ranges.iter().any(|r| r.contains(&line)));
+    if in_active {
+        CodeStepState::Active
+    } else {
+        CodeStepState::Dimmed
+    }
+}
+
 /// Renders a text box as a `<g>` containing one `<text>` per paragraph.
-fn render_text_box(text_box: &TextBox, theme: &Theme, out: &mut String) {
+fn render_text_box(text_box: &TextBox, theme: &Theme, code_active_step: usize, out: &mut String) {
     out.push_str("<g>");
     let base_x = text_box.frame.x + TEXT_PADDING_EMU;
     let line_height = TEXT_LINE_HEIGHT_EMU;
@@ -396,8 +521,29 @@ fn render_text_box(text_box: &TextBox, theme: &Theme, out: &mut String) {
             };
         let y = text_box.frame.y + line_height * (index as f64 + 1.0);
 
+        // Stepped-code highlighting applies only to code blocks carrying a
+        // non-empty `code_step_ranges`; everything else renders normally so old
+        // decks are byte-identical. Lines are 1-based by paragraph order.
+        let step_state = if style.code_block {
+            match &style.code_step_ranges {
+                Some(ranges) if !ranges.trim().is_empty() => {
+                    let steps = parse_code_steps(ranges);
+                    line_step_state(&steps, code_active_step, index + 1)
+                }
+                _ => CodeStepState::Neutral,
+            }
+        } else {
+            CodeStepState::Neutral
+        };
+        let highlight = matches!(step_state, CodeStepState::Active);
+        let dim = matches!(step_state, CodeStepState::Dimmed);
+
+        if dim {
+            out.push_str(&format!("<g opacity=\"{CODE_STEP_DIM_OPACITY}\">"));
+        }
+
         if style.code_block {
-            render_code_block_background(text_box, logical_x, y, line_height, out);
+            render_code_block_background(text_box, logical_x, y, line_height, highlight, out);
         }
 
         if style.blockquote {
@@ -421,6 +567,10 @@ fn render_text_box(text_box: &TextBox, theme: &Theme, out: &mut String) {
             push_run(run, out);
         }
         out.push_str("</text>");
+
+        if dim {
+            out.push_str("</g>");
+        }
     }
     out.push_str("</g>");
 }
@@ -461,24 +611,32 @@ fn heading_size(level: HeadingLevel) -> f64 {
     }
 }
 
-/// Renders a light background rectangle behind a code-block paragraph.
+/// Renders a light background rectangle behind a code-block paragraph. When
+/// `highlight` is true (the line is in the active code step) the highlight color
+/// is used instead of the default code background.
 fn render_code_block_background(
     text_box: &TextBox,
     logical_x: f64,
     y: f64,
     line_height: f64,
+    highlight: bool,
     out: &mut String,
 ) {
     let rect_x = logical_x - TEXT_PADDING_EMU / 2.0;
     let rect_y = y - line_height * 0.8;
     let width = text_box.frame.width - (logical_x - text_box.frame.x) - TEXT_PADDING_EMU / 2.0;
     let height = line_height;
+    let fill = if highlight {
+        CODE_STEP_HIGHLIGHT
+    } else {
+        CODE_BLOCK_BACKGROUND
+    };
     let rect_x = fnum(rect_x);
     let rect_y = fnum(rect_y);
     let width = fnum(width);
     let height = fnum(height);
     out.push_str(&format!(
-        "<rect x=\"{rect_x}\" y=\"{rect_y}\" width=\"{width}\" height=\"{height}\" fill=\"{CODE_BLOCK_BACKGROUND}\" stroke=\"none\"/>"
+        "<rect x=\"{rect_x}\" y=\"{rect_y}\" width=\"{width}\" height=\"{height}\" fill=\"{fill}\" stroke=\"none\"/>"
     ));
 }
 
@@ -2073,5 +2231,172 @@ mod tests {
         assert_eq!(out.svg.matches("<rect ").count(), 2);
         assert!(out.svg.contains("width=\"2000000\""));
         assert!(out.svg.contains("height=\"1000000\""));
+    }
+
+    /// Renders a slide with custom [`RenderOptions`].
+    fn render_opts(slide: &slides_core::Slide, opts: &RenderOptions) -> RenderedSlide {
+        render_slide(slide, &Theme::default(), &MediaStore::new(), opts)
+    }
+
+    /// Builds a single-line code-block paragraph with optional step ranges.
+    fn code_line(text: &str, ranges: Option<String>) -> Paragraph {
+        Paragraph {
+            runs: vec![Run::new(text)],
+            list_style: ListStyle::None,
+            style: ParagraphStyle {
+                code_block: true,
+                code_step_ranges: ranges,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Builds a text box at a fixed frame holding the given paragraphs.
+    fn text_box_with(paragraphs: Vec<Paragraph>) -> TextBox {
+        TextBox {
+            id: String::new(),
+            frame: rect(0.0, 0.0, 4_000_000.0, 2_000_000.0),
+            paragraphs,
+        }
+    }
+
+    #[test]
+    fn embed_fonts_true_includes_font_face() {
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::TextBox(TextBox {
+            id: String::new(),
+            frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
+            paragraphs: vec![Paragraph {
+                runs: vec![Run::new("hi")],
+                list_style: ListStyle::None,
+                ..Default::default()
+            }],
+        }));
+        let opts = RenderOptions {
+            embed_fonts: true,
+            ..RenderOptions::default()
+        };
+        let out = render_opts(&slide, &opts);
+        assert!(out.svg.contains("@font-face"), "must emit @font-face rules");
+        assert!(out.svg.contains("base64"), "must embed base64 font data");
+        assert!(
+            out.svg.contains("<defs>"),
+            "font styles must live in <defs>"
+        );
+        // Bundled families and the theme's default alias both resolve.
+        assert!(out.svg.contains("font-family: 'Inter'"));
+        assert!(out.svg.contains("font-family: 'Calibri'"));
+    }
+
+    #[test]
+    fn embed_fonts_false_no_font_data() {
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::TextBox(TextBox {
+            id: String::new(),
+            frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
+            paragraphs: vec![Paragraph {
+                runs: vec![Run::new("hi")],
+                list_style: ListStyle::None,
+                ..Default::default()
+            }],
+        }));
+        // Default opts: embed_fonts = false.
+        let out = render(&slide);
+        assert!(
+            !out.svg.contains("@font-face"),
+            "no @font-face when embed_fonts is false"
+        );
+        assert!(!out.svg.contains("base64"));
+    }
+
+    #[test]
+    fn parse_code_steps_simple() {
+        let steps = parse_code_steps("1-3|4|5,7");
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0], vec![1..=3]);
+        assert_eq!(steps[1], vec![4..=4]);
+        assert_eq!(steps[2], vec![5..=5, 7..=7]);
+    }
+
+    #[test]
+    fn parse_code_steps_empty() {
+        assert!(parse_code_steps("").is_empty());
+        assert!(parse_code_steps("   ").is_empty());
+    }
+
+    #[test]
+    fn code_step_highlight_active() {
+        let ranges = Some("1-3".to_string());
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::TextBox(text_box_with(vec![
+            code_line("line one", ranges.clone()),
+            code_line("line two", ranges.clone()),
+            code_line("line three", ranges.clone()),
+        ])));
+        let opts = RenderOptions {
+            code_active_step: 0,
+            ..RenderOptions::default()
+        };
+        let out = render_opts(&slide, &opts);
+        // All three lines are in the active step (1-3): highlighted.
+        assert!(
+            out.svg.contains(CODE_STEP_HIGHLIGHT),
+            "active step lines must carry the highlight background"
+        );
+        assert!(
+            !out.svg
+                .contains(&format!("opacity=\"{CODE_STEP_DIM_OPACITY}\"")),
+            "no dimming when every line is active"
+        );
+    }
+
+    #[test]
+    fn code_step_dim_non_active() {
+        // Step 0 = lines 1-2, step 1 = line 3. Active step 0 dims line 3.
+        let ranges = Some("1-2|3".to_string());
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::TextBox(text_box_with(vec![
+            code_line("line one", ranges.clone()),
+            code_line("line two", ranges.clone()),
+            code_line("line three", ranges.clone()),
+        ])));
+        let opts = RenderOptions {
+            code_active_step: 0,
+            ..RenderOptions::default()
+        };
+        let out = render_opts(&slide, &opts);
+        // Line three is not in the active step -> dimmed via an opacity group.
+        assert!(
+            out.svg
+                .contains(&format!("opacity=\"{CODE_STEP_DIM_OPACITY}\"")),
+            "non-active step lines must be dimmed"
+        );
+        // Lines one and two are active -> highlighted.
+        assert!(
+            out.svg.contains(CODE_STEP_HIGHLIGHT),
+            "active step lines must be highlighted"
+        );
+    }
+
+    #[test]
+    fn embed_fonts_deterministic() {
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::TextBox(TextBox {
+            id: String::new(),
+            frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
+            paragraphs: vec![Paragraph {
+                runs: vec![Run::new("hi")],
+                list_style: ListStyle::None,
+                ..Default::default()
+            }],
+        }));
+        let opts = RenderOptions {
+            embed_fonts: true,
+            ..RenderOptions::default()
+        };
+        let first = render_opts(&slide, &opts);
+        let second = render_opts(&slide, &opts);
+        assert_eq!(first.svg, second.svg);
+        assert_eq!(first.hash, second.hash);
     }
 }
