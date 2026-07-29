@@ -20,6 +20,10 @@ quick-xml = "0.36"
 base64 = "0.22"
 twox-hash = "1"
 image = "0.25"
+resvg = "0.42"
+usvg = "0.42"
+tiny-skia = "0.11"
+printpdf = "0.7"
 slides-core = { path = "crates/slides-core" }
 slides-animation = { path = "crates/slides-animation" }
 
