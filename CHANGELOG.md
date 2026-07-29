@@ -26,6 +26,23 @@ This section tracks work toward v0.2.0 (editor completeness). See
 
 ## [v0.4.0 — in progress]
 
+### Added — Wave 17 (local comments)
+
+- **Local comments**: threaded annotations anchored to slides, specific
+  shapes, or text ranges within a text box. Support reply, resolve, and
+  assignment. All stored locally.
+- New model types: `Comment`, `CommentThread`, `CommentAnchor` (slide /
+  shape / text-range variants). Additive `Deck.comments` field.
+- Five reversible commands: `AddComment`, `ReplyToComment`,
+  `SetCommentResolved`, `AssignComment`, `DeleteCommentThread`.
+- Comments persist in the 900Slides custom XML manifest and survive PPTX
+  round-trip. The CDATA section is split on `]]>` to prevent data
+  corruption from comment bodies containing that sequence.
+- Desktop **comments sidebar** (toggle `C`): lists threads grouped by slide,
+  reply, resolve, assign, delete. Context menu: "Add comment" on shapes,
+  "Comment on selection" on text ranges.
+- `docs/sprint-records/wave-17.md` documenting the wave scope.
+
 ### Added — Wave 16 (local version history)
 
 - Every save now creates a **content-addressed snapshot** (SHA-256 of the

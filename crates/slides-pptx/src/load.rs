@@ -7,10 +7,10 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::QName;
 use quick_xml::{Reader, Writer};
 use slides_core::{
-    BorderEdge, CellAlign, Color, Crop, DashStyle, Deck, Fill, GeometricShape, ImageShape, Link,
-    ListStyle, MediaEntry, MediaStore, Outline, Paragraph, ParagraphStyle, PassthroughObject, Rect,
-    Run, Shadow, Shape, Slide, Style, TableBorders, TableCell, TableError, TableRow, TableShape,
-    TextBox, Theme, Transform, VerticalAlign, MAX_TABLE_COLS, MAX_TABLE_ROWS,
+    BorderEdge, CellAlign, Color, CommentThread, Crop, DashStyle, Deck, Fill, GeometricShape,
+    ImageShape, Link, ListStyle, MediaEntry, MediaStore, Outline, Paragraph, ParagraphStyle,
+    PassthroughObject, Rect, Run, Shadow, Shape, Slide, Style, TableBorders, TableCell, TableError,
+    TableRow, TableShape, TextBox, Theme, Transform, VerticalAlign, MAX_TABLE_COLS, MAX_TABLE_ROWS,
 };
 
 use crate::chart::{is_chart_frame, parse_chart_frame};
@@ -299,6 +299,14 @@ pub fn load(bytes: &[u8]) -> Result<LoadResult> {
         .iter()
         .find(|r| r.rel_type == REL_TYPE_MANIFEST)
         .and_then(|r| r.resolve(""));
+
+    // Read the 900Slides manifest (if present) and parse any embedded comments.
+    // Decks without a manifest or a <comments> section load with empty comments.
+    if let Some(path) = &manifest_path {
+        if let Ok(xml) = read_entry_to_string(&mut archive, path) {
+            deck.comments = parse_manifest_comments(&xml);
+        }
+    }
 
     Ok(LoadResult {
         deck,
@@ -1809,6 +1817,66 @@ fn extract_id(xml: &str, fallback_index: usize) -> String {
 
 pub(crate) fn qname_str(q: QName) -> String {
     String::from_utf8_lossy(q.local_name().as_ref()).into_owned()
+}
+
+/// Extracts the `<comments>` payload from a 900Slides manifest and deserializes
+/// it back into [`CommentThread`]s. Returns an empty vec when the section is
+/// absent or cannot be parsed, so that old decks load with no comments.
+///
+/// The payload is a JSON array serialized by the saver and embedded either as a
+/// CDATA section or as escaped element text; both forms are handled here.
+fn parse_manifest_comments(xml: &str) -> Vec<CommentThread> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+    let mut in_comments = false;
+    let mut comments_depth: i32 = 0;
+    let mut content = String::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let local = qname_str(e.name());
+                if !in_comments && local == "comments" {
+                    in_comments = true;
+                    content.clear();
+                    comments_depth = 1;
+                } else if in_comments {
+                    comments_depth += 1;
+                }
+            }
+            Ok(Event::End(_)) => {
+                if in_comments {
+                    comments_depth -= 1;
+                    if comments_depth == 0 {
+                        return deserialize_comment_threads(&content);
+                    }
+                }
+            }
+            Ok(Event::Empty(e)) => {
+                if !in_comments && qname_str(e.name()) == "comments" {
+                    return Vec::new();
+                }
+            }
+            Ok(Event::Text(t)) if in_comments => {
+                content.push_str(&t.unescape().unwrap_or_default());
+            }
+            Ok(Event::CData(c)) if in_comments => {
+                content.push_str(&String::from_utf8_lossy(&c));
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    Vec::new()
+}
+
+fn deserialize_comment_threads(content: &str) -> Vec<CommentThread> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    serde_json::from_str(trimmed).unwrap_or_default()
 }
 
 pub(crate) fn attr_by_local_name(e: &BytesStart<'_>, name: &str) -> Option<String> {

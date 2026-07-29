@@ -1,6 +1,7 @@
 //! Deck model, commands, undo, theme.
 
 use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -48,6 +49,10 @@ pub struct Deck {
     /// Additive; old decks deserialize into an empty master.
     #[serde(default)]
     pub master: Master,
+    /// Threaded comments anchored to slides, shapes, or text ranges. Additive
+    /// and skipped when empty so old decks serialize unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub comments: Vec<CommentThread>,
 }
 
 impl Default for Deck {
@@ -64,6 +69,7 @@ impl Default for Deck {
             template: None,
             layouts: Vec::new(),
             master: Master::default(),
+            comments: Vec::new(),
         }
     }
 }
@@ -85,6 +91,16 @@ impl Deck {
     /// Returns a reference to the slide with the given id, if any.
     pub fn slide(&self, id: &str) -> Option<&Slide> {
         self.slides.iter().find(|s| s.id == id)
+    }
+
+    /// Returns a reference to the comment thread with the given id, if any.
+    pub fn comment_thread(&self, id: &str) -> Option<&CommentThread> {
+        self.comments.iter().find(|thread| thread.id == id)
+    }
+
+    /// Returns a mutable reference to the comment thread with the given id.
+    pub fn comment_thread_mut(&mut self, id: &str) -> Option<&mut CommentThread> {
+        self.comments.iter_mut().find(|thread| thread.id == id)
     }
 }
 
@@ -1789,6 +1805,122 @@ pub enum BuildEffect {
     Appear,
     /// Hide a shape that was already visible (opacity 1 -> 0).
     Disappear,
+}
+
+// ===== Local comments (Wave 17) ==============================================
+
+/// A single comment in a thread.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Comment {
+    /// Unique id (UUID without hyphens).
+    pub id: String,
+    /// Author name (free text; no account system).
+    pub author: String,
+    /// Comment body (plain text).
+    pub body: String,
+    /// ISO 8601 timestamp (UTC).
+    pub timestamp: String,
+    /// Whether this specific comment is marked resolved (only applies to
+    /// the thread root; replies inherit the thread's resolved state).
+    #[serde(default)]
+    pub resolved: bool,
+}
+
+/// A comment thread anchored to a target within the deck.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CommentThread {
+    /// Unique id (UUID without hyphens).
+    pub id: String,
+    /// Where this thread is anchored.
+    pub anchor: CommentAnchor,
+    /// The root comment + replies in chronological order.
+    pub comments: Vec<Comment>,
+    /// Optional assignee (free text name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned_to: Option<String>,
+    /// Whether the entire thread is resolved.
+    #[serde(default)]
+    pub resolved: bool,
+}
+
+/// Where a comment thread is anchored.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CommentAnchor {
+    /// Anchored to a whole slide.
+    Slide { slide_id: String },
+    /// Anchored to a specific shape (by id).
+    Shape { slide_id: String, shape_id: String },
+    /// Anchored to a text range within a specific text box.
+    TextRange {
+        slide_id: String,
+        shape_id: String,
+        /// Byte offsets into the text box's concatenated text.
+        start: usize,
+        end: usize,
+    },
+}
+
+impl CommentAnchor {
+    /// Returns the id of the slide this anchor refers to.
+    pub fn slide_id(&self) -> &str {
+        match self {
+            CommentAnchor::Slide { slide_id }
+            | CommentAnchor::Shape { slide_id, .. }
+            | CommentAnchor::TextRange { slide_id, .. } => slide_id,
+        }
+    }
+
+    /// Returns `true` if this anchor references a shape on the given slide and
+    /// (for text ranges) its offsets are well-formed. The caller is responsible
+    /// for first confirming the slide exists.
+    fn shape_is_valid(&self, slide: &Slide) -> bool {
+        match self {
+            CommentAnchor::Slide { .. } => true,
+            CommentAnchor::Shape { shape_id, .. } => {
+                slide.shapes.iter().any(|shape| shape.id() == shape_id)
+            }
+            CommentAnchor::TextRange {
+                shape_id,
+                start,
+                end,
+                ..
+            } => start <= end && slide.shapes.iter().any(|shape| shape.id() == shape_id),
+        }
+    }
+}
+
+/// Returns the current UTC time as an ISO 8601 string (`YYYY-MM-DDTHH:MM:SSZ`).
+///
+/// Implemented with the standard library only (no `chrono` dependency) using
+/// Howard Hinnant's civil-from-days algorithm to convert epoch seconds to a
+/// proleptic Gregorian date.
+fn iso8601_now() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86_400) as i64;
+    let secs_of_day = (secs % 86_400) as u32;
+
+    let z = days + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+
+    let hour = secs_of_day / 3600;
+    let minute = (secs_of_day % 3600) / 60;
+    let second = secs_of_day % 60;
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year, month, day, hour, minute, second
+    )
 }
 
 /// A reversible command that mutates a [`Deck`].
@@ -4520,6 +4652,443 @@ impl Command for SetSlideLayout {
             None => true,
             Some(name) => deck.layouts.iter().any(|layout| layout.name == *name),
         }
+    }
+}
+
+// ===== Comment commands (Wave 17) ============================================
+
+/// Creates a new comment thread anchored to a slide, shape, or text range,
+/// seeded with a single root comment.
+///
+/// The thread id and root comment id are generated (UUID, no hyphens) at
+/// construction time so [`Command::inverse`] can target the thread by id before
+/// [`Command::apply`] runs. Inverse: [`DeleteCommentThread`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AddComment {
+    anchor: CommentAnchor,
+    author: String,
+    body: String,
+    thread_id: String,
+    comment_id: String,
+}
+
+impl AddComment {
+    /// Creates a new add-comment command for `anchor`, authored by `author`.
+    pub fn new(anchor: CommentAnchor, author: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            anchor,
+            author: author.into(),
+            body: body.into(),
+            thread_id: Shape::generate_id(),
+            comment_id: Shape::generate_id(),
+        }
+    }
+}
+
+impl Command for AddComment {
+    fn apply(&self, deck: &mut Deck) {
+        let thread = CommentThread {
+            id: self.thread_id.clone(),
+            anchor: self.anchor.clone(),
+            comments: vec![Comment {
+                id: self.comment_id.clone(),
+                author: self.author.clone(),
+                body: self.body.clone(),
+                timestamp: iso8601_now(),
+                resolved: false,
+            }],
+            assigned_to: None,
+            resolved: false,
+        };
+        deck.comments.push(thread);
+    }
+
+    fn inverse(&self, _deck: &Deck) -> Box<dyn Command> {
+        Box::new(DeleteCommentThread::new(
+            self.thread_id.clone(),
+            self.anchor.slide_id().to_string(),
+        ))
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |string| string.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.anchor.slide_id().to_string()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        let Some(slide) = deck.slide(self.anchor.slide_id()) else {
+            return false;
+        };
+        self.anchor.shape_is_valid(slide)
+    }
+}
+
+/// Appends a reply to an existing comment thread.
+///
+/// The reply comment id is generated at construction time. Inverse:
+/// [`RemoveCommentReply`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplyToComment {
+    thread_id: String,
+    slide_id: String,
+    author: String,
+    body: String,
+    comment_id: String,
+}
+
+impl ReplyToComment {
+    /// Creates a new reply command for `thread_id` (which lives on `slide_id`).
+    pub fn new(
+        thread_id: impl Into<String>,
+        slide_id: impl Into<String>,
+        author: impl Into<String>,
+        body: impl Into<String>,
+    ) -> Self {
+        Self {
+            thread_id: thread_id.into(),
+            slide_id: slide_id.into(),
+            author: author.into(),
+            body: body.into(),
+            comment_id: Shape::generate_id(),
+        }
+    }
+}
+
+impl Command for ReplyToComment {
+    fn apply(&self, deck: &mut Deck) {
+        if let Some(thread) = deck.comment_thread_mut(&self.thread_id) {
+            thread.comments.push(Comment {
+                id: self.comment_id.clone(),
+                author: self.author.clone(),
+                body: self.body.clone(),
+                timestamp: iso8601_now(),
+                resolved: false,
+            });
+        }
+    }
+
+    fn inverse(&self, _deck: &Deck) -> Box<dyn Command> {
+        Box::new(RemoveCommentReply {
+            thread_id: self.thread_id.clone(),
+            slide_id: self.slide_id.clone(),
+            comment_id: self.comment_id.clone(),
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |string| string.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        deck.comment_thread(&self.thread_id).is_some()
+    }
+}
+
+/// Removes a single reply (by id) from a thread.
+///
+/// The inverse of [`ReplyToComment`]; not normally constructed by callers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RemoveCommentReply {
+    thread_id: String,
+    slide_id: String,
+    comment_id: String,
+}
+
+impl Command for RemoveCommentReply {
+    fn apply(&self, deck: &mut Deck) {
+        if let Some(thread) = deck.comment_thread_mut(&self.thread_id) {
+            thread
+                .comments
+                .retain(|comment| comment.id != self.comment_id);
+        }
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        let comment = deck
+            .comment_thread(&self.thread_id)
+            .and_then(|thread| thread.comments.iter().find(|c| c.id == self.comment_id))
+            .cloned()
+            .unwrap_or(Comment {
+                id: self.comment_id.clone(),
+                author: String::new(),
+                body: String::new(),
+                timestamp: String::new(),
+                resolved: false,
+            });
+        Box::new(RestoreCommentReply {
+            thread_id: self.thread_id.clone(),
+            slide_id: self.slide_id.clone(),
+            comment,
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |string| string.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        deck.comment_thread(&self.thread_id)
+            .is_some_and(|thread| thread.comments.iter().any(|c| c.id == self.comment_id))
+    }
+}
+
+/// Re-inserts a previously removed reply into a thread.
+///
+/// The inverse of [`RemoveCommentReply`]; not normally constructed by callers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RestoreCommentReply {
+    thread_id: String,
+    slide_id: String,
+    comment: Comment,
+}
+
+impl Command for RestoreCommentReply {
+    fn apply(&self, deck: &mut Deck) {
+        if let Some(thread) = deck.comment_thread_mut(&self.thread_id) {
+            thread.comments.push(self.comment.clone());
+        }
+    }
+
+    fn inverse(&self, _deck: &Deck) -> Box<dyn Command> {
+        Box::new(RemoveCommentReply {
+            thread_id: self.thread_id.clone(),
+            slide_id: self.slide_id.clone(),
+            comment_id: self.comment.id.clone(),
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |string| string.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        deck.comment_thread(&self.thread_id).is_some()
+    }
+}
+
+/// Sets the resolved flag of a comment thread. Inverse snapshots the prior
+/// value (reusing [`Self`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetCommentResolved {
+    thread_id: String,
+    slide_id: String,
+    resolved: bool,
+}
+
+impl SetCommentResolved {
+    /// Creates a new set-resolved command for `thread_id` (on `slide_id`).
+    pub fn new(thread_id: impl Into<String>, slide_id: impl Into<String>, resolved: bool) -> Self {
+        Self {
+            thread_id: thread_id.into(),
+            slide_id: slide_id.into(),
+            resolved,
+        }
+    }
+}
+
+impl Command for SetCommentResolved {
+    fn apply(&self, deck: &mut Deck) {
+        if let Some(thread) = deck.comment_thread_mut(&self.thread_id) {
+            thread.resolved = self.resolved;
+        }
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        let prior = deck
+            .comment_thread(&self.thread_id)
+            .is_some_and(|thread| thread.resolved);
+        Box::new(Self {
+            thread_id: self.thread_id.clone(),
+            slide_id: self.slide_id.clone(),
+            resolved: prior,
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |string| string.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        deck.comment_thread(&self.thread_id).is_some()
+    }
+}
+
+/// Sets or clears the assignee of a comment thread. Inverse snapshots the prior
+/// value (reusing [`Self`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssignComment {
+    thread_id: String,
+    slide_id: String,
+    assignee: Option<String>,
+}
+
+impl AssignComment {
+    /// Creates a new assign command for `thread_id` (on `slide_id`). Pass
+    /// `None` to clear the assignee.
+    pub fn new(
+        thread_id: impl Into<String>,
+        slide_id: impl Into<String>,
+        assignee: Option<String>,
+    ) -> Self {
+        Self {
+            thread_id: thread_id.into(),
+            slide_id: slide_id.into(),
+            assignee,
+        }
+    }
+}
+
+impl Command for AssignComment {
+    fn apply(&self, deck: &mut Deck) {
+        if let Some(thread) = deck.comment_thread_mut(&self.thread_id) {
+            thread.assigned_to = self.assignee.clone();
+        }
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        let prior = deck
+            .comment_thread(&self.thread_id)
+            .and_then(|thread| thread.assigned_to.clone());
+        Box::new(Self {
+            thread_id: self.thread_id.clone(),
+            slide_id: self.slide_id.clone(),
+            assignee: prior,
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |string| string.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        deck.comment_thread(&self.thread_id).is_some()
+    }
+}
+
+/// Removes a comment thread by id. Inverse: [`RestoreCommentThread`], which
+/// snapshots the removed thread and re-inserts it at its original position.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeleteCommentThread {
+    thread_id: String,
+    slide_id: String,
+}
+
+impl DeleteCommentThread {
+    /// Creates a new delete-thread command for `thread_id` (on `slide_id`).
+    pub fn new(thread_id: impl Into<String>, slide_id: impl Into<String>) -> Self {
+        Self {
+            thread_id: thread_id.into(),
+            slide_id: slide_id.into(),
+        }
+    }
+}
+
+impl Command for DeleteCommentThread {
+    fn apply(&self, deck: &mut Deck) {
+        deck.comments.retain(|thread| thread.id != self.thread_id);
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        let (index, thread) = deck
+            .comments
+            .iter()
+            .position(|thread| thread.id == self.thread_id)
+            .zip(deck.comment_thread(&self.thread_id).cloned())
+            .unwrap_or((
+                deck.comments.len(),
+                CommentThread {
+                    id: self.thread_id.clone(),
+                    anchor: CommentAnchor::Slide {
+                        slide_id: self.slide_id.clone(),
+                    },
+                    comments: Vec::new(),
+                    assigned_to: None,
+                    resolved: false,
+                },
+            ));
+        Box::new(RestoreCommentThread {
+            index,
+            slide_id: self.slide_id.clone(),
+            thread,
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |string| string.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        deck.comment_thread(&self.thread_id).is_some()
+    }
+}
+
+/// Re-inserts a previously removed comment thread at its original position.
+///
+/// The inverse of [`DeleteCommentThread`]; not normally constructed by callers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RestoreCommentThread {
+    index: usize,
+    slide_id: String,
+    thread: CommentThread,
+}
+
+impl Command for RestoreCommentThread {
+    fn apply(&self, deck: &mut Deck) {
+        if self.index <= deck.comments.len() {
+            deck.comments.insert(self.index, self.thread.clone());
+        }
+    }
+
+    fn inverse(&self, _deck: &Deck) -> Box<dyn Command> {
+        Box::new(DeleteCommentThread::new(
+            self.thread.id.clone(),
+            self.slide_id.clone(),
+        ))
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |string| string.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        self.index <= deck.comments.len() && deck.slide(self.slide_id()).is_some()
+    }
+}
+
+impl RestoreCommentThread {
+    fn slide_id(&self) -> &str {
+        self.thread.anchor.slide_id()
     }
 }
 
@@ -8249,5 +8818,458 @@ mod tests {
         }
         // The deck is otherwise valid.
         assert_eq!(restored.slides[0].shapes.len(), 3);
+    }
+
+    // ===== Comment tests (Wave 17) ===========================================
+
+    fn slide_with_shape(slide_id: &str, shape_id: &str) -> Slide {
+        slide_with(
+            slide_id,
+            vec![Shape::Geometric(GeometricShape {
+                id: shape_id.to_string(),
+                transform: Transform::default(),
+                geometry: Geometry::Rectangle,
+                style: Style::default(),
+            })],
+        )
+    }
+
+    fn root_comment(body: &str) -> Comment {
+        Comment {
+            id: Shape::generate_id(),
+            author: "Alice".to_string(),
+            body: body.to_string(),
+            timestamp: "2026-07-29T00:00:00Z".to_string(),
+            resolved: false,
+        }
+    }
+
+    fn thread_on_slide(slide_id: &str) -> CommentThread {
+        CommentThread {
+            id: Shape::generate_id(),
+            anchor: CommentAnchor::Slide {
+                slide_id: slide_id.to_string(),
+            },
+            comments: vec![root_comment("first")],
+            assigned_to: None,
+            resolved: false,
+        }
+    }
+
+    #[test]
+    fn old_deck_without_comments_deserializes() {
+        // A deck serialized before comments existed has no `comments` key.
+        // Build a valid deck in code, serialize it (the empty `comments` field
+        // is skipped), then prove the payload round-trips into a deck with an
+        // empty comments list.
+        let mut deck = Deck::new();
+        deck.id = "legacy".to_string();
+        deck.slides.push(slide_with("s1", Vec::new()));
+
+        let json = serde_json::to_string(&deck).expect("serialize deck");
+        assert!(
+            !json.contains("\"comments\""),
+            "an empty-comments deck must not emit a `comments` key"
+        );
+
+        let restored: Deck = serde_json::from_str(&json).expect("deserialize legacy deck");
+        assert!(restored.comments.is_empty());
+        assert_eq!(restored.id, "legacy");
+        assert_eq!(restored, deck);
+    }
+
+    #[test]
+    fn add_comment_creates_thread() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with("s1", Vec::new()));
+        let original = deck.clone();
+
+        let mut bus = CommandBus::default();
+        bus.apply(
+            Box::new(AddComment::new(
+                CommentAnchor::Slide {
+                    slide_id: "s1".to_string(),
+                },
+                "Alice",
+                "Hello world",
+            )),
+            &mut deck,
+        )
+        .expect("apply");
+
+        assert_eq!(deck.comments.len(), 1);
+        let thread = &deck.comments[0];
+        assert_eq!(thread.anchor.slide_id(), "s1");
+        assert_eq!(thread.comments.len(), 1);
+        assert_eq!(thread.comments[0].author, "Alice");
+        assert_eq!(thread.comments[0].body, "Hello world");
+        assert!(!thread.comments[0].resolved);
+        assert!(!thread.resolved);
+        assert!(thread.assigned_to.is_none());
+
+        assert_eq!(
+            AddComment::new(
+                CommentAnchor::Slide {
+                    slide_id: "s1".to_string(),
+                },
+                "Alice",
+                "Hello world",
+            )
+            .affected_slide_ids(),
+            vec!["s1".to_string()],
+        );
+
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn add_comment_validates_slide_and_shape() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with_shape("s1", "shape-1"));
+        let mut bus = CommandBus::default();
+
+        // Unknown slide → rejected.
+        assert_eq!(
+            bus.apply(
+                Box::new(AddComment::new(
+                    CommentAnchor::Slide {
+                        slide_id: "nope".to_string(),
+                    },
+                    "Alice",
+                    "x",
+                )),
+                &mut deck,
+            ),
+            Err(CommandError::InvalidCommand)
+        );
+
+        // Shape anchor referencing a missing shape → rejected.
+        assert_eq!(
+            bus.apply(
+                Box::new(AddComment::new(
+                    CommentAnchor::Shape {
+                        slide_id: "s1".to_string(),
+                        shape_id: "missing".to_string(),
+                    },
+                    "Alice",
+                    "x",
+                )),
+                &mut deck,
+            ),
+            Err(CommandError::InvalidCommand)
+        );
+
+        // Shape anchor with a real shape id → accepted.
+        bus.apply(
+            Box::new(AddComment::new(
+                CommentAnchor::Shape {
+                    slide_id: "s1".to_string(),
+                    shape_id: "shape-1".to_string(),
+                },
+                "Alice",
+                "on the shape",
+            )),
+            &mut deck,
+        )
+        .expect("valid shape anchor");
+        assert_eq!(deck.comments.len(), 1);
+    }
+
+    #[test]
+    fn add_comment_text_range_validates_offsets() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with_shape("s1", "shape-1"));
+        let mut bus = CommandBus::default();
+
+        // start > end → rejected.
+        assert_eq!(
+            bus.apply(
+                Box::new(AddComment::new(
+                    CommentAnchor::TextRange {
+                        slide_id: "s1".to_string(),
+                        shape_id: "shape-1".to_string(),
+                        start: 5,
+                        end: 2,
+                    },
+                    "Alice",
+                    "bad range",
+                )),
+                &mut deck,
+            ),
+            Err(CommandError::InvalidCommand)
+        );
+
+        // start <= end with a real shape → accepted.
+        bus.apply(
+            Box::new(AddComment::new(
+                CommentAnchor::TextRange {
+                    slide_id: "s1".to_string(),
+                    shape_id: "shape-1".to_string(),
+                    start: 2,
+                    end: 5,
+                },
+                "Alice",
+                "good range",
+            )),
+            &mut deck,
+        )
+        .expect("valid text range");
+        assert_eq!(deck.comments.len(), 1);
+    }
+
+    #[test]
+    fn reply_to_comment_appends_and_undoes() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with("s1", Vec::new()));
+        let thread = thread_on_slide("s1");
+        let thread_id = thread.id.clone();
+        deck.comments.push(thread);
+        let original = deck.clone();
+
+        let mut bus = CommandBus::default();
+        bus.apply(
+            Box::new(ReplyToComment::new(
+                thread_id.clone(),
+                "s1",
+                "Bob",
+                "a reply",
+            )),
+            &mut deck,
+        )
+        .expect("apply");
+
+        let thread = deck.comment_thread(&thread_id).expect("thread exists");
+        assert_eq!(thread.comments.len(), 2);
+        assert_eq!(thread.comments[1].author, "Bob");
+        assert_eq!(thread.comments[1].body, "a reply");
+
+        // Replying to an unknown thread is rejected.
+        assert_eq!(
+            bus.apply(
+                Box::new(ReplyToComment::new("missing", "s1", "Bob", "x")),
+                &mut deck,
+            ),
+            Err(CommandError::InvalidCommand)
+        );
+
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn set_comment_resolved_applies_and_undoes() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with("s1", Vec::new()));
+        let thread = thread_on_slide("s1");
+        let thread_id = thread.id.clone();
+        deck.comments.push(thread);
+        let original = deck.clone();
+
+        let mut bus = CommandBus::default();
+        bus.apply(
+            Box::new(SetCommentResolved::new(thread_id.clone(), "s1", true)),
+            &mut deck,
+        )
+        .expect("apply");
+        assert!(deck.comment_thread(&thread_id).expect("thread").resolved);
+
+        assert!(bus.undo(&mut deck).is_some());
+        assert!(!deck.comment_thread(&thread_id).expect("thread").resolved);
+        assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn assign_comment_applies_and_undoes() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with("s1", Vec::new()));
+        let thread = thread_on_slide("s1");
+        let thread_id = thread.id.clone();
+        deck.comments.push(thread);
+        let original = deck.clone();
+
+        let mut bus = CommandBus::default();
+        bus.apply(
+            Box::new(AssignComment::new(
+                thread_id.clone(),
+                "s1",
+                Some("Carol".to_string()),
+            )),
+            &mut deck,
+        )
+        .expect("apply");
+        assert_eq!(
+            deck.comment_thread(&thread_id).expect("thread").assigned_to,
+            Some("Carol".to_string())
+        );
+
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+
+        // Clearing an existing assignee is also reversible.
+        bus.apply(
+            Box::new(AssignComment::new(
+                thread_id.clone(),
+                "s1",
+                Some("Dan".to_string()),
+            )),
+            &mut deck,
+        )
+        .expect("assign");
+        bus.apply(
+            Box::new(AssignComment::new(thread_id.clone(), "s1", None)),
+            &mut deck,
+        )
+        .expect("clear");
+        assert!(deck
+            .comment_thread(&thread_id)
+            .expect("thread")
+            .assigned_to
+            .is_none());
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(
+            deck.comment_thread(&thread_id).expect("thread").assigned_to,
+            Some("Dan".to_string())
+        );
+    }
+
+    #[test]
+    fn delete_comment_thread_applies_and_undoes() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with("s1", Vec::new()));
+        let thread = thread_on_slide("s1");
+        let thread_id = thread.id.clone();
+        deck.comments.push(thread);
+        let original = deck.clone();
+
+        let mut bus = CommandBus::default();
+        bus.apply(
+            Box::new(DeleteCommentThread::new(thread_id.clone(), "s1")),
+            &mut deck,
+        )
+        .expect("apply");
+        assert!(deck.comments.is_empty());
+
+        // Deleting an unknown thread is rejected.
+        assert_eq!(
+            bus.apply(
+                Box::new(DeleteCommentThread::new("missing", "s1")),
+                &mut deck,
+            ),
+            Err(CommandError::InvalidCommand)
+        );
+
+        // Undo re-inserts the removed thread in full.
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+        assert_eq!(deck.comments.len(), 1);
+        assert_eq!(deck.comments[0].id, thread_id);
+        assert_eq!(deck.comments[0].comments.len(), 1);
+    }
+
+    #[test]
+    fn comment_thread_serialize_and_deserialize() {
+        let thread = CommentThread {
+            id: "t1".to_string(),
+            anchor: CommentAnchor::Shape {
+                slide_id: "s1".to_string(),
+                shape_id: "sh1".to_string(),
+            },
+            comments: vec![Comment {
+                id: "c1".to_string(),
+                author: "Alice".to_string(),
+                body: "hi".to_string(),
+                timestamp: "2026-07-29T12:00:00Z".to_string(),
+                resolved: false,
+            }],
+            assigned_to: Some("Bob".to_string()),
+            resolved: true,
+        };
+
+        let json = serde_json::to_string(&thread).expect("serialize thread");
+        let restored: CommentThread = serde_json::from_str(&json).expect("deserialize thread");
+        assert_eq!(thread, restored);
+
+        // The assigned_to field round-trips and resolved flags are kept.
+        assert!(json.contains("\"assigned_to\":\"Bob\""));
+        assert!(json.contains("\"resolved\":true"));
+    }
+
+    #[test]
+    fn comment_anchor_all_variants_serialize_correctly() {
+        let slide = CommentAnchor::Slide {
+            slide_id: "s1".to_string(),
+        };
+        let shape = CommentAnchor::Shape {
+            slide_id: "s1".to_string(),
+            shape_id: "sh1".to_string(),
+        };
+        let range = CommentAnchor::TextRange {
+            slide_id: "s1".to_string(),
+            shape_id: "sh1".to_string(),
+            start: 3,
+            end: 9,
+        };
+
+        // Tagged with `kind`; internally-tagged enums have no `value` wrapper.
+        let slide_json = serde_json::to_value(&slide).expect("serialize slide anchor");
+        assert_eq!(slide_json["kind"], "slide");
+        assert_eq!(slide_json["slide_id"], "s1");
+
+        let shape_json = serde_json::to_value(&shape).expect("serialize shape anchor");
+        assert_eq!(shape_json["kind"], "shape");
+        assert_eq!(shape_json["shape_id"], "sh1");
+
+        let range_json = serde_json::to_value(&range).expect("serialize range anchor");
+        assert_eq!(range_json["kind"], "text_range");
+        assert_eq!(range_json["start"], 3);
+        assert_eq!(range_json["end"], 9);
+
+        // Each variant round-trips.
+        assert_eq!(
+            serde_json::from_str::<CommentAnchor>(&serde_json::to_string(&slide).unwrap()).unwrap(),
+            slide
+        );
+        assert_eq!(
+            serde_json::from_str::<CommentAnchor>(&serde_json::to_string(&shape).unwrap()).unwrap(),
+            shape
+        );
+        assert_eq!(
+            serde_json::from_str::<CommentAnchor>(&serde_json::to_string(&range).unwrap()).unwrap(),
+            range
+        );
+    }
+
+    #[test]
+    fn deck_with_comments_round_trips() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with("s1", Vec::new()));
+        deck.comments.push(CommentThread {
+            id: "t1".to_string(),
+            anchor: CommentAnchor::Slide {
+                slide_id: "s1".to_string(),
+            },
+            comments: vec![Comment {
+                id: "c1".to_string(),
+                author: "Alice".to_string(),
+                body: "top-level".to_string(),
+                timestamp: "2026-07-29T08:30:00Z".to_string(),
+                resolved: false,
+            }],
+            assigned_to: None,
+            resolved: false,
+        });
+
+        let json = serde_json::to_string(&deck).expect("serialize deck");
+        let restored: Deck = serde_json::from_str(&json).expect("deserialize deck");
+        assert_eq!(deck, restored);
+        assert_eq!(restored.comments.len(), 1);
+        assert_eq!(restored.comments[0].id, "t1");
+
+        // An empty-comments deck serializes without a `comments` key.
+        let mut empty = deck.clone();
+        empty.comments.clear();
+        let empty_json = serde_json::to_string(&empty).expect("serialize empty");
+        assert!(!empty_json.contains("\"comments\""));
     }
 }
