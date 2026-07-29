@@ -293,6 +293,45 @@ export interface SlideSnapshot {
   animation?: AnimationDto
   /** Rich-text speaker notes, when present. When absent, plain notes are used. */
   richNotes?: ParagraphDto[]
+  /** Name of the layout (from the deck's layouts) this slide uses, if any. */
+  layoutRef?: string
+}
+
+/** A named placeholder frame, mirroring slides-core PlaceholderDef. */
+export interface PlaceholderDefDto {
+  name: string
+  frame: RectDto
+}
+
+/** A named layout variant, mirroring slides-core Layout. */
+export interface LayoutDto {
+  name: string
+  placeholders: PlaceholderDefDto[]
+}
+
+/** A background shape painted by a slide master, mirroring slides-core BackgroundShape. */
+export interface BackgroundShapeDto {
+  geometry: GeometryDto
+  style: StyleDto
+  transform: TransformDto
+}
+
+/** A slide master, mirroring slides-core Master. */
+export interface MasterDto {
+  backgroundShapes: BackgroundShapeDto[]
+  placeholders: PlaceholderDefDto[]
+}
+
+/** Summary of a built-in template for the picker, with a theme preview. */
+export interface TemplateInfoDto {
+  name: string
+  displayName: string
+  /** Theme background color as a CSS hex string (e.g. '#ffffff'). */
+  backgroundHex: string
+  /** Theme accent color as a CSS hex string. */
+  accentHex: string
+  headingFont: string
+  bodyFont: string
 }
 
 /** Media entry with bytes base64-encoded, keyed by media reference. */
@@ -311,6 +350,12 @@ export interface DeckSnapshot {
   id: string
   schemaVersion: number
   theme: ThemeSnapshot
+  /** Built-in template this deck is based on (e.g. 'default', 'pitch'), if any. */
+  template?: string
+  /** The deck's available layouts, derived from its template. */
+  layouts: LayoutDto[]
+  /** The deck's slide master: background layers and placeholder definitions. */
+  master: MasterDto
   /** Fixed slide dimensions (aspect ratio), when set. */
   slideSize?: SlideSizeDto
   /** Named slide sections, in slide order. */
