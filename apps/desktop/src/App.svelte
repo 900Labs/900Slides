@@ -10,6 +10,7 @@
   import RichNotesEditor from './RichNotesEditor.svelte'
   import FindReplace from './FindReplace.svelte'
   import ShortcutsDialog from './ShortcutsDialog.svelte'
+  import VersionHistory from './VersionHistory.svelte'
   import TemplatePicker from './TemplatePicker.svelte'
   import type {
     AnimationDto,
@@ -73,6 +74,8 @@
   let findReplaceMode = $state<'find' | 'replace'>('find')
   /** Whether the shortcuts dialog is open. */
   let showShortcuts = $state(false)
+  /** Whether the version-history panel is open. */
+  let showVersionHistory = $state(false)
   /** Slide-section start ids whose headers are collapsed in the sidebar. */
   let collapsedSections = $state<Set<string>>(new Set())
   /** Name being typed for a new slide section. */
@@ -321,6 +324,12 @@
   async function onUndo(): Promise<void> {
     deck = await invoke<DeckSnapshot>('undo')
     activeIndex = Math.min(activeIndex, (deck?.slides.length ?? 1) - 1)
+  }
+
+  /** Adopts a deck restored from version history (reversible via Undo). */
+  function onRestoreVersion(snapshot: DeckSnapshot): void {
+    deck = snapshot
+    activeIndex = Math.min(activeIndex, Math.max(snapshot.slides.length - 1, 0))
   }
 
   /** Opens the presenter window. */
@@ -1086,6 +1095,14 @@
         >
           Find
         </button>
+        <button
+          onclick={() => (showVersionHistory = true)}
+          type="button"
+          disabled={!deck}
+          title="Local version history"
+        >
+          History
+        </button>
         <span class="export-picker-wrap">
           <button
             onclick={() => (showExportMenu = !showExportMenu)}
@@ -1440,6 +1457,13 @@
 
     {#if showShortcuts}
       <ShortcutsDialog onClose={() => (showShortcuts = false)} />
+    {/if}
+
+    {#if showVersionHistory && deck}
+      <VersionHistory
+        onClose={() => (showVersionHistory = false)}
+        onRestore={onRestoreVersion}
+      />
     {/if}
 
     {#if showTemplatePicker}
