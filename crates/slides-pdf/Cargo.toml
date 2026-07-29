@@ -5,3 +5,12 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "PDF export and image-per-page import"
+
+[dependencies]
+slides-core = { path = "../slides-core" }
+slides-render = { path = "../slides-render" }
+image = { workspace = true }
+resvg = { workspace = true }
+usvg = { workspace = true }
+tiny-skia = { workspace = true }
+printpdf = { workspace = true }
