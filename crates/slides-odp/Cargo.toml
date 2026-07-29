@@ -5,3 +5,9 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "ODP import / export conversion boundary"
+
+[dependencies]
+slides-core = { workspace = true }
+zip = { workspace = true }
+quick-xml = { workspace = true }
+thiserror = { workspace = true }
