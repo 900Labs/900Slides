@@ -72,6 +72,13 @@ pub struct RenderOptions {
     /// guides above the master background and below the slide content.
     /// Defaults to empty so no guides are painted.
     pub layouts: Vec<Layout>,
+    /// When true, embeds bundled fonts as base64 `@font-face` declarations in
+    /// the SVG `<defs>` so the output renders identically in any viewer.
+    /// Defaults to false for editor performance; set true on export.
+    pub embed_fonts: bool,
+    /// Which code-step range is active (0-indexed) for stepped code
+    /// highlighting. Lines in the active step are highlighted; others dimmed.
+    pub code_active_step: usize,
 }
 
 impl Default for RenderOptions {
@@ -83,6 +90,8 @@ impl Default for RenderOptions {
             height_emu: 6_858_000.0,
             master: Master::default(),
             layouts: Vec::new(),
+            embed_fonts: false,
+            code_active_step: 0,
         }
     }
 }
