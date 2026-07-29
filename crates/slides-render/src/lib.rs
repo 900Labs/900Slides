@@ -182,10 +182,23 @@ pub fn render_slide(
             Shape::Chart(chart) => render_chart(chart, &mut frag),
         }
 
+        let shape_id = shape.id();
         if let Some((step_index, effect)) = build_map.get(&shape_index) {
+            let mut class = format!(
+                "build-{step_index} {}",
+                slides_animation::css_class(*effect)
+            );
+            if !shape_id.is_empty() {
+                class.push_str(" shape-");
+                class.push_str(&escape_xml(shape_id));
+            }
+            body.push_str(&format!("<g class=\"{class}\">"));
+            body.push_str(&frag);
+            body.push_str("</g>");
+        } else if !shape_id.is_empty() {
+            let escaped = escape_xml(shape_id);
             body.push_str(&format!(
-                "<g class=\"build-{step_index} {effect_class}\">",
-                effect_class = slides_animation::css_class(*effect)
+                "<g class=\"shape-{escaped}\" data-shape-id=\"{escaped}\">"
             ));
             body.push_str(&frag);
             body.push_str("</g>");
@@ -1392,6 +1405,36 @@ mod tests {
         let empty_out = render_with_master(&slide, &Master::default(), &[]);
         let default_out = render(&slide);
         assert_eq!(empty_out.svg, default_out.svg);
+    }
+
+    #[test]
+    fn shape_with_id_emits_data_attribute() {
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::TextBox(TextBox {
+            id: "abc123".to_string(),
+            frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
+            paragraphs: vec![],
+        }));
+        let out = render(&slide);
+        assert!(
+            out.svg.contains("data-shape-id=\"abc123\""),
+            "shape with id must carry data-shape-id"
+        );
+    }
+
+    #[test]
+    fn shape_without_id_emits_no_data_attribute() {
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::TextBox(TextBox {
+            id: String::new(),
+            frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
+            paragraphs: vec![],
+        }));
+        let out = render(&slide);
+        assert!(
+            !out.svg.contains("data-shape-id"),
+            "shape without id must not carry data-shape-id"
+        );
     }
 
     #[test]
