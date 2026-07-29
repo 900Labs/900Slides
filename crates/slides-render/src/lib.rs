@@ -671,7 +671,10 @@ fn render_layout_guides(
     let Some(layout_name) = slide.layout_ref.as_deref() else {
         return;
     };
-    let Some(layout) = layouts.iter().find(|candidate| candidate.name == layout_name) else {
+    let Some(layout) = layouts
+        .iter()
+        .find(|candidate| candidate.name == layout_name)
+    else {
         return;
     };
     // A layout may override the master's placeholders; when it has none of its
@@ -1281,7 +1284,9 @@ mod tests {
             background_shapes: vec![BackgroundShape {
                 geometry: slides_core::Geometry::Rectangle,
                 style: slides_core::Style {
-                    fill: Some(slides_core::Fill::Solid(slides_core::Color::rgb(26, 26, 46))),
+                    fill: Some(slides_core::Fill::Solid(slides_core::Color::rgb(
+                        26, 26, 46,
+                    ))),
                     ..Default::default()
                 },
                 transform: Transform {
@@ -1312,7 +1317,9 @@ mod tests {
             background_shapes: vec![BackgroundShape {
                 geometry: slides_core::Geometry::Rectangle,
                 style: slides_core::Style {
-                    fill: Some(slides_core::Fill::Solid(slides_core::Color::rgb(26, 26, 46))),
+                    fill: Some(slides_core::Fill::Solid(slides_core::Color::rgb(
+                        26, 26, 46,
+                    ))),
                     ..Default::default()
                 },
                 transform: Transform {
@@ -1333,8 +1340,10 @@ mod tests {
 
     #[test]
     fn placeholder_guides_render_for_matching_layout() {
-        let mut slide = slides_core::Slide::default();
-        slide.layout_ref = Some("Title and Content".to_string());
+        let slide = slides_core::Slide {
+            layout_ref: Some("Title and Content".to_string()),
+            ..slides_core::Slide::default()
+        };
         let master = Master::default();
         let layouts = vec![Layout {
             name: "Title and Content".to_string(),
