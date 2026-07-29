@@ -2,15 +2,22 @@
   import { invoke } from '@tauri-apps/api/core'
   import { emit } from '@tauri-apps/api/event'
   import SlideCanvas from './SlideCanvas.svelte'
-  import type { ColorDto, PresenterSettingsDto, PresenterState } from './lib/types'
+  import type {
+    ColorDto,
+    MorphFrameDto,
+    PresenterSettingsDto,
+    PresenterState,
+  } from './lib/types'
   import {
     PRESENTER_EVENTS,
     clamp01,
+    runMorph,
     slideRectFromStage,
     throttle,
     type BlankMode,
     type HighlighterStroke,
     type LaserPayload,
+    type MorphPayload,
     type SlideRect,
     type Vec2,
   } from './lib/presenter'
@@ -41,6 +48,12 @@
   let strokes = $state<HighlighterStroke[]>([])
   /** Whether a highlighter stroke is currently being drawn. */
   let drawing = $state(false)
+
+  /** Active Magic Move morph: the previous slide rendered as an overlay while
+   *  matching shapes interpolate between slides. */
+  let morph = $state<MorphPayload | null>(null)
+  /** Bound morph overlay root, used to locate its canvas during playback. */
+  let morphOverlayEl = $state<HTMLElement | null>(null)
 
   /** Lazily-created throttled event emitters (capped to ~30fps). */
   let emitLaser: ((payload: LaserPayload) => void) | null = null
@@ -87,6 +100,29 @@
   $effect(() => {
     void presenterState?.currentSlide.id
     if (stageEl) slideRect = slideRectFromStage(stageEl)
+  })
+
+  // When a morph is active and both canvases are rendered, drive the
+  // interpolation once, then clear the overlay.
+  $effect(() => {
+    const active = morph
+    const stage = stageEl
+    const overlayRoot = morphOverlayEl
+    if (!active || !stage || !overlayRoot) return
+    const base = stage.querySelector<HTMLElement>('.stage-content .canvas')
+    const overlay = overlayRoot.querySelector<HTMLElement>('.canvas')
+    if (!base || !overlay) return
+    let cancelled = false
+    const handle = window.requestAnimationFrame(() => {
+      if (cancelled) return
+      void runMorph(base, overlay, active.frames, active.durationMs).then(() => {
+        if (!cancelled) morph = null
+      })
+    })
+    return () => {
+      cancelled = true
+      cancelAnimationFrame(handle)
+    }
   })
 
   /** Refreshes presenter state from the backend. */
@@ -137,11 +173,41 @@
       broadcastBuildStep()
       return
     }
+    // A Magic Move transition belongs to the slide being entered. Compute the
+    // interpolation frames before advancing so the morph plays as soon as the
+    // incoming slide renders (no flash of the settled next slide).
+    const upcoming = presenterState.nextSlide
+    const isMorph = upcoming?.transition?.kind === 'morph'
+    const prevSlide = presenterState.currentSlide
+    let frames: MorphFrameDto[] = []
+    if (isMorph && upcoming) {
+      try {
+        frames = await invoke<MorphFrameDto[]>('compute_morph', {
+          prevSlideId: prevSlide.id,
+          nextSlideId: upcoming.id,
+        })
+      } catch {
+        frames = []
+      }
+    }
     const result = await invoke<PresenterState>('presenter_next')
-    if (result.slideNumber !== presenterState.slideNumber) {
-      presenterState = result
+    if (result.slideNumber === presenterState.slideNumber) return
+    presenterState = result
+    clearStrokes()
+    if (isMorph && frames.length > 0 && result.currentSlide) {
+      // Show the incoming slide fully built so every shape can interpolate.
+      activeBuildStep = Infinity
+      broadcastState()
+      const payload: MorphPayload = {
+        prev: prevSlide,
+        frames,
+        durationMs: result.currentSlide.transition?.durationMs ?? 500,
+      }
+      morph = payload
+      // Mirror the morph to the audience window, which renders the same overlay.
+      void emit(PRESENTER_EVENTS.morph, payload)
+    } else {
       activeBuildStep = -1
-      clearStrokes()
       broadcastState()
     }
   }
@@ -387,6 +453,19 @@
         </div>
       {/key}
 
+      {#if morph}
+        <div class="morph-overlay" bind:this={morphOverlayEl} aria-hidden="true">
+          <SlideCanvas
+            slide={morph.prev}
+            background={{ r: 255, g: 255, b: 255, a: 0 }}
+            media={presenterState.media}
+            slideSize={presenterState.slideSize}
+            highContrast={presenterState.highContrast}
+            readonly
+          />
+        </div>
+      {/if}
+
       {#if slideRect && strokes.length > 0}
         <svg
           class="overlay highlighter-overlay"
@@ -615,6 +694,18 @@
   }
   .stage-content.transition-wipe {
     animation: transition-wipe var(--transition-duration, 500ms) ease forwards;
+  }
+  .morph-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 5;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+  }
+  .morph-overlay :global(.canvas) {
+    box-shadow: none;
   }
   @keyframes transition-fade {
     from {

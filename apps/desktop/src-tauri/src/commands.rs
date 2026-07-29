@@ -431,6 +431,8 @@ pub enum TransitionKindDto {
     Push,
     /// Wipe reveal.
     Wipe,
+    /// Magic Move: interpolate matching shapes between adjacent slides.
+    Morph,
 }
 
 /// Snapshot of an ordered build-in animation sequence.
@@ -495,6 +497,9 @@ pub enum ShapeSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChartShapeSnapshot {
+    /// Stable shape id used for cross-slide morph matching (empty when unset).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
     /// Position, size, and rotation of the chart.
     pub transform: TransformDto,
     /// Kind of chart.
@@ -576,6 +581,9 @@ pub struct XYPointDto {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageShapeSnapshot {
+    /// Stable shape id used for cross-slide morph matching (empty when unset).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
     /// Position, size, and rotation of the image.
     pub transform: TransformDto,
     /// Key of this image's bytes in the deck media store.
@@ -588,6 +596,9 @@ pub struct ImageShapeSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GeometricShapeSnapshot {
+    /// Stable shape id used for cross-slide morph matching (empty when unset).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
     /// Position, size, and rotation of the shape.
     pub transform: TransformDto,
     /// Primitive geometry of the shape.
@@ -672,6 +683,9 @@ pub struct TableRowDto {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TableShapeSnapshot {
+    /// Stable shape id used for cross-slide morph matching (empty when unset).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
     /// Position, size, and rotation of the table.
     pub transform: TransformDto,
     /// Rows, top to bottom.
@@ -816,6 +830,9 @@ pub struct MediaEntryDto {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TextBoxSnapshot {
+    /// Stable shape id used for cross-slide morph matching (empty when unset).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
     /// Bounding rectangle in EMU.
     pub frame: RectDto,
     /// Paragraphs inside the text box.
@@ -972,6 +989,41 @@ pub struct MisspellingDto {
     pub byte_start: usize,
     /// Exclusive byte offset of the token within the checked text.
     pub byte_end: usize,
+}
+
+/// Interpolatable transform state for a morph, mirroring
+/// [`slides_animation::MorphTransform`]. Coordinates are in EMU; rotation is in
+/// degrees around the frame center.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MorphTransformDto {
+    /// Horizontal position, in EMU.
+    pub x: f64,
+    /// Vertical position, in EMU.
+    pub y: f64,
+    /// Width, in EMU.
+    pub width: f64,
+    /// Height, in EMU.
+    pub height: f64,
+    /// Rotation around the frame center, in degrees.
+    pub rotation: f64,
+}
+
+/// One shape's morph interpolation between two adjacent slides, mirroring
+/// [`slides_animation::MorphFrame`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MorphFrameDto {
+    /// The shape id being morphed (present on at least one of the two slides).
+    pub shape_id: String,
+    /// Source transform on the previous slide. `None` when the shape is new on
+    /// the next slide (fade-in).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<MorphTransformDto>,
+    /// Target transform on the next slide. `None` when the shape is being
+    /// removed (fade-out).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<MorphTransformDto>,
 }
 
 /// State returned to the presenter window.
@@ -1378,6 +1430,7 @@ pub fn add_shape(
         .map(style_to_core)
         .unwrap_or_else(|| default_shape_style(&session.deck().theme));
     let shape = slides_core::Shape::Geometric(slides_core::GeometricShape {
+        id: slides_core::Shape::generate_id(),
         transform: centered_transform(0, 0),
         geometry,
         style: core_style,
@@ -2069,6 +2122,30 @@ pub fn get_loss_ledger(state: State<'_, AppState>) -> Option<Vec<WarningDto>> {
     })
 }
 
+/// Computes the morph timeline for a Magic Move transition from `prev_slide_id`
+/// to `next_slide_id`.
+///
+/// Matches shapes by stable id and returns one [`MorphFrameDto`] per matched
+/// shape: interpolating shapes carry both `from` and `to`, new shapes carry
+/// only `to` (fade-in), and removed shapes carry only `from` (fade-out). The
+/// presenter applies CSS transitions to the matching `data-shape-id` elements.
+#[tauri::command]
+pub fn compute_morph(
+    prev_slide_id: String,
+    next_slide_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<MorphFrameDto>, String> {
+    let guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_ref().ok_or("no deck is open")?;
+    let deck = session.deck();
+    let prev = deck
+        .slide(&prev_slide_id)
+        .ok_or("previous slide not found")?;
+    let next = deck.slide(&next_slide_id).ok_or("next slide not found")?;
+    let frames = slides_animation::morph_timeline(prev, next);
+    Ok(frames.into_iter().map(morph_frame_to_dto).collect())
+}
+
 /// Opens the dual-display presenter: a presenter control window and a
 /// separate fullscreen audience window, both driven from the current deck.
 ///
@@ -2519,8 +2596,10 @@ fn slide_to_dto(slide: &slides_core::Slide) -> SlideSnapshot {
 }
 
 fn shape_to_dto(shape: &slides_core::Shape) -> ShapeSnapshot {
+    let id = shape.id().to_string();
     match shape {
         slides_core::Shape::TextBox(tb) => ShapeSnapshot::TextBox(TextBoxSnapshot {
+            id,
             frame: rect_to_dto(tb.frame),
             paragraphs: tb.paragraphs.iter().map(paragraph_to_dto).collect(),
         }),
@@ -2531,12 +2610,14 @@ fn shape_to_dto(shape: &slides_core::Shape) -> ShapeSnapshot {
             frame: obj.frame.map(rect_to_dto),
         }),
         slides_core::Shape::Image(image) => ShapeSnapshot::Image(ImageShapeSnapshot {
+            id,
             transform: transform_to_dto(image.transform),
             media_ref: image.media_ref.clone(),
             crop: image.crop.as_ref().map(crop_to_dto),
         }),
         slides_core::Shape::Geometric(geometric) => {
             ShapeSnapshot::Geometric(GeometricShapeSnapshot {
+                id,
                 transform: transform_to_dto(geometric.transform),
                 geometry: geometry_to_dto(geometric.geometry),
                 style: style_to_dto(&geometric.style),
@@ -2917,6 +2998,7 @@ fn table_row_to_dto(row: &slides_core::TableRow) -> TableRowDto {
 
 fn table_to_dto(table: &slides_core::TableShape) -> TableShapeSnapshot {
     TableShapeSnapshot {
+        id: table.id.clone(),
         transform: transform_to_dto(table.transform),
         rows: table.rows.iter().map(table_row_to_dto).collect(),
         column_widths: table.column_widths.clone(),
@@ -2927,6 +3009,7 @@ fn table_to_dto(table: &slides_core::TableShape) -> TableShapeSnapshot {
 
 fn chart_to_dto(chart: &slides_core::ChartShape) -> ChartShapeSnapshot {
     ChartShapeSnapshot {
+        id: chart.id.clone(),
         transform: transform_to_dto(chart.transform),
         chart_type: chart_type_to_dto(chart.chart_type),
         data: chart_data_to_dto(&chart.data),
@@ -3026,6 +3109,7 @@ fn transition_kind_to_dto(kind: slides_core::TransitionKind) -> TransitionKindDt
         slides_core::TransitionKind::Slide => TransitionKindDto::Slide,
         slides_core::TransitionKind::Push => TransitionKindDto::Push,
         slides_core::TransitionKind::Wipe => TransitionKindDto::Wipe,
+        slides_core::TransitionKind::Morph => TransitionKindDto::Morph,
     }
 }
 
@@ -3036,6 +3120,7 @@ fn transition_kind_from_dto(dto: TransitionKindDto) -> slides_core::TransitionKi
         TransitionKindDto::Slide => slides_core::TransitionKind::Slide,
         TransitionKindDto::Push => slides_core::TransitionKind::Push,
         TransitionKindDto::Wipe => slides_core::TransitionKind::Wipe,
+        TransitionKindDto::Morph => slides_core::TransitionKind::Morph,
     }
 }
 
@@ -3187,6 +3272,24 @@ fn warning_to_dto(warning: &slides_pptx::LossWarning) -> WarningDto {
     WarningDto {
         slide_id: warning.slide_id.clone(),
         message: warning.message.clone(),
+    }
+}
+
+fn morph_frame_to_dto(frame: slides_animation::MorphFrame) -> MorphFrameDto {
+    MorphFrameDto {
+        shape_id: frame.shape_id,
+        from: frame.from.map(morph_transform_to_dto),
+        to: frame.to.map(morph_transform_to_dto),
+    }
+}
+
+fn morph_transform_to_dto(transform: slides_animation::MorphTransform) -> MorphTransformDto {
+    MorphTransformDto {
+        x: transform.x,
+        y: transform.y,
+        width: transform.width,
+        height: transform.height,
+        rotation: transform.rotation,
     }
 }
 

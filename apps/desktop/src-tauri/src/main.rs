@@ -55,6 +55,7 @@ fn main() {
             commands::set_slide_layout,
             commands::list_templates,
             commands::render_slide_svg,
+            commands::compute_morph,
             commands::undo,
             commands::get_loss_ledger,
             commands::start_presenter,
