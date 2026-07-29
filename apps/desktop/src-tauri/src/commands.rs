@@ -921,6 +921,10 @@ pub struct ParagraphStyleDto {
     /// Whether this paragraph is a fenced code block.
     #[serde(default)]
     pub code_block: bool,
+    /// Stepped code highlighting ranges (e.g. "1-3|4|5,7") for a code block.
+    /// `None` means no stepping applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_step_ranges: Option<String>,
     /// Indentation level of the paragraph.
     #[serde(default)]
     pub indent_level: u32,
@@ -1956,12 +1960,17 @@ pub fn move_build_step(
 /// enabled, a high-contrast palette (black background, white text, yellow
 /// accents) overrides the theme before rendering.
 #[tauri::command]
-pub fn render_slide_svg(slide_id: String, state: State<'_, AppState>) -> Result<String, String> {
+pub fn render_slide_svg(
+    slide_id: String,
+    code_active_step: Option<usize>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
     let guard = state.session.lock().map_err(|e| e.to_string())?;
     let session = guard.as_ref().ok_or("no deck is open")?;
     let deck = session.deck();
     let slide = deck.slide(&slide_id).ok_or("slide not found")?;
-    let opts = render_options(deck);
+    let mut opts = render_options(deck);
+    opts.code_active_step = code_active_step.unwrap_or(0);
     let theme = high_contrast_theme(deck);
     let rendered = slides_render::render_slide(slide, &theme, &deck.media, &opts);
     Ok(rendered.svg)
@@ -1984,7 +1993,7 @@ pub fn export_svg(
         let session = guard.as_ref().ok_or("no deck is open")?;
         let deck = session.deck();
         let slide = deck.slide(&slide_id).ok_or("slide not found")?;
-        let opts = render_options(deck);
+        let opts = render_options_export(deck);
         let theme = high_contrast_theme(deck);
         slides_pdf::export_slide_svg(slide, &theme, &deck.media, &opts)
     };
@@ -2010,7 +2019,7 @@ pub fn export_png(
         let session = guard.as_ref().ok_or("no deck is open")?;
         let deck = session.deck();
         let slide = deck.slide(&slide_id).ok_or("slide not found")?;
-        let opts = render_options(deck);
+        let opts = render_options_export(deck);
         let theme = high_contrast_theme(deck);
         slides_pdf::export_slide_png(slide, &theme, &deck.media, &opts, scale)
             .map_err(|e| e.to_string())?
@@ -2031,7 +2040,7 @@ pub fn export_pdf(file_path: String, state: State<'_, AppState>) -> Result<(), S
         let guard = state.session.lock().map_err(|e| e.to_string())?;
         let session = guard.as_ref().ok_or("no deck is open")?;
         let deck = session.deck();
-        let opts = render_options(deck);
+        let opts = render_options_export(deck);
         slides_pdf::export_deck_pdf(deck, &opts).map_err(|e| e.to_string())?
     };
     fs::write(&file_path, bytes).map_err(|e| e.to_string())?;
@@ -2050,6 +2059,15 @@ fn render_options(deck: &slides_core::Deck) -> slides_render::RenderOptions {
     } else {
         slides_render::RenderOptions::default()
     }
+}
+
+/// Builds render options for an export: identical to the editor preview, but
+/// with bundled fonts embedded so exported files render identically on any
+/// platform. The live editor preview keeps `embed_fonts: false` for speed.
+fn render_options_export(deck: &slides_core::Deck) -> slides_render::RenderOptions {
+    let mut opts = render_options(deck);
+    opts.embed_fonts = true;
+    opts
 }
 
 /// Returns the theme to render with. When high-contrast is enabled, returns an
@@ -3265,6 +3283,7 @@ fn paragraph_style_to_dto(style: &slides_core::ParagraphStyle) -> ParagraphStyle
         }),
         blockquote: style.blockquote,
         code_block: style.code_block,
+        code_step_ranges: style.code_step_ranges.clone(),
         indent_level: style.indent_level,
     }
 }
@@ -3335,6 +3354,7 @@ fn paragraph_style_to_core(style: &ParagraphStyleDto) -> slides_core::ParagraphS
         }),
         blockquote: style.blockquote,
         code_block: style.code_block,
+        code_step_ranges: style.code_step_ranges.clone(),
         indent_level: style.indent_level,
     }
 }

@@ -21,6 +21,7 @@
     type SlideRect,
     type Vec2,
   } from './lib/presenter'
+  import { codeStepCount } from './lib/codeSteps'
 
   /** Presenter view state from Rust. */
   let presenterState = $state<PresenterState | null>(null)
@@ -30,6 +31,8 @@
   let timer = $state<ReturnType<typeof setInterval> | null>(null)
   /** Current build step index within the current slide; -1 = before first step. */
   let activeBuildStep = $state<number>(Infinity)
+  /** Current code-step index (0-based) for stepped code highlighting. */
+  let activeCodeStep = $state<number>(0)
 
   /** Bound main slide stage element, used for coordinate mapping and overlays. */
   let stageEl = $state<HTMLElement | null>(null)
@@ -130,6 +133,7 @@
     presenterState = await invoke<PresenterState>('get_presenter_state')
     if (presenterState) {
       activeBuildStep = Infinity
+      activeCodeStep = 0
       laserOn = presenterState.presenterSettings.laserPointer
       highlighterOn = presenterState.presenterSettings.highlighter
     }
@@ -145,16 +149,27 @@
     return presenterState?.presenterSettings.highlighterColor ?? '#ffff00'
   }
 
-  /** Broadcasts the full presenter state and build step to the audience window. */
+  /** Broadcasts the full presenter state, build step, and code step. */
   function broadcastState(): void {
     if (!presenterState) return
     void emit(PRESENTER_EVENTS.state, presenterState)
     void emit(PRESENTER_EVENTS.buildStep, { step: activeBuildStep })
+    void emit(PRESENTER_EVENTS.codeStep, { step: activeCodeStep })
   }
 
   /** Broadcasts only the build-step index. */
   function broadcastBuildStep(): void {
     void emit(PRESENTER_EVENTS.buildStep, { step: activeBuildStep })
+  }
+
+  /** Broadcasts only the active code-step index. */
+  function broadcastCodeStep(): void {
+    void emit(PRESENTER_EVENTS.codeStep, { step: activeCodeStep })
+  }
+
+  /** Number of stepped code steps on the current slide (0 if none). */
+  function currentCodeStepCount(): number {
+    return codeStepCount(presenterState?.currentSlide)
   }
 
   /** Clears highlighter strokes locally and on the audience window. */
@@ -166,6 +181,15 @@
   /** Advances the build timeline or moves to the next slide. */
   async function next(): Promise<void> {
     if (!presenterState) return
+    // Stepped code highlighting advances first (like build steps, but for
+    // code). Each click moves to the next code step before builds or the next
+    // slide.
+    const codeCount = currentCodeStepCount()
+    if (codeCount > 0 && activeCodeStep < codeCount - 1) {
+      activeCodeStep += 1
+      broadcastCodeStep()
+      return
+    }
     const steps = presenterState.currentSlide.animation?.steps ?? []
     const maxStep = steps.length - 1
     if (activeBuildStep < maxStep) {
@@ -197,6 +221,7 @@
     if (isMorph && frames.length > 0 && result.currentSlide) {
       // Show the incoming slide fully built so every shape can interpolate.
       activeBuildStep = Infinity
+      activeCodeStep = 0
       broadcastState()
       const payload: MorphPayload = {
         prev: prevSlide,
@@ -208,6 +233,7 @@
       void emit(PRESENTER_EVENTS.morph, payload)
     } else {
       activeBuildStep = -1
+      activeCodeStep = 0
       broadcastState()
     }
   }
@@ -219,6 +245,7 @@
     if (result.slideNumber !== presenterState.slideNumber) {
       presenterState = result
       activeBuildStep = Infinity
+      activeCodeStep = 0
       clearStrokes()
       broadcastState()
     }
@@ -233,6 +260,7 @@
     }
     if (presenterState) {
       activeBuildStep = Infinity
+      activeCodeStep = 0
       clearStrokes()
       broadcastState()
     }
@@ -247,6 +275,7 @@
     }
     if (presenterState) {
       activeBuildStep = Infinity
+      activeCodeStep = 0
       clearStrokes()
       broadcastState()
     }
@@ -449,6 +478,7 @@
             highContrast={presenterState.highContrast}
             readonly
             activeBuildStep={activeBuildStep}
+            codeActiveStep={activeCodeStep}
           />
         </div>
       {/key}
@@ -559,6 +589,12 @@
         <span class="timer">{formatTime(elapsed)}</span>
       </div>
 
+      {#if currentCodeStepCount() > 0}
+        <div class="code-step-indicator" aria-label="Active code step">
+          Code {activeCodeStep + 1} / {currentCodeStepCount()}
+        </div>
+      {/if}
+
       <div class="notes" aria-label="Speaker notes">
         {presenterState.notes || 'No notes'}
       </div>
@@ -662,6 +698,16 @@
     display: flex;
     justify-content: space-between;
     font-size: 1.5rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .code-step-indicator {
+    align-self: flex-start;
+    padding: 0.2rem 0.5rem;
+    background: #3a2f00;
+    border: 1px solid #997a00;
+    border-radius: 4px;
+    color: #ffd95e;
+    font-size: 0.85rem;
     font-variant-numeric: tabular-nums;
   }
   .notes {

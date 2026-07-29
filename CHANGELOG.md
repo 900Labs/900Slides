@@ -19,9 +19,29 @@ This section tracks work toward v0.2.0 (editor completeness). See
 [`docs/sprint-records/wave-8.md`](docs/sprint-records/wave-8.md), and
 [`docs/sprint-records/wave-9.md`](docs/sprint-records/wave-9.md),
 [`docs/sprint-records/wave-10.md`](docs/sprint-records/wave-10.md), and
-[`docs/sprint-records/wave-11.md`](docs/sprint-records/wave-11.md).
+[`docs/sprint-records/wave-11.md`](docs/sprint-records/wave-11.md), and
+[`docs/sprint-records/wave-12.md`](docs/sprint-records/wave-12.md).
 
 ## [v0.3.0 — in progress]
+
+### Added — Wave 12 (bundled fonts + stepped code highlighting)
+
+- **Bundled open-licensed fonts**: Inter (sans), Source Serif 4 (serif),
+  and JetBrains Mono (mono) are embedded in the binary via
+  `include_bytes!`. When exporting (SVG, PNG, PDF), the fonts are embedded
+  as base64 `@font-face` declarations so files render identically on any
+  platform. The live editor preview keeps fonts unembedded for performance.
+  Font aliases map common names (Calibri, Helvetica, Georgia, Courier New,
+  etc.) to the bundled equivalents.
+- **Stepped code highlighting**: code blocks support `1-3|4|5,7` style step
+  ranges. Each pipe-separated segment is one click step; the active step's
+  lines are highlighted and others dimmed. `ParagraphStyle.code_step_ranges`
+  stores the range string (additive, `#[serde(default)]`). The presenter
+  advances through code steps on click.
+- Desktop: code step range editor in the toolbar (for code-block
+  paragraphs), presenter code-step slider, and font-enabled export.
+- `docs/sprint-records/wave-12.md` documenting the wave scope and acceptance
+  criteria.
 
 ### Added — Wave 11 (export formats)
 

@@ -1405,6 +1405,11 @@ pub struct ParagraphStyle {
     /// Whether this paragraph is a fenced code block.
     #[serde(default)]
     pub code_block: bool,
+    /// Stepped code highlighting ranges (e.g. "1-3|4|5,7"). Each pipe-separated
+    /// segment is one step; comma-separated entries within a segment are
+    /// simultaneous. `None` or empty means no stepping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_step_ranges: Option<String>,
     /// Indentation level of the paragraph.
     #[serde(default)]
     pub indent_level: u32,
@@ -5253,6 +5258,7 @@ mod tests {
                 heading: Some(HeadingLevel::H2),
                 blockquote: true,
                 code_block: true,
+                code_step_ranges: None,
                 indent_level: 2,
             },
         };

@@ -18,6 +18,8 @@
   let presenterState = $state<PresenterState | null>(null)
   /** Build-step index synced from the control window. */
   let activeBuildStep = $state<number>(Infinity)
+  /** Active code-step index synced from the control window. */
+  let activeCodeStep = $state<number>(0)
   /** Mirrored laser dot (null when hidden). */
   let laser = $state<LaserPayload | null>(null)
   /** Mirrored highlighter strokes. */
@@ -56,6 +58,9 @@
     })
     on<{ step: number }>(PRESENTER_EVENTS.buildStep, (payload) => {
       activeBuildStep = payload.step
+    })
+    on<{ step: number }>(PRESENTER_EVENTS.codeStep, (payload) => {
+      activeCodeStep = payload.step
     })
     on<LaserPayload>(PRESENTER_EVENTS.laser, (payload) => {
       laser = payload.visible ? payload : null
@@ -158,6 +163,7 @@
             highContrast={presenterState.highContrast}
             readonly
             {activeBuildStep}
+            codeActiveStep={activeCodeStep}
           />
         </div>
       {/key}
