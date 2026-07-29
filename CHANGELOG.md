@@ -17,10 +17,27 @@ This section tracks work toward v0.2.0 (editor completeness). See
 [`docs/sprint-records/wave-6.md`](docs/sprint-records/wave-6.md), and
 [`docs/sprint-records/wave-7.md`](docs/sprint-records/wave-7.md), and
 [`docs/sprint-records/wave-8.md`](docs/sprint-records/wave-8.md), and
-[`docs/sprint-records/wave-9.md`](docs/sprint-records/wave-9.md), and
-[`docs/sprint-records/wave-10.md`](docs/sprint-records/wave-10.md).
+[`docs/sprint-records/wave-9.md`](docs/sprint-records/wave-9.md),
+[`docs/sprint-records/wave-10.md`](docs/sprint-records/wave-10.md), and
+[`docs/sprint-records/wave-11.md`](docs/sprint-records/wave-11.md).
 
 ## [v0.3.0 — in progress]
+
+### Added — Wave 11 (export formats)
+
+- Decks can now be exported to **SVG**, **PNG**, and **PDF**. A new
+  `slides-pdf` crate (no longer a stub) provides:
+  - **SVG export**: per-slide standalone SVG (thin wrapper over the renderer).
+  - **PNG export**: rasterizes the rendered SVG via `resvg`/`usvg`/`tiny-skia`
+    (pure-Rust SVG renderer, no system deps). Configurable scale (1x/2x).
+  - **PDF export**: multi-page deck PDF. Each slide is rasterized at retina
+    resolution and embedded as a full-page image. All exports are
+    deterministic — identical inputs yield byte-identical output.
+- Desktop **Export** menu (File → Export) with SVG (current slide), PNG
+  (current slide, 2x), and PDF (entire deck) options. Uses the system save
+  dialog with file-type filters. Shows a busy indicator and surfaces errors.
+- `docs/sprint-records/wave-11.md` documenting the wave scope and acceptance
+  criteria.
 
 ### Added — Wave 10 (Magic Move / Morph)
 

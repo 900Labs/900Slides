@@ -52,7 +52,8 @@ What v0.1.0 does:
   only.
 - Recovers work after a crash or accidental quit via debounced autosave
   snapshots and a startup recovery prompt.
-- Undoes every edit through a transactional command bus with bounded history.
+- Exports a slide to **SVG** or **PNG** (2x retina), or the entire deck to
+  **PDF** — all deterministic and fully offline.
 - **Spell-checks** text as you type (en-US, offline). Misspelled words get
   red squiggles; right-click for correction suggestions or to add a word to
   your personal dictionary, which persists across sessions.
@@ -71,7 +72,7 @@ What v0.1.0 does:
 
 What v0.1.0 does **not** do yet:
 
-- Export to PDF, PNG, SVG, or ODP.
+- Export to ODP.
 - Ship a signed or notarized installer on any platform.
 
 ## Build from source
@@ -162,7 +163,7 @@ apps/desktop/             Desktop UI and Tauri command boundary
 crates/slides-core/       Deck model, commands, undo, theme
 crates/slides-pptx/       PPTX load and save (native format)
 crates/slides-odp/        ODP import / export conversion boundary (stub)
-crates/slides-pdf/        PDF export and image-per-page import (stub)
+crates/slides-pdf/        SVG, PNG, and PDF export
 crates/slides-render/     Deterministic slide rendering to SVG
 crates/slides-animation/  Deterministic build-in timeline and CSS playback
 crates/slides-chart/      Chart data model and deterministic SVG previews
