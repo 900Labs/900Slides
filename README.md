@@ -23,7 +23,8 @@ What v0.1.0 does:
 
 - Opens `.pptx` files and edits **text boxes**: paragraphs, bold, italic,
   underline, strikethrough, super/subscript, inline code, links, headings
-  (H1-H6), blockquotes, fenced code blocks, and indent levels.
+  (H1-H6), blockquotes, fenced code blocks (with stepped line-range
+  highlighting), and indent levels.
 - Edits **images and geometric shapes** (rectangle, rounded rectangle,
   ellipse, triangle, line, arrow, right-arrow callout, five-point star) with
   fill, outline, shadow, rotation, and crop. Insert an image through the
@@ -53,7 +54,9 @@ What v0.1.0 does:
 - Recovers work after a crash or accidental quit via debounced autosave
   snapshots and a startup recovery prompt.
 - Exports a slide to **SVG** or **PNG** (2x retina), or the entire deck to
-  **PDF** — all deterministic and fully offline.
+  **PDF** — all deterministic and fully offline, with **bundled fonts**
+  (Inter, Source Serif 4, JetBrains Mono) embedded so output renders
+  identically on any platform.
 - **Spell-checks** text as you type (en-US, offline). Misspelled words get
   red squiggles; right-click for correction suggestions or to add a word to
   your personal dictionary, which persists across sessions.
