@@ -580,6 +580,7 @@ fn parse_image(
         transform: attrs.into(),
         media_ref,
         crop: None,
+        alt_text: None,
     })
 }
 

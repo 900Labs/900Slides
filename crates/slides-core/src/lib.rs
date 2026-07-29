@@ -1,5 +1,7 @@
 //! Deck model, commands, undo, theme.
 
+pub mod accessibility;
+
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -475,6 +477,12 @@ pub struct ImageShape {
     pub media_ref: String,
     /// Optional crop applied to the image.
     pub crop: Option<Crop>,
+    /// Accessibility alt text describing the image for screen readers. Defaults
+    /// to `None` (`#[serde(default)]`) so decks serialized before this field
+    /// existed deserialize unchanged — a non-breaking, additive change. The
+    /// accessibility checker flags images with `None` or empty alt text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alt_text: Option<String>,
 }
 
 /// A geometric shape placed on a slide.
@@ -1614,6 +1622,18 @@ pub struct Run {
     /// Run-level font family override; used by code.
     #[serde(default)]
     pub font_family: Option<String>,
+    /// Glyph (text) color override, used by the accessibility checker for
+    /// contrast measurement. Defaults to `None` (`#[serde(default)]`) so decks
+    /// serialized before this field existed deserialize unchanged — a
+    /// non-breaking, additive change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<Color>,
+    /// Font size in EMU (12,700 EMU per point), used by the accessibility
+    /// checker to detect small text and to pick the WCAG large-text threshold.
+    /// Defaults to `None` (`#[serde(default)]`) so decks serialized before this
+    /// field existed deserialize unchanged — a non-breaking, additive change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_size: Option<f64>,
 }
 
 impl Run {
@@ -1629,6 +1649,8 @@ impl Run {
             link: None,
             code: false,
             font_family: None,
+            color: None,
+            font_size: None,
         }
     }
 
@@ -1677,6 +1699,18 @@ impl Run {
     /// Returns a new run with the given font family override.
     pub fn font(mut self, family: impl Into<String>) -> Self {
         self.font_family = Some(family.into());
+        self
+    }
+
+    /// Returns a new run with the given glyph color override.
+    pub fn color(mut self, color: Color) -> Self {
+        self.color = Some(color);
+        self
+    }
+
+    /// Returns a new run with the given font size, in EMU.
+    pub fn font_size(mut self, emu: f64) -> Self {
+        self.font_size = Some(emu);
         self
     }
 
@@ -2864,6 +2898,7 @@ impl Command for InsertImage {
                 transform: self.transform,
                 media_ref: self.media_key.clone(),
                 crop: self.crop.clone(),
+                alt_text: None,
             }));
         }
     }
@@ -5424,6 +5459,7 @@ mod tests {
                         right: 0.1,
                         bottom: 0.0,
                     }),
+                    alt_text: None,
                 }),
             ],
         ));
@@ -5508,6 +5544,7 @@ mod tests {
                 transform: Transform::default(),
                 media_ref: "only".to_string(),
                 crop: None,
+                alt_text: None,
             })],
         ));
         let original = deck.clone();
@@ -5540,6 +5577,7 @@ mod tests {
                 transform: Transform::default(),
                 media_ref: "shared".to_string(),
                 crop: None,
+                alt_text: None,
             })
         };
         deck.slides.push(slide_with("s1", vec![image(), image()]));
@@ -5594,6 +5632,7 @@ mod tests {
                     },
                     media_ref: "x".to_string(),
                     crop: None,
+                    alt_text: None,
                 }),
             ],
         ));
@@ -5685,6 +5724,7 @@ mod tests {
                     transform: Transform::default(),
                     media_ref: "m".to_string(),
                     crop: None,
+                    alt_text: None,
                 }),
             ],
         ));
@@ -6317,6 +6357,7 @@ mod tests {
                     transform: Transform::default(),
                     media_ref: "m".to_string(),
                     crop: None,
+                    alt_text: None,
                 }),
                 geo_rectangle(),
                 Shape::Passthrough(PassthroughObject {
@@ -8781,6 +8822,7 @@ mod tests {
                     transform: Transform::default(),
                     media_ref: "key".to_string(),
                     crop: None,
+                    alt_text: None,
                 }),
             ],
             animation: None,

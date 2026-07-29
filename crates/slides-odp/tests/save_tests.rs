@@ -131,6 +131,7 @@ fn save_image_writes_picture() {
             },
             media_ref: "img1".to_string(),
             crop: None,
+            alt_text: None,
         })],
         ..Slide::default()
     });
