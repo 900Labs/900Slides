@@ -15,7 +15,30 @@ This section tracks work toward v0.2.0 (editor completeness). See
 [`docs/sprint-records/wave-4.md`](docs/sprint-records/wave-4.md), and
 [`docs/sprint-records/wave-5.md`](docs/sprint-records/wave-5.md), and
 [`docs/sprint-records/wave-6.md`](docs/sprint-records/wave-6.md), and
-[`docs/sprint-records/wave-7.md`](docs/sprint-records/wave-7.md).
+[`docs/sprint-records/wave-7.md`](docs/sprint-records/wave-7.md), and
+[`docs/sprint-records/wave-8.md`](docs/sprint-records/wave-8.md).
+
+### Added — Wave 8 (dual-display presenter)
+
+- The presenter now runs in **dual-display mode**: a presenter window
+  (controls, notes, timer, next-slide preview, tool toggles) and a separate
+  fullscreen **audience window** showing only the slide. The two windows
+  synchronize in real time via Tauri events (slide advances, build-step
+  reveals, transitions).
+- **Laser pointer**: when enabled (toggle button or `L` key), a colored dot
+  follows the cursor on both windows. Throttled to ~30 fps to avoid event
+  flooding. Transient — not saved to the deck.
+- **Highlighter**: freehand strokes drawn over the current slide on both
+  windows via an SVG overlay. Strokes clear on slide advance. Toggle button
+  or `H` key.
+- **Black/white slide**: `B` blanks the audience window to solid black,
+  `W` to solid white — for Q&A. Toggling restores the slide.
+- Presenter settings (`laser_pointer`, `laser_color`, `highlighter`,
+  `highlighter_color`) persist on the deck via a new
+  `SetPresenterSettings` command (verified inverse). Old decks default to
+  all-off.
+- `docs/sprint-records/wave-8.md` documenting the wave scope and acceptance
+  criteria.
 
 ### Added — Wave 7 (deck structure & editor completeness)
 

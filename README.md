@@ -45,9 +45,11 @@ What v0.1.0 does:
 - Shows per-slide warnings when a file contains content that is preserved but
   not editable (the loss ledger).
 - Renders a slide to deterministic SVG for thumbnails and presenter previews.
-- Presents a deck locally: a fullscreen presenter window with the current
-  slide, a next-slide preview, a slide counter, an elapsed timer, and speaker
-  notes. Keyboard navigation only.
+- Presents a deck locally in **dual-display mode**: a presenter window
+  (controls, notes, timer, next-slide preview) and a separate fullscreen
+  audience window. Includes a **laser pointer** (`L`), **highlighter**
+  (`H`), and **black/white slide** (`B`/`W`) for Q&A. Keyboard navigation
+  only.
 - Recovers work after a crash or accidental quit via debounced autosave
   snapshots and a startup recovery prompt.
 - Undoes every edit through a transactional command bus with bounded history.
@@ -119,8 +121,10 @@ visibility:
     cannot be modified.
 6. Choose **Save** to write a `.pptx` file. Only edited slides are
    regenerated; every other part of the original file is unchanged.
-7. Choose **Present** to open a fullscreen presenter window. Use arrow keys,
-   space, Home, End, and Escape to navigate.
+7. Choose **Present** to open dual-display mode: a presenter window and a
+   fullscreen audience window. Use arrow keys, space, Home, End, and Escape
+   to navigate. Press `B` or `W` for a black/white Q&A slide, `L` for the
+   laser pointer, `H` for the highlighter.
 
 ### Recovery
 
