@@ -13,7 +13,7 @@
 //! PDF output depends neither on the wall clock nor on a random generator: the
 //! metadata dates are pinned to the Unix epoch and the trailer `/ID`, which
 //! `printpdf` fills with random strings, is rewritten to a fixed value via the
-//! `lopdf` library that `printpdf` is built on. No telemetry, no network.
+//! `lopdf` library that `printpdf` is built on. Fully offline, no network.
 
 use std::io::Cursor;
 
