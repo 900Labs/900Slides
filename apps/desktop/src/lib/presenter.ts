@@ -1,3 +1,5 @@
+import type { MorphFrameDto, SlideSnapshot } from './types'
+
 /**
  * Shared contract for the dual-display presenter.
  *
@@ -39,6 +41,8 @@ export const PRESENTER_EVENTS = {
   highlighter: 'presenter:highlighter',
   /** Audience blank mode. */
   blank: 'presenter:blank',
+  /** Magic Move morph payload: previous slide + interpolation frames. */
+  morph: 'presenter:morph',
   /** Both windows should close. */
   exit: 'presenter:exit',
 } as const
@@ -68,6 +72,17 @@ export interface BlankPayload {
 /** Payload for {@link PRESENTER_EVENTS.buildStep}. */
 export interface BuildStepPayload {
   step: number
+}
+
+/** Payload for {@link PRESENTER_EVENTS.morph}: the previous slide plus the
+ *  interpolation frames computed for a Magic Move transition. */
+export interface MorphPayload {
+  /** The slide being left, rendered as an overlay during the morph. */
+  prev: SlideSnapshot
+  /** Per-shape interpolation frames from `compute_morph`. */
+  frames: MorphFrameDto[]
+  /** Morph duration in milliseconds. */
+  durationMs: number
 }
 
 /** Slide rect in stage-local pixels, used to position overlays. */
@@ -137,4 +152,146 @@ export function throttle<A extends unknown[]>(
       }, remaining)
     }
   }
+}
+
+/** EMU -> CSS pixels, matching `SlideCanvas`. */
+const MORPH_EMU_TO_PX = 1 / 9525
+
+/** Converts an EMU length to a CSS pixel string. */
+function morphPx(emu: number): string {
+  return `${emu * MORPH_EMU_TO_PX}px`
+}
+
+/** Saved inline styles for a morphed element, restored once the morph ends. */
+interface MorphSavedStyle {
+  transition: string
+  left: string
+  top: string
+  width: string
+  height: string
+  opacity: string
+}
+
+/**
+ * Drives a Magic Move morph between the just-rendered next slide (`base`) and
+ * the previous slide (`overlay`). Matching shape elements are located by their
+ * `data-shape-id` attribute and animated via CSS transitions:
+ *
+ * - **Interpolate** (shape on both slides): in `base`, jump to the source frame
+ *   with no transition, then transition `left/top/width/height` to the target.
+ * - **Fade-in** (shape new on next): in `base`, start at opacity 0 and
+ *   transition to 1.
+ * - **Fade-out** (shape removed): in `overlay`, transition opacity 1 -> 0.
+ *
+ * Every other shape in the `overlay` is hidden, since the base canvas already
+ * renders the incoming slide. After `durationMs`, inline overrides are restored
+ * so the rendered DOM returns to its reactive state. Resolves immediately when
+ * either canvas is missing or there is nothing to animate.
+ */
+export function runMorph(
+  base: HTMLElement | null,
+  overlay: HTMLElement | null,
+  frames: MorphFrameDto[],
+  durationMs: number,
+): Promise<void> {
+  if (!base || !overlay || frames.length === 0 || durationMs <= 0) {
+    return Promise.resolve()
+  }
+
+  const collect = (root: HTMLElement): Map<string, HTMLElement> => {
+    const map = new Map<string, HTMLElement>()
+    for (const el of Array.from(root.querySelectorAll<HTMLElement>('[data-shape-id]'))) {
+      const id = el.getAttribute('data-shape-id')
+      if (id) map.set(id, el)
+    }
+    return map
+  }
+
+  const baseShapes = collect(base)
+  const overlayShapes = collect(overlay)
+  const transition =
+    `left ${durationMs}ms ease, top ${durationMs}ms ease, ` +
+    `width ${durationMs}ms ease, height ${durationMs}ms ease, opacity ${durationMs}ms ease`
+  const saved = new Map<HTMLElement, MorphSavedStyle>()
+
+  const remember = (el: HTMLElement): void => {
+    if (saved.has(el)) return
+    const s = el.style
+    saved.set(el, {
+      transition: s.transition,
+      left: s.left,
+      top: s.top,
+      width: s.width,
+      height: s.height,
+      opacity: s.opacity,
+    })
+  }
+
+  // 1. Apply the start state with transitions disabled.
+  for (const frame of frames) {
+    const baseEl = baseShapes.get(frame.shapeId)
+    if (baseEl) {
+      remember(baseEl)
+      baseEl.style.transition = 'none'
+      if (frame.from && frame.to) {
+        baseEl.style.left = morphPx(frame.from.x)
+        baseEl.style.top = morphPx(frame.from.y)
+        baseEl.style.width = morphPx(frame.from.width)
+        baseEl.style.height = morphPx(frame.from.height)
+      } else if (frame.to) {
+        baseEl.style.opacity = '0'
+      }
+    }
+
+    const overlayEl = overlayShapes.get(frame.shapeId)
+    if (overlayEl) {
+      remember(overlayEl)
+      overlayEl.style.transition = 'none'
+      // Only fade-out shapes stay visible in the overlay; everything else is
+      // already shown by the incoming base canvas and is hidden here.
+      if (!(frame.from && !frame.to)) {
+        overlayEl.style.opacity = '0'
+      }
+    }
+  }
+
+  // 2. Commit the start state, then enable transitions toward the targets.
+  void base.offsetWidth
+
+  for (const frame of frames) {
+    const baseEl = baseShapes.get(frame.shapeId)
+    if (baseEl) {
+      if (frame.from && frame.to) {
+        baseEl.style.transition = transition
+        baseEl.style.left = morphPx(frame.to.x)
+        baseEl.style.top = morphPx(frame.to.y)
+        baseEl.style.width = morphPx(frame.to.width)
+        baseEl.style.height = morphPx(frame.to.height)
+      } else if (frame.to) {
+        baseEl.style.transition = transition
+        baseEl.style.opacity = '1'
+      }
+    }
+
+    const overlayEl = overlayShapes.get(frame.shapeId)
+    if (overlayEl && frame.from && !frame.to) {
+      overlayEl.style.transition = transition
+      overlayEl.style.opacity = '0'
+    }
+  }
+
+  // 3. After the duration, restore the original inline styles.
+  return new Promise<void>((resolve) => {
+    window.setTimeout(() => {
+      for (const [el, s] of saved) {
+        el.style.transition = s.transition
+        el.style.left = s.left
+        el.style.top = s.top
+        el.style.width = s.width
+        el.style.height = s.height
+        el.style.opacity = s.opacity
+      }
+      resolve()
+    }, durationMs)
+  })
 }

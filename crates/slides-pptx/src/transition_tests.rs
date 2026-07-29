@@ -165,6 +165,23 @@ fn fade_transition_body(spd: &str) -> String {
     )
 }
 
+/// Slide body with an empty `p:spTree` followed by a `p:morph` transition
+/// (OOXML's Morph / Magic Move transition), with no `spd` attribute.
+fn morph_transition_body() -> String {
+    r#"  <p:cSld>
+    <p:spTree>
+      <p:nvGrpSpPr>
+        <p:cNvPr id="0" name=""/>
+        <p:cNvGrpSpPr/>
+        <p:nvPr/>
+      </p:nvGrpSpPr>
+      <p:grpSpPr/>
+    </p:spTree>
+    <p:transition><p:morph option="byObject"/></p:transition>
+  </p:cSld>"#
+        .to_string()
+}
+
 #[test]
 fn load_extracts_fade_transition() {
     let bytes = build_pptx_with_slide_body(&fade_transition_body("med"));
@@ -177,6 +194,25 @@ fn load_extracts_fade_transition() {
         .expect("fade transition should be modeled");
     assert_eq!(transition.kind, TransitionKind::Fade);
     assert_eq!(transition.duration_ms, 500);
+}
+
+#[test]
+fn load_extracts_morph_transition() {
+    let bytes = build_pptx_with_slide_body(&morph_transition_body());
+    let session = load(&bytes).expect("load should succeed");
+
+    let slide = &session.deck().slides[0];
+    let transition = slide
+        .transition
+        .as_ref()
+        .expect("morph transition should be modeled");
+    assert_eq!(transition.kind, TransitionKind::Morph);
+    assert_eq!(transition.duration_ms, 500);
+    // Morph is now modeled, so it must not produce a loss warning.
+    assert!(
+        session.loss_ledger().is_empty(),
+        "modeled morph transition must not warn"
+    );
 }
 
 #[test]

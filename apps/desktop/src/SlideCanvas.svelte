@@ -901,6 +901,7 @@
       <div
         class="text-box-container"
         class:build-shape={buildStateFor(shapeIndex) !== undefined}
+        data-shape-id={textBox.id}
         style:left={toPx(textBox.frame.x)}
         style:top={toPx(textBox.frame.y)}
         style:width={toPx(textBox.frame.width)}
@@ -950,6 +951,7 @@
       <div
         class="passthrough"
         class:build-shape={buildStateFor(shapeIndex) !== undefined}
+        data-shape-id={obj.id}
         style:left={obj.frame ? toPx(obj.frame.x) : undefined}
         style:top={obj.frame ? toPx(obj.frame.y) : `${1 + passthroughIndex * 0.5}rem`}
         style:right={obj.frame ? undefined : '1rem'}
@@ -970,6 +972,7 @@
       <div
         class="image-container"
         class:build-shape={buildStateFor(shapeIndex) !== undefined}
+        data-shape-id={image.id}
         style:left={toPx(frame.x)}
         style:top={toPx(frame.y)}
         style:width={toPx(frame.width)}
@@ -997,6 +1000,7 @@
       <div
         class="geometric-container"
         class:build-shape={buildStateFor(shapeIndex) !== undefined}
+        data-shape-id={geometric.id}
         style:left={toPx(frame.x)}
         style:top={toPx(frame.y)}
         style:width={toPx(frame.width)}
@@ -1017,6 +1021,7 @@
       <div
         class="table-container"
         class:build-shape={buildStateFor(shapeIndex) !== undefined}
+        data-shape-id={table.id}
         style:left={toPx(tframe.x)}
         style:top={toPx(tframe.y)}
         style:width={toPx(tframe.width)}
@@ -1072,6 +1077,7 @@
         class="chart-container"
         class:chart-readonly={readonly}
         class:build-shape={buildStateFor(shapeIndex) !== undefined}
+        data-shape-id={chart.id}
         style:left={toPx(frame.x)}
         style:top={toPx(frame.y)}
         style:width={toPx(frame.width)}

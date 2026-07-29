@@ -64,7 +64,9 @@ What v0.1.0 does:
   **high-contrast theme** toggle for accessibility.
 - Animates **build-ins** (fade, slide-in from any edge, appear, disappear)
   with an ordered build-sequence editor, and plays **transitions** (none,
-  fade, slide, push, wipe) between slides. The presenter reveals shapes
+  fade, slide, push, wipe, morph) between slides. **Magic Move** (morph)
+  automatically interpolates position and size for shapes that appear on
+  adjacent slides. The presenter reveals shapes
   step-by-step on each click.
 
 What v0.1.0 does **not** do yet:

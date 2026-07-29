@@ -1008,7 +1008,7 @@ fn generate_xy_series(series: &XYSeries, idx: usize) -> String {
 /// Builds a `<p:graphicFrame>` element for a chart shape, referencing the chart
 /// part via `r:id`. Used both for appending new charts and for regenerating a
 /// chart frame when the original slide XML is being rewritten from scratch.
-pub fn chart_graphic_frame_xml(chart: &ChartShape, id: i64, name: &str, rid: &str) -> String {
+pub fn chart_graphic_frame_xml(chart: &ChartShape, id: &str, name: &str, rid: &str) -> String {
     let f = chart.transform.frame;
     let rot = if chart.transform.rotation != 0.0 {
         format!(

@@ -5,10 +5,12 @@
   import type { ColorDto, PresenterState } from './lib/types'
   import {
     PRESENTER_EVENTS,
+    runMorph,
     slideRectFromStage,
     type BlankMode,
     type HighlighterStroke,
     type LaserPayload,
+    type MorphPayload,
     type SlideRect,
   } from './lib/presenter'
 
@@ -26,6 +28,10 @@
   let stageEl = $state<HTMLElement | null>(null)
   /** Rendered slide box in stage-local pixels. */
   let slideRect = $state<SlideRect | null>(null)
+  /** Active Magic Move morph mirrored from the control window. */
+  let morph = $state<MorphPayload | null>(null)
+  /** Bound morph overlay root, used to locate its canvas during playback. */
+  let morphOverlayEl = $state<HTMLElement | null>(null)
 
   $effect(() => {
     let cancelled = false
@@ -60,6 +66,9 @@
     on<{ mode: BlankMode }>(PRESENTER_EVENTS.blank, (payload) => {
       blankMode = payload.mode
     })
+    on<MorphPayload>(PRESENTER_EVENTS.morph, (payload) => {
+      morph = payload
+    })
     on<unknown>(PRESENTER_EVENTS.exit, () => {
       window.close()
     })
@@ -87,6 +96,28 @@
   $effect(() => {
     void presenterState?.currentSlide.id
     if (stageEl) slideRect = slideRectFromStage(stageEl)
+  })
+
+  // Mirror the control window's Magic Move morph once both canvases render.
+  $effect(() => {
+    const active = morph
+    const stage = stageEl
+    const overlayRoot = morphOverlayEl
+    if (!active || !stage || !overlayRoot) return
+    const base = stage.querySelector<HTMLElement>('.stage-content .canvas')
+    const overlay = overlayRoot.querySelector<HTMLElement>('.canvas')
+    if (!base || !overlay) return
+    let cancelled = false
+    const handle = window.requestAnimationFrame(() => {
+      if (cancelled) return
+      void runMorph(base, overlay, active.frames, active.durationMs).then(() => {
+        if (!cancelled) morph = null
+      })
+    })
+    return () => {
+      cancelled = true
+      cancelAnimationFrame(handle)
+    }
   })
 
   /** White slide background. */
@@ -130,6 +161,19 @@
           />
         </div>
       {/key}
+
+      {#if morph}
+        <div class="morph-overlay" bind:this={morphOverlayEl} aria-hidden="true">
+          <SlideCanvas
+            slide={morph.prev}
+            background={{ r: 255, g: 255, b: 255, a: 0 }}
+            media={presenterState.media}
+            slideSize={presenterState.slideSize}
+            highContrast={presenterState.highContrast}
+            readonly
+          />
+        </div>
+      {/if}
 
       {#if slideRect && strokes.length > 0}
         <svg
@@ -209,6 +253,18 @@
   }
   .stage-content.transition-wipe {
     animation: transition-wipe var(--transition-duration, 500ms) ease forwards;
+  }
+  .morph-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 5;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+  }
+  .morph-overlay :global(.canvas) {
+    box-shadow: none;
   }
   @keyframes transition-fade {
     from {

@@ -88,7 +88,7 @@
   /** Chart types offered by the chart toolbar dropdown. */
   const CHART_TYPES: ChartTypeDto[] = ['bar', 'column', 'line', 'area', 'pie', 'scatter']
   /** Slide transition kinds offered by the transition picker. */
-  const TRANSITION_KINDS: TransitionKindDto[] = ['none', 'fade', 'slide', 'push', 'wipe']
+  const TRANSITION_KINDS: TransitionKindDto[] = ['none', 'fade', 'slide', 'push', 'wipe', 'morph']
   /** Build-in effects offered by the build step picker. */
   const BUILD_EFFECTS: BuildEffectDto[] = [
     'fade',
