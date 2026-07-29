@@ -32,6 +32,10 @@ pub struct Deck {
     /// Key-addressed store of image bytes referenced by image shapes.
     #[serde(default)]
     pub media: MediaStore,
+    /// Presenter configuration (laser pointer, highlighter). Additive;
+    /// defaults to all-off so old decks are unaffected.
+    #[serde(default)]
+    pub presenter_settings: PresenterSettings,
 }
 
 impl Default for Deck {
@@ -44,6 +48,7 @@ impl Default for Deck {
             slide_size: None,
             sections: Vec::new(),
             media: MediaStore::default(),
+            presenter_settings: PresenterSettings::default(),
         }
     }
 }
@@ -145,6 +150,43 @@ impl Default for Theme {
             high_contrast: false,
         }
     }
+}
+
+/// Presenter configuration stored on the deck. Additive with
+/// `#[serde(default)]`; old decks get the defaults.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PresenterSettings {
+    /// Whether the laser pointer is enabled.
+    #[serde(default)]
+    pub laser_pointer: bool,
+    /// Laser pointer color (hex). Defaults to red.
+    #[serde(default = "default_laser_color")]
+    pub laser_color: String,
+    /// Whether the highlighter tool is enabled.
+    #[serde(default)]
+    pub highlighter: bool,
+    /// Highlighter color (hex). Defaults to yellow.
+    #[serde(default = "default_highlighter_color")]
+    pub highlighter_color: String,
+}
+
+impl Default for PresenterSettings {
+    fn default() -> Self {
+        Self {
+            laser_pointer: false,
+            laser_color: default_laser_color(),
+            highlighter: false,
+            highlighter_color: default_highlighter_color(),
+        }
+    }
+}
+
+fn default_laser_color() -> String {
+    "#ff0000".to_string()
+}
+
+fn default_highlighter_color() -> String {
+    "#ffff00".to_string()
 }
 
 /// An RGBA color.
@@ -3850,6 +3892,38 @@ impl Command for SetHighContrast {
     }
 }
 
+/// Sets the deck's presenter settings (laser pointer, highlighter).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetPresenterSettings {
+    settings: PresenterSettings,
+}
+
+impl SetPresenterSettings {
+    pub fn new(settings: PresenterSettings) -> Self {
+        Self { settings }
+    }
+}
+
+impl Command for SetPresenterSettings {
+    fn apply(&self, deck: &mut Deck) {
+        deck.presenter_settings = self.settings.clone();
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        Box::new(Self {
+            settings: deck.presenter_settings.clone(),
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn validate(&self, _deck: &Deck) -> bool {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6775,6 +6849,50 @@ mod tests {
         assert_eq!(restored.slide_size, deck.slide_size);
         assert_eq!(restored.sections, deck.sections);
         assert_eq!(restored.theme.high_contrast, deck.theme.high_contrast);
+    }
+
+    #[test]
+    fn presenter_settings_default_is_all_off() {
+        let settings = PresenterSettings::default();
+        assert!(!settings.laser_pointer);
+        assert!(!settings.highlighter);
+        assert_eq!(settings.laser_color, "#ff0000");
+        assert_eq!(settings.highlighter_color, "#ffff00");
+    }
+
+    #[test]
+    fn set_presenter_settings_applies_and_undoes() {
+        let mut deck = Deck::new();
+        let original = deck.clone();
+        let settings = PresenterSettings {
+            laser_pointer: true,
+            laser_color: "#00ff00".to_string(),
+            highlighter: true,
+            highlighter_color: "#0000ff".to_string(),
+        };
+        let mut bus = CommandBus::default();
+        bus.apply(
+            Box::new(SetPresenterSettings::new(settings.clone())),
+            &mut deck,
+        )
+        .expect("apply");
+        assert_eq!(deck.presenter_settings, settings);
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn old_deck_without_presenter_settings_deserializes() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with("s1", vec![geo_rectangle()]));
+        let mut value = serde_json::to_value(&deck).expect("serialize");
+        value
+            .as_object_mut()
+            .expect("deck object")
+            .remove("presenter_settings");
+        let old_json = serde_json::to_string(&value).expect("reserialize");
+        let restored: Deck = serde_json::from_str(&old_json).expect("old deck must load");
+        assert_eq!(restored.presenter_settings, PresenterSettings::default());
     }
 
     #[test]

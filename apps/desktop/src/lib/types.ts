@@ -317,6 +317,8 @@ export interface DeckSnapshot {
   sections: SlideSectionDto[]
   slides: SlideSnapshot[]
   media: MediaMap
+  /** Presenter settings (laser pointer + highlighter). */
+  presenterSettings: PresenterSettingsDto
   warnings: WarningDto[]
 }
 
@@ -324,6 +326,18 @@ export interface DeckSnapshot {
 export interface WarningDto {
   slideId: string
   message: string
+}
+
+/** Presenter settings: laser pointer and highlighter defaults and colors. */
+export interface PresenterSettingsDto {
+  /** Whether the laser pointer is enabled by default. */
+  laserPointer: boolean
+  /** Laser pointer color as a CSS hex string (e.g. `#ff0000`). */
+  laserColor: string
+  /** Whether the highlighter tool is enabled by default. */
+  highlighter: boolean
+  /** Highlighter color as a CSS hex string (e.g. `#ffff00`). */
+  highlighterColor: string
 }
 
 /** Presenter view state. */
@@ -338,6 +352,8 @@ export interface PresenterState {
   slideSize?: SlideSizeDto
   /** Whether the deck is rendered in high-contrast mode. */
   highContrast: boolean
+  /** Presenter settings (laser pointer + highlighter). */
+  presenterSettings: PresenterSettingsDto
 }
 
 /** Recovery snapshot metadata. */
