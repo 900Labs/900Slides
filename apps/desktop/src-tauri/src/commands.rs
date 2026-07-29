@@ -124,6 +124,7 @@ impl AppState {
             slides: deck.slides.iter().map(slide_to_dto).collect(),
             media,
             presenter_settings: presenter_settings_to_dto(&deck.presenter_settings),
+            comments: deck.comments.iter().map(comment_thread_to_dto).collect(),
             warnings: Vec::new(),
         }
     }
@@ -203,6 +204,9 @@ pub struct DeckSnapshot {
     /// Presenter settings (laser pointer, highlighter).
     #[serde(default)]
     pub presenter_settings: PresenterSettingsDto,
+    /// Comment threads on this deck, anchored to slides, shapes, or text ranges.
+    #[serde(default)]
+    pub comments: Vec<CommentThreadDto>,
     /// Warnings from the last load (empty for most commands).
     pub warnings: Vec<WarningDto>,
 }
@@ -903,6 +907,150 @@ pub struct MediaEntryDto {
     pub width: u32,
     /// Native pixel height of the media.
     pub height: u32,
+}
+
+/// Where a comment thread is anchored. Mirrors [`slides_core::CommentAnchor`].
+///
+/// Internally tagged by `kind` (snake_case) so the frontend can discriminate the
+/// variant, while the nested fields use camelCase to match the rest of the
+/// snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CommentAnchorDto {
+    /// Anchored to a whole slide.
+    Slide {
+        /// Id of the slide this comment is anchored to.
+        #[serde(rename = "slideId")]
+        slide_id: String,
+    },
+    /// Anchored to a specific shape (by id).
+    Shape {
+        /// Id of the slide containing the shape.
+        #[serde(rename = "slideId")]
+        slide_id: String,
+        /// Id of the shape this comment is anchored to.
+        #[serde(rename = "shapeId")]
+        shape_id: String,
+    },
+    /// Anchored to a text range within a text box.
+    TextRange {
+        /// Id of the slide containing the text box.
+        #[serde(rename = "slideId")]
+        slide_id: String,
+        /// Id of the text box shape.
+        #[serde(rename = "shapeId")]
+        shape_id: String,
+        /// Inclusive byte offset where the range starts.
+        start: usize,
+        /// Exclusive byte offset where the range ends.
+        end: usize,
+    },
+}
+
+/// A single comment in a thread. Mirrors [`slides_core::Comment`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentDto {
+    /// Unique id.
+    pub id: String,
+    /// Author name (free text).
+    pub author: String,
+    /// Comment body (plain text).
+    pub body: String,
+    /// ISO 8601 timestamp (UTC).
+    pub timestamp: String,
+    /// Whether this comment is resolved (applies to the thread root).
+    #[serde(default)]
+    pub resolved: bool,
+}
+
+/// A comment thread anchored to a target within the deck. Mirrors
+/// [`slides_core::CommentThread`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentThreadDto {
+    /// Unique thread id.
+    pub id: String,
+    /// Where this thread is anchored.
+    pub anchor: CommentAnchorDto,
+    /// The root comment followed by its replies, in chronological order.
+    pub comments: Vec<CommentDto>,
+    /// Optional assignee (free-text name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned_to: Option<String>,
+    /// Whether the entire thread is resolved.
+    #[serde(default)]
+    pub resolved: bool,
+}
+
+/// Converts a model [`slides_core::CommentAnchor`] into its DTO.
+fn comment_anchor_to_dto(anchor: &slides_core::CommentAnchor) -> CommentAnchorDto {
+    match anchor {
+        slides_core::CommentAnchor::Slide { slide_id } => CommentAnchorDto::Slide {
+            slide_id: slide_id.clone(),
+        },
+        slides_core::CommentAnchor::Shape { slide_id, shape_id } => CommentAnchorDto::Shape {
+            slide_id: slide_id.clone(),
+            shape_id: shape_id.clone(),
+        },
+        slides_core::CommentAnchor::TextRange {
+            slide_id,
+            shape_id,
+            start,
+            end,
+        } => CommentAnchorDto::TextRange {
+            slide_id: slide_id.clone(),
+            shape_id: shape_id.clone(),
+            start: *start,
+            end: *end,
+        },
+    }
+}
+
+/// Converts a [`CommentAnchorDto`] into the model type.
+fn comment_anchor_from_dto(dto: &CommentAnchorDto) -> slides_core::CommentAnchor {
+    match dto {
+        CommentAnchorDto::Slide { slide_id } => slides_core::CommentAnchor::Slide {
+            slide_id: slide_id.clone(),
+        },
+        CommentAnchorDto::Shape { slide_id, shape_id } => slides_core::CommentAnchor::Shape {
+            slide_id: slide_id.clone(),
+            shape_id: shape_id.clone(),
+        },
+        CommentAnchorDto::TextRange {
+            slide_id,
+            shape_id,
+            start,
+            end,
+        } => slides_core::CommentAnchor::TextRange {
+            slide_id: slide_id.clone(),
+            shape_id: shape_id.clone(),
+            start: *start,
+            end: *end,
+        },
+    }
+}
+
+/// Converts a model [`slides_core::Comment`] into its DTO.
+fn comment_to_dto(comment: &slides_core::Comment) -> CommentDto {
+    CommentDto {
+        id: comment.id.clone(),
+        author: comment.author.clone(),
+        body: comment.body.clone(),
+        timestamp: comment.timestamp.clone(),
+        resolved: comment.resolved,
+    }
+}
+
+/// Converts a model [`slides_core::CommentThread`] into its DTO.
+fn comment_thread_to_dto(thread: &slides_core::CommentThread) -> CommentThreadDto {
+    CommentThreadDto {
+        id: thread.id.clone(),
+        anchor: comment_anchor_to_dto(&thread.anchor),
+        comments: thread.comments.iter().map(comment_to_dto).collect(),
+        assigned_to: thread.assigned_to.clone(),
+        resolved: thread.resolved,
+    }
 }
 
 /// Snapshot of a text box shape.
@@ -2659,6 +2807,115 @@ fn presenter_state_at(state: &AppState) -> Result<PresenterState, String> {
         high_contrast: session.deck().theme.high_contrast,
         presenter_settings: presenter_settings_to_dto(&session.deck().presenter_settings),
     })
+}
+
+/// Adds a new comment thread anchored to a slide, shape, or text range. The
+/// root comment is authored by `author`. Returns the updated deck snapshot.
+#[tauri::command]
+pub fn add_comment(
+    anchor: CommentAnchorDto,
+    author: String,
+    body: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let command = Box::new(slides_core::AddComment::new(
+        comment_anchor_from_dto(&anchor),
+        author,
+        body,
+    ));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Appends a reply to the comment thread `thread_id` (which lives on
+/// `slide_id`). Returns the updated deck snapshot.
+#[tauri::command]
+pub fn reply_to_comment(
+    thread_id: String,
+    slide_id: String,
+    author: String,
+    body: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let command = Box::new(slides_core::ReplyToComment::new(
+        thread_id, slide_id, author, body,
+    ));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Sets or clears the resolved flag of a comment thread. Returns the updated
+/// deck snapshot.
+#[tauri::command]
+pub fn set_comment_resolved(
+    thread_id: String,
+    slide_id: String,
+    resolved: bool,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let command = Box::new(slides_core::SetCommentResolved::new(
+        thread_id, slide_id, resolved,
+    ));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Sets or clears the assignee of a comment thread. Pass `None` (or null from
+/// the frontend) to clear. Returns the updated deck snapshot.
+#[tauri::command]
+pub fn assign_comment(
+    thread_id: String,
+    slide_id: String,
+    assignee: Option<String>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let command = Box::new(slides_core::AssignComment::new(
+        thread_id, slide_id, assignee,
+    ));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Removes a comment thread by id. Returns the updated deck snapshot.
+#[tauri::command]
+pub fn delete_comment_thread(
+    thread_id: String,
+    slide_id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let command = Box::new(slides_core::DeleteCommentThread::new(thread_id, slide_id));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
 }
 
 fn schedule_recovery(app: &AppHandle, state: &State<'_, AppState>) {

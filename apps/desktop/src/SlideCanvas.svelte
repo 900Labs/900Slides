@@ -59,6 +59,20 @@
     onEditChart?: (detail: { slideId: string; shapeIndex: number }) => void
     /** Callback invoked when a shape is clicked to select it. */
     onSelectShape?: (detail: { shapeIndex: number }) => void
+    /** Callback invoked when a non-text shape is right-clicked, so the host can
+     *  offer an "Add comment" (shape-anchored) action. */
+    onShapeContextMenu?: (detail: { shapeId: string; shapeIndex: number; x: number; y: number }) => void
+    /** Callback invoked when the user right-clicks a text selection, so the host
+     *  can offer a "Comment on selection" (text-range-anchored) action. The
+     *  offsets are UTF-8 byte offsets into the text box's concatenated text. */
+    onCommentOnSelection?: (detail: {
+      shapeId: string
+      shapeIndex: number
+      start: number
+      end: number
+      x: number
+      y: number
+    }) => void
     /** Whether the canvas is read-only (presenter mode). */
     readonly?: boolean
     /** Current build step index for presenter playback. */
@@ -80,6 +94,8 @@
     onCellFocus,
     onEditChart,
     onSelectShape,
+    onShapeContextMenu,
+    onCommentOnSelection,
     readonly = false,
     activeBuildStep = Infinity,
     codeActiveStep = 0,
@@ -640,6 +656,16 @@
   let spellMenuTextarea: HTMLTextAreaElement | null = null
   let spellMenuShapeIndex = 0
 
+  /** Open "comment on selection" menu state (null when closed). */
+  let commentMenu = $state<{
+    shapeId: string
+    shapeIndex: number
+    start: number
+    end: number
+    x: number
+    y: number
+  } | null>(null)
+
   /** Tracks the rendered slide so per-shape spell state resets on slide change. */
   let lastSlideId = ''
   /** Root canvas element, used to keep the squiggle overlay scroll in sync. */
@@ -690,6 +716,11 @@
       i += cp > 0xffff ? 2 : 1
     }
     return text.length
+  }
+
+  /** Maps a JS string index to a UTF-8 byte offset (for comment text ranges). */
+  function charOffsetToByte(text: string, charIndex: number): number {
+    return new TextEncoder().encode(text.slice(0, Math.max(0, charIndex))).length
   }
 
   /** Escapes the HTML-significant characters in a string. */
@@ -813,14 +844,67 @@
     spellMenu = { word, start, end, x, y, suggestions }
   }
 
-  /** Right-click handler: shows the spell menu only on a misspelled word. */
+  /** Right-click handler: shows the spell menu on a misspelled word, or offers
+   *  a "Comment on selection" action when text is selected. */
   function handleContextMenu(event: MouseEvent, shapeIndex: number): void {
     if (readonly) return
     const textarea = event.currentTarget as HTMLTextAreaElement
     const hit = findMisspellingAt(textarea, event.clientX, event.clientY)
-    if (!hit) return
+    if (hit) {
+      event.preventDefault()
+      void openSpellMenu(textarea, shapeIndex, hit.word, hit.start, hit.end, event.clientX, event.clientY)
+      return
+    }
+    if (onCommentOnSelection) {
+      const selStart = textarea.selectionStart ?? 0
+      const selEnd = textarea.selectionEnd ?? 0
+      if (selStart !== selEnd) {
+        event.preventDefault()
+        const shape = slide.shapes[shapeIndex]
+        const shapeId =
+          shape && shape.kind === 'text_box' ? (shape.value as TextBoxSnapshot).id ?? '' : ''
+        const text = textarea.value
+        commentMenu = {
+          shapeId,
+          shapeIndex,
+          start: charOffsetToByte(text, Math.min(selStart, selEnd)),
+          end: charOffsetToByte(text, Math.max(selStart, selEnd)),
+          x: event.clientX,
+          y: event.clientY,
+        }
+      }
+    }
+  }
+
+  /** Fires the "Comment on selection" callback with the captured text range. */
+  function applyCommentOnSelection(): void {
+    const menu = commentMenu
+    commentMenu = null
+    if (!menu) return
+    onCommentOnSelection?.({
+      shapeId: menu.shapeId,
+      shapeIndex: menu.shapeIndex,
+      start: menu.start,
+      end: menu.end,
+      x: menu.x,
+      y: menu.y,
+    })
+  }
+
+  /** Closes the "comment on selection" context menu. */
+  function closeCommentMenu(): void {
+    commentMenu = null
+  }
+
+  /** Right-click handler for non-text shapes: offers "Add comment". */
+  function handleShapeContextMenu(
+    event: MouseEvent,
+    shapeId: string | undefined,
+    shapeIndex: number,
+  ): void {
+    if (readonly || !onShapeContextMenu || !shapeId) return
     event.preventDefault()
-    void openSpellMenu(textarea, shapeIndex, hit.word, hit.start, hit.end, event.clientX, event.clientY)
+    onShapeContextMenu({ shapeId, shapeIndex, x: event.clientX, y: event.clientY })
   }
 
   /** Replaces the misspelled word with the chosen suggestion and re-checks. */
@@ -968,10 +1052,12 @@
     {:else if shape.kind === 'passthrough'}
       {@const obj = shape.value as PassthroughSnapshot}
       {@const passthroughIndex = slide.shapes.filter((s, i) => s.kind === 'passthrough' && i < shapeIndex).length}
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div
         class="passthrough"
         class:build-shape={buildStateFor(shapeIndex) !== undefined}
         data-shape-id={obj.id}
+        oncontextmenu={(event) => handleShapeContextMenu(event, obj.id, shapeIndex)}
         style:left={obj.frame ? toPx(obj.frame.x) : undefined}
         style:top={obj.frame ? toPx(obj.frame.y) : `${1 + passthroughIndex * 0.5}rem`}
         style:right={obj.frame ? undefined : '1rem'}
@@ -989,10 +1075,12 @@
       {@const entry = media?.[image.mediaRef]}
       {@const frame = image.transform.frame}
       {@const rotation = image.transform.rotation}
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div
         class="image-container"
         class:build-shape={buildStateFor(shapeIndex) !== undefined}
         data-shape-id={image.id}
+        oncontextmenu={(event) => handleShapeContextMenu(event, image.id, shapeIndex)}
         style:left={toPx(frame.x)}
         style:top={toPx(frame.y)}
         style:width={toPx(frame.width)}
@@ -1017,10 +1105,12 @@
     {:else if shape.kind === 'geometric'}
       {@const geometric = shape.value as GeometricShapeSnapshot}
       {@const frame = geometric.transform.frame}
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div
         class="geometric-container"
         class:build-shape={buildStateFor(shapeIndex) !== undefined}
         data-shape-id={geometric.id}
+        oncontextmenu={(event) => handleShapeContextMenu(event, geometric.id, shapeIndex)}
         style:left={toPx(frame.x)}
         style:top={toPx(frame.y)}
         style:width={toPx(frame.width)}
@@ -1038,10 +1128,12 @@
       {@const trot = table.transform.rotation}
       {@const colX = columnOffsets(table.columnWidths)}
       {@const rowY = rowOffsets(table.rows)}
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div
         class="table-container"
         class:build-shape={buildStateFor(shapeIndex) !== undefined}
         data-shape-id={table.id}
+        oncontextmenu={(event) => handleShapeContextMenu(event, table.id, shapeIndex)}
         style:left={toPx(tframe.x)}
         style:top={toPx(tframe.y)}
         style:width={toPx(tframe.width)}
@@ -1098,6 +1190,7 @@
         class:chart-readonly={readonly}
         class:build-shape={buildStateFor(shapeIndex) !== undefined}
         data-shape-id={chart.id}
+        oncontextmenu={(event) => handleShapeContextMenu(event, chart.id, shapeIndex)}
         style:left={toPx(frame.x)}
         style:top={toPx(frame.y)}
         style:width={toPx(frame.width)}
@@ -1156,6 +1249,31 @@
       onclick={addToDictionary}
     >
       Add &ldquo;{spellMenu.word}&rdquo; to dictionary
+    </button>
+  </div>
+{/if}
+
+{#if commentMenu}
+  <button
+    type="button"
+    class="spell-menu-backdrop"
+    aria-label="Close comment menu"
+    onclick={closeCommentMenu}
+  ></button>
+  <div
+    class="spell-menu"
+    style:left={`${commentMenu.x}px`}
+    style:top={`${commentMenu.y}px`}
+    role="menu"
+    aria-label="Comment on selection"
+  >
+    <button
+      type="button"
+      class="spell-menu-item"
+      role="menuitem"
+      onclick={applyCommentOnSelection}
+    >
+      Comment on selection
     </button>
   </div>
 {/if}

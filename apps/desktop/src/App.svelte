@@ -12,6 +12,7 @@
   import ShortcutsDialog from './ShortcutsDialog.svelte'
   import VersionHistory from './VersionHistory.svelte'
   import TemplatePicker from './TemplatePicker.svelte'
+  import Comments from './Comments.svelte'
   import type {
     AnimationDto,
     BuildEffectDto,
@@ -19,6 +20,7 @@
     ChartDataDto,
     ChartShapeSnapshot,
     ChartTypeDto,
+    CommentAnchorDto,
     DeckSnapshot,
     HeadingLevelDto,
     ParagraphDto,
@@ -76,6 +78,12 @@
   let showShortcuts = $state(false)
   /** Whether the version-history panel is open. */
   let showVersionHistory = $state(false)
+  /** Whether the comments sidebar is open. */
+  let showComments = $state(false)
+  /** Pending comment anchor invoked from a context menu, or null. */
+  let commentDraft = $state<CommentAnchorDto | null>(null)
+  /** Open "Add comment" shape context menu, or null. */
+  let shapeMenu = $state<{ shapeId: string; x: number; y: number } | null>(null)
   /** Slide-section start ids whose headers are collapsed in the sidebar. */
   let collapsedSections = $state<Set<string>>(new Set())
   /** Name being typed for a new slide section. */
@@ -330,6 +338,55 @@
   function onRestoreVersion(snapshot: DeckSnapshot): void {
     deck = snapshot
     activeIndex = Math.min(activeIndex, Math.max(snapshot.slides.length - 1, 0))
+  }
+
+  /** Adopts the deck snapshot returned by any comment command. */
+  function handleCommentApplied(snapshot: DeckSnapshot): void {
+    deck = snapshot
+  }
+
+  /** Opens the "Add comment" context menu for a right-clicked shape. */
+  function handleShapeContextMenu(detail: {
+    shapeId: string
+    shapeIndex: number
+    x: number
+    y: number
+  }): void {
+    shapeMenu = { shapeId: detail.shapeId, x: detail.x, y: detail.y }
+  }
+
+  /** Creates a shape-anchored comment draft from the open context menu. */
+  function addShapeComment(): void {
+    if (!shapeMenu || !activeSlide) return
+    commentDraft = { kind: 'shape', slideId: activeSlide.id, shapeId: shapeMenu.shapeId }
+    shapeMenu = null
+    showComments = true
+  }
+
+  /** Creates a text-range-anchored comment draft from a text selection. */
+  function handleCommentOnSelection(detail: {
+    shapeId: string
+    shapeIndex: number
+    start: number
+    end: number
+    x: number
+    y: number
+  }): void {
+    if (!activeSlide) return
+    commentDraft = {
+      kind: 'text_range',
+      slideId: activeSlide.id,
+      shapeId: detail.shapeId,
+      start: detail.start,
+      end: detail.end,
+    }
+    showComments = true
+  }
+
+  /** Closes the comments sidebar and clears any pending draft. */
+  function closeComments(): void {
+    showComments = false
+    commentDraft = null
   }
 
   /** Opens the presenter window. */
@@ -920,6 +977,9 @@
     } else if (!typing && event.key === '?') {
       event.preventDefault()
       showShortcuts = true
+    } else if (!mod && !typing && (event.key === 'c' || event.key === 'C')) {
+      event.preventDefault()
+      showComments = !showComments
     }
   }
 </script>
@@ -1103,6 +1163,15 @@
         >
           History
         </button>
+        <button
+          onclick={() => (showComments = !showComments)}
+          type="button"
+          class:active-toggle={showComments}
+          disabled={!deck}
+          title="Comments (C)"
+        >
+          Comments
+        </button>
         <span class="export-picker-wrap">
           <button
             onclick={() => (showExportMenu = !showExportMenu)}
@@ -1245,6 +1314,8 @@
             onSetCellText={handleSetCellText}
             onCellFocus={handleCellFocus}
             onEditChart={handleEditChart}
+            onShapeContextMenu={handleShapeContextMenu}
+            onCommentOnSelection={handleCommentOnSelection}
           />
         {:else}
           <div class="empty-canvas">Open or create a deck to start editing.</div>
@@ -1464,6 +1535,35 @@
         onClose={() => (showVersionHistory = false)}
         onRestore={onRestoreVersion}
       />
+    {/if}
+
+    {#if showComments && deck}
+      <Comments
+        deck={deck}
+        activeSlideId={activeSlide?.id ?? ''}
+        draft={commentDraft}
+        onApplied={handleCommentApplied}
+        onClearDraft={() => (commentDraft = null)}
+        onClose={closeComments}
+      />
+    {/if}
+
+    {#if shapeMenu}
+      <button
+        type="button"
+        class="picker-backdrop"
+        aria-label="Close shape menu"
+        onclick={() => (shapeMenu = null)}
+      ></button>
+      <div
+        class="shape-context-menu"
+        style:left={`${shapeMenu.x}px`}
+        style:top={`${shapeMenu.y}px`}
+        role="menu"
+        aria-label="Add comment"
+      >
+        <button type="button" role="menuitem" onclick={addShapeComment}>Add comment</button>
+      </div>
     {/if}
 
     {#if showTemplatePicker}
@@ -1791,6 +1891,27 @@
   .active-toggle {
     background: #0070c0 !important;
     color: #fff !important;
+  }
+  .shape-context-menu {
+    position: fixed;
+    z-index: 70;
+    min-width: 150px;
+    display: flex;
+    flex-direction: column;
+    background: #fff;
+    border: 1px solid #ccc;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  }
+  .shape-context-menu button {
+    text-align: left;
+    background: none;
+    border: none;
+    padding: 0.4rem 0.8rem;
+    cursor: pointer;
+    font-size: 0.85rem;
+  }
+  .shape-context-menu button:hover {
+    background: #f0f0f0;
   }
   .section-header {
     display: flex;
