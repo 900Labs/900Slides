@@ -1364,6 +1364,7 @@ fn session_from_slide_xml(slide_xml: &str, slide: Slide) -> Session {
             template: None,
             layouts: Vec::new(),
             master: Master::default(),
+            comments: Vec::new(),
         },
         original,
         package_rels,
