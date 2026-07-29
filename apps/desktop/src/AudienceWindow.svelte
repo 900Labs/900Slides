@@ -2,9 +2,11 @@
   import { invoke } from '@tauri-apps/api/core'
   import { listen, type UnlistenFn, type Event } from '@tauri-apps/api/event'
   import SlideCanvas from './SlideCanvas.svelte'
-  import type { ColorDto, PresenterState } from './lib/types'
+  import type { ColorDto, PresenterState, ProjectorFiltersDto } from './lib/types'
   import {
     PRESENTER_EVENTS,
+    defaultProjectorFilters,
+    projectorFilterCss,
     runMorph,
     slideRectFromStage,
     type BlankMode,
@@ -26,6 +28,10 @@
   let strokes = $state<HighlighterStroke[]>([])
   /** Audience blank mode. */
   let blankMode = $state<BlankMode>('none')
+  /** Projector CSS filters applied to the slide container. */
+  let appliedFilters = $state<ProjectorFiltersDto>(defaultProjectorFilters())
+  /** CSS `filter` string derived from {@link appliedFilters}. */
+  let filterCss = $derived(projectorFilterCss(appliedFilters))
   /** Bound stage element, used to measure the rendered slide. */
   let stageEl = $state<HTMLElement | null>(null)
   /** Rendered slide box in stage-local pixels. */
@@ -40,7 +46,10 @@
     const unlisteners: Array<() => void> = []
 
     invoke<PresenterState>('get_presenter_state').then((state) => {
-      if (!cancelled) presenterState = state
+      if (!cancelled) {
+        presenterState = state
+        appliedFilters = state.presenterSettings.projectorFilters ?? defaultProjectorFilters()
+      }
     })
 
     /** Registers a listener and ensures it is torn down even if the effect is. */
@@ -55,6 +64,7 @@
 
     on<PresenterState>(PRESENTER_EVENTS.state, (state) => {
       presenterState = state
+      appliedFilters = state.presenterSettings.projectorFilters ?? defaultProjectorFilters()
     })
     on<{ step: number }>(PRESENTER_EVENTS.buildStep, (payload) => {
       activeBuildStep = payload.step
@@ -70,6 +80,9 @@
     })
     on<{ mode: BlankMode }>(PRESENTER_EVENTS.blank, (payload) => {
       blankMode = payload.mode
+    })
+    on<ProjectorFiltersDto>(PRESENTER_EVENTS.filters, (payload) => {
+      appliedFilters = payload
     })
     on<MorphPayload>(PRESENTER_EVENTS.morph, (payload) => {
       morph = payload
@@ -154,6 +167,7 @@
         <div
           class="stage-content {transitionClass()}"
           style:--transition-duration="{transitionDurationMs()}ms"
+          style:filter={filterCss || 'none'}
         >
           <SlideCanvas
             slide={presenterState.currentSlide}

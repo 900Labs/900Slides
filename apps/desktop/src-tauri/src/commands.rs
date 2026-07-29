@@ -274,6 +274,9 @@ pub struct PresenterSettingsDto {
     /// Highlighter color as a CSS hex string. Defaults to yellow.
     #[serde(default = "default_highlighter_color_dto")]
     pub highlighter_color: String,
+    /// Projector compensation CSS filters applied to the audience window.
+    #[serde(default)]
+    pub projector_filters: ProjectorFiltersDto,
 }
 
 impl Default for PresenterSettingsDto {
@@ -283,6 +286,7 @@ impl Default for PresenterSettingsDto {
             laser_color: default_laser_color_dto(),
             highlighter: false,
             highlighter_color: default_highlighter_color_dto(),
+            projector_filters: ProjectorFiltersDto::default(),
         }
     }
 }
@@ -297,6 +301,75 @@ fn default_highlighter_color_dto() -> String {
     String::from("#ffff00")
 }
 
+/// Projector compensation CSS filters, mirroring
+/// [`slides_core::ProjectorFilters`]. Serialized to the audience window as a
+/// CSS `filter` string. Old snapshots without `projectorFilters` deserialize
+/// to the neutral default via the field-level `#[serde(default)]`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectorFiltersDto {
+    /// Invert all colors.
+    #[serde(default)]
+    pub invert: bool,
+    /// Brightness multiplier (1.0 = normal, 0.0 = black, 2.0 = double).
+    #[serde(default = "default_filter_unit")]
+    pub brightness: f64,
+    /// Contrast multiplier (1.0 = normal).
+    #[serde(default = "default_filter_unit")]
+    pub contrast: f64,
+    /// Saturation multiplier (1.0 = normal, 0.0 = grayscale).
+    #[serde(default = "default_filter_unit")]
+    pub saturation: f64,
+    /// Sepia intensity (0.0 = none, 1.0 = full sepia).
+    #[serde(default)]
+    pub sepia: f64,
+    /// Hue rotation in degrees (0.0 = none, 360.0 = full rotation).
+    #[serde(default)]
+    pub hue_rotate: f64,
+}
+
+impl Default for ProjectorFiltersDto {
+    fn default() -> Self {
+        Self {
+            invert: false,
+            brightness: default_filter_unit(),
+            contrast: default_filter_unit(),
+            saturation: default_filter_unit(),
+            sepia: 0.0,
+            hue_rotate: 0.0,
+        }
+    }
+}
+
+/// Neutral multiplier default (1.0) for brightness / contrast / saturation.
+fn default_filter_unit() -> f64 {
+    1.0
+}
+
+/// Converts a model [`slides_core::ProjectorFilters`] into its DTO.
+fn projector_filters_to_dto(filters: &slides_core::ProjectorFilters) -> ProjectorFiltersDto {
+    ProjectorFiltersDto {
+        invert: filters.invert,
+        brightness: filters.brightness,
+        contrast: filters.contrast,
+        saturation: filters.saturation,
+        sepia: filters.sepia,
+        hue_rotate: filters.hue_rotate,
+    }
+}
+
+/// Converts a [`ProjectorFiltersDto`] into the model type.
+fn projector_filters_from_dto(dto: &ProjectorFiltersDto) -> slides_core::ProjectorFilters {
+    slides_core::ProjectorFilters {
+        invert: dto.invert,
+        brightness: dto.brightness,
+        contrast: dto.contrast,
+        saturation: dto.saturation,
+        sepia: dto.sepia,
+        hue_rotate: dto.hue_rotate,
+    }
+}
+
 /// Converts a model [`slides_core::PresenterSettings`] into its DTO.
 fn presenter_settings_to_dto(settings: &slides_core::PresenterSettings) -> PresenterSettingsDto {
     PresenterSettingsDto {
@@ -304,6 +377,7 @@ fn presenter_settings_to_dto(settings: &slides_core::PresenterSettings) -> Prese
         laser_color: settings.laser_color.clone(),
         highlighter: settings.highlighter,
         highlighter_color: settings.highlighter_color.clone(),
+        projector_filters: projector_filters_to_dto(&settings.projector_filters),
     }
 }
 
@@ -314,6 +388,7 @@ fn presenter_settings_from_dto(dto: &PresenterSettingsDto) -> slides_core::Prese
         laser_color: dto.laser_color.clone(),
         highlighter: dto.highlighter,
         highlighter_color: dto.highlighter_color.clone(),
+        projector_filters: projector_filters_from_dto(&dto.projector_filters),
     }
 }
 

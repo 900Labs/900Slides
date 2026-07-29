@@ -395,6 +395,24 @@ export interface PresenterSettingsDto {
   highlighter: boolean
   /** Highlighter color as a CSS hex string (e.g. `#ffff00`). */
   highlighterColor: string
+  /** Projector compensation CSS filters applied to the audience window. */
+  projectorFilters: ProjectorFiltersDto
+}
+
+/** Projector compensation CSS filters, mirroring slides-core ProjectorFilters. */
+export interface ProjectorFiltersDto {
+  /** Invert all colors. */
+  invert: boolean
+  /** Brightness multiplier (1.0 = normal, 0.0 = black, 2.0 = double). */
+  brightness: number
+  /** Contrast multiplier (1.0 = normal). */
+  contrast: number
+  /** Saturation multiplier (1.0 = normal, 0.0 = grayscale). */
+  saturation: number
+  /** Sepia intensity (0.0 = none, 1.0 = full sepia). */
+  sepia: number
+  /** Hue rotation in degrees (0.0 = none, 360.0 = full rotation). */
+  hueRotate: number
 }
 
 /** Presenter view state. */
