@@ -112,6 +112,9 @@ impl AppState {
             id: deck.id.clone(),
             schema_version: deck.schema_version,
             theme: theme_to_dto(&deck.theme),
+            template: deck.template.clone(),
+            layouts: deck.layouts.iter().map(layout_to_dto).collect(),
+            master: master_to_dto(&deck.master),
             slide_size: deck.slide_size.as_ref().map(slide_size_to_dto),
             sections: deck.sections.iter().map(section_to_dto).collect(),
             slides: deck.slides.iter().map(slide_to_dto).collect(),
@@ -171,6 +174,15 @@ pub struct DeckSnapshot {
     pub schema_version: u32,
     /// Theme applied to the whole deck.
     pub theme: ThemeSnapshot,
+    /// Built-in template this deck is based on (e.g. "default", "pitch"), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    /// The deck's available layouts, derived from its template.
+    #[serde(default)]
+    pub layouts: Vec<LayoutDto>,
+    /// The deck's slide master: background layers and placeholder definitions.
+    #[serde(default)]
+    pub master: MasterDto,
     /// Fixed slide dimensions (aspect ratio), when set. When `None`, the deck
     /// renders at the default 16:9.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -325,6 +337,74 @@ pub struct SlideSnapshot {
     /// [`SlideSnapshot::notes`] field is used instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rich_notes: Option<Vec<ParagraphDto>>,
+    /// Name of the layout (from [`DeckSnapshot::layouts`]) this slide uses,
+    /// when any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout_ref: Option<String>,
+}
+
+/// A named placeholder frame, mirroring [`slides_core::PlaceholderDef`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaceholderDefDto {
+    /// Placeholder name, referenced by layouts.
+    pub name: String,
+    /// Bounding rectangle of the placeholder, in EMU.
+    pub frame: RectDto,
+}
+
+/// A named layout variant, mirroring [`slides_core::Layout`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LayoutDto {
+    /// Layout name (e.g. "Title Slide", "Title and Content").
+    pub name: String,
+    /// Placeholder overrides carried by this layout.
+    #[serde(default)]
+    pub placeholders: Vec<PlaceholderDefDto>,
+}
+
+/// A background shape painted by a slide master, mirroring
+/// [`slides_core::BackgroundShape`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundShapeDto {
+    /// The geometric shape data.
+    pub geometry: GeometryDto,
+    /// Visual style of the background shape.
+    pub style: StyleDto,
+    /// Position, size, and rotation of the background shape.
+    pub transform: TransformDto,
+}
+
+/// A slide master, mirroring [`slides_core::Master`].
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MasterDto {
+    /// Background shapes painted behind every slide.
+    #[serde(default)]
+    pub background_shapes: Vec<BackgroundShapeDto>,
+    /// Named placeholders that layouts reference.
+    #[serde(default)]
+    pub placeholders: Vec<PlaceholderDefDto>,
+}
+
+/// Summary of a built-in template for the picker, with a theme preview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TemplateInfoDto {
+    /// Stable template identifier (e.g. "default", "pitch").
+    pub name: String,
+    /// Human-readable template name shown in the picker.
+    pub display_name: String,
+    /// Theme background color as a CSS hex string (e.g. "#ffffff").
+    pub background_hex: String,
+    /// Theme accent color as a CSS hex string.
+    pub accent_hex: String,
+    /// Heading font family.
+    pub heading_font: String,
+    /// Body font family.
+    pub body_font: String,
 }
 
 /// Snapshot of a slide-to-slide transition.
@@ -935,15 +1015,77 @@ pub struct RecoverySnapshot {
 }
 
 /// Creates a new blank deck and returns its snapshot.
+///
+/// When `template_name` is `Some`, the named built-in template is applied to
+/// the fresh deck (its theme, master, and layouts) before the snapshot is
+/// returned. `None` leaves the default blank deck unchanged.
 #[tauri::command]
-pub fn new_deck(state: State<'_, AppState>) -> Result<DeckSnapshot, String> {
+pub fn new_deck(
+    template_name: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
     let bytes = slides_pptx::create_blank_pptx();
     let mut session = slides_pptx::load(&bytes).map_err(|e| e.to_string())?;
     let fresh = slides_core::Deck::new();
     session.deck_mut().id = fresh.id;
+    if let Some(name) = template_name {
+        let command = Box::new(slides_core::SetTemplate::new(name));
+        session.execute(command).map_err(|e| e.to_string())?;
+    }
     let snapshot = state.snapshot(session.deck());
     *state.session.lock().map_err(|e| e.to_string())? = Some(session);
     *state.presenter_index.lock().map_err(|e| e.to_string())? = 0;
+    Ok(snapshot)
+}
+
+/// Lists the six built-in templates with display names and theme previews for
+/// the template picker.
+#[tauri::command]
+pub fn list_templates() -> Vec<TemplateInfoDto> {
+    slides_core::TemplateRegistry::names()
+        .into_iter()
+        .filter_map(slides_core::TemplateRegistry::get)
+        .map(template_definition_to_dto)
+        .collect()
+}
+
+/// Applies a built-in template to the current deck and returns the updated
+/// deck snapshot. The change is applied via the verified
+/// [`slides_core::SetTemplate`] command so it is undoable.
+#[tauri::command]
+pub fn set_template(
+    template_name: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let command = Box::new(slides_core::SetTemplate::new(template_name));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Sets or clears a slide's layout reference and returns the updated deck
+/// snapshot. Pass `None` (or omit `layout_name`) to clear the layout. The
+/// change is applied via the verified [`slides_core::SetSlideLayout`] command
+/// so it is undoable.
+#[tauri::command]
+pub fn set_slide_layout(
+    slide_id: String,
+    layout_name: Option<String>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let command = Box::new(slides_core::SetSlideLayout::new(slide_id, layout_name));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
     Ok(snapshot)
 }
 
@@ -1849,8 +1991,8 @@ pub fn set_rich_notes(
 ) -> Result<DeckSnapshot, String> {
     let mut guard = state.session.lock().map_err(|e| e.to_string())?;
     let session = guard.as_mut().ok_or("no deck is open")?;
-    let core_notes = rich_notes
-        .map(|paragraphs| paragraphs.iter().map(paragraph_from_dto).collect());
+    let core_notes =
+        rich_notes.map(|paragraphs| paragraphs.iter().map(paragraph_from_dto).collect());
     let command = Box::new(slides_core::SetRichNotes::new(slide_id, core_notes));
     session.execute(command).map_err(|e| e.to_string())?;
     let snapshot = state.snapshot(session.deck());
@@ -2273,6 +2415,56 @@ fn theme_to_dto(theme: &slides_core::Theme) -> ThemeSnapshot {
     }
 }
 
+/// Formats an RGBA color as an opaque CSS hex string (e.g. "#1a1a2e").
+fn color_to_hex(color: slides_core::Color) -> String {
+    format!("#{:02x}{:02x}{:02x}", color.r, color.g, color.b)
+}
+
+fn placeholder_to_dto(placeholder: &slides_core::PlaceholderDef) -> PlaceholderDefDto {
+    PlaceholderDefDto {
+        name: placeholder.name.clone(),
+        frame: rect_to_dto(placeholder.frame),
+    }
+}
+
+fn layout_to_dto(layout: &slides_core::Layout) -> LayoutDto {
+    LayoutDto {
+        name: layout.name.clone(),
+        placeholders: layout.placeholders.iter().map(placeholder_to_dto).collect(),
+    }
+}
+
+fn background_shape_to_dto(shape: &slides_core::BackgroundShape) -> BackgroundShapeDto {
+    BackgroundShapeDto {
+        geometry: geometry_to_dto(shape.geometry),
+        style: style_to_dto(&shape.style),
+        transform: transform_to_dto(shape.transform),
+    }
+}
+
+fn master_to_dto(master: &slides_core::Master) -> MasterDto {
+    MasterDto {
+        background_shapes: master
+            .background_shapes
+            .iter()
+            .map(background_shape_to_dto)
+            .collect(),
+        placeholders: master.placeholders.iter().map(placeholder_to_dto).collect(),
+    }
+}
+
+/// Summarizes a built-in template definition for the template picker.
+fn template_definition_to_dto(def: slides_core::TemplateDefinition) -> TemplateInfoDto {
+    TemplateInfoDto {
+        name: def.name.to_string(),
+        display_name: def.display_name.to_string(),
+        background_hex: color_to_hex(def.theme.background),
+        accent_hex: color_to_hex(def.theme.accent_color),
+        heading_font: def.theme.heading_font,
+        body_font: def.theme.body_font,
+    }
+}
+
 fn slide_size_to_dto(size: &slides_core::SlideSize) -> SlideSizeDto {
     SlideSizeDto {
         width_emu: size.width_emu,
@@ -2321,6 +2513,7 @@ fn slide_to_dto(slide: &slides_core::Slide) -> SlideSnapshot {
             .rich_notes
             .as_ref()
             .map(|paragraphs| paragraphs.iter().map(paragraph_to_dto).collect()),
+        layout_ref: slide.layout_ref.clone(),
     }
 }
 
