@@ -17,7 +17,35 @@ This section tracks work toward v0.2.0 (editor completeness). See
 [`docs/sprint-records/wave-6.md`](docs/sprint-records/wave-6.md), and
 [`docs/sprint-records/wave-7.md`](docs/sprint-records/wave-7.md), and
 [`docs/sprint-records/wave-8.md`](docs/sprint-records/wave-8.md), and
-[`docs/sprint-records/wave-9.md`](docs/sprint-records/wave-9.md).
+[`docs/sprint-records/wave-9.md`](docs/sprint-records/wave-9.md), and
+[`docs/sprint-records/wave-10.md`](docs/sprint-records/wave-10.md).
+
+## [v0.3.0 — in progress]
+
+### Added — Wave 10 (Magic Move / Morph)
+
+- **Magic Move**: when a slide uses the Morph transition, the presenter
+  automatically interpolates position, size, rotation, and opacity for
+  shapes that share a stable id with the preceding slide. Non-matching
+  shapes fade in/out. This is the v0.3.0 headline feature.
+- Every editable shape variant (`TextBox`, `ImageShape`, `GeometricShape`,
+  `TableShape`, `ChartShape`) now carries a stable `id: String`
+  (`#[serde(default)]` — old decks deserialize with empty ids and behave
+  identically). The PPTX loader assigns the OOXML `p:cNvPr` id; the saver
+  emits it back. Shape ids round-trip through PPTX.
+- `TransitionKind::Morph` variant added.
+- New `slides-animation::morph_timeline` computes a deterministic cross-slide
+  interpolation frame sequence (matched by id, sorted alphabetically for
+  stable output). Three frame types: interpolate (from+to), fade-in (to
+  only), fade-out (from only).
+- The renderer tags shapes with `data-shape-id` attributes for presenter
+  matching.
+- PPTX saver emits `<p:morph>` transition; loader parses it.
+- Desktop: "Morph" added to the transition picker; presenter computes
+  morph frames via a `compute_morph` command and applies CSS transform/
+  opacity transitions on matching shape elements.
+- `docs/sprint-records/wave-10.md` documenting the wave scope and acceptance
+  criteria.
 
 ### Added — Wave 9 (templates and slide masters)
 
