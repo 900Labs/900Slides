@@ -222,3 +222,39 @@ fn text_range_anchor_round_trips() {
         other => panic!("expected TextRange anchor, got {other:?}"),
     }
 }
+
+#[test]
+fn comment_body_with_cdata_terminator_round_trips() {
+    let blank = crate::create_blank_pptx();
+    let mut session = load(blank.as_slice()).expect("blank should load");
+
+    // A comment body containing the literal CDATA terminator `]]>`.
+    session.deck_mut().comments.push(CommentThread {
+        id: "cdata-1".to_string(),
+        anchor: CommentAnchor::Slide {
+            slide_id: SLIDE_ID.to_string(),
+        },
+        comments: vec![Comment {
+            id: "cdata-c1".to_string(),
+            author: "tester".to_string(),
+            body: "code: if (a > b) { /* ]]> */ }".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            resolved: false,
+        }],
+        assigned_to: None,
+        resolved: false,
+    });
+
+    let bytes = save(&session).expect("save should succeed");
+    let reloaded = load(&bytes).expect("reload should succeed");
+    assert_eq!(
+        reloaded.deck().comments.len(),
+        1,
+        "comment with ]]> in body must survive round-trip"
+    );
+    assert_eq!(
+        reloaded.deck().comments[0].comments[0].body,
+        "code: if (a > b) { /* ]]> */ }",
+        "body text must be byte-identical after round-trip"
+    );
+}

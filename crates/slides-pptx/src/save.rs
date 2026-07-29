@@ -479,11 +479,14 @@ fn write_manifest(session: &Session) -> Vec<u8> {
             // data out of hand-written XML while staying inside the manifest.
             let json =
                 serde_json::to_string(&session.deck.comments).unwrap_or_else(|_| "[]".to_string());
+            // Split on the CDATA terminator so a comment body containing the
+            // literal `]]>` cannot corrupt the manifest XML.
+            let safe = json.replace("]]>", "]]]]><![CDATA[>");
             writer
                 .write_event(Event::Start(BytesStart::new("comments")))
                 .ok();
             writer
-                .write_event(Event::CData(BytesCData::new(json.as_str())))
+                .write_event(Event::CData(BytesCData::new(safe.as_str())))
                 .ok();
             writer
                 .write_event(Event::End(BytesEnd::new("comments")))
