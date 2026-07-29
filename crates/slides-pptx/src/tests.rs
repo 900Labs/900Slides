@@ -5,9 +5,9 @@ use std::io::{Read, Write};
 
 use slides_core::{
     AddShape, Animation, BuildEffect, BuildStep, Color, DashStyle, Deck, DeleteShape, EditText,
-    Fill, GeometricShape, Geometry, InsertImage, ListStyle, MediaEntry, MediaStore, MoveShape,
-    Outline, Paragraph, PassthroughObject, Rect, Run, SetShapeStyle, Shape, Slide, Style, TextBox,
-    Theme, Transform, Transition, TransitionKind,
+    Fill, GeometricShape, Geometry, InsertImage, ListStyle, Master, MediaEntry, MediaStore,
+    MoveShape, Outline, Paragraph, PassthroughObject, Rect, Run, SetShapeStyle, Shape, Slide,
+    Style, TextBox, Theme, Transform, Transition, TransitionKind,
 };
 use zip::write::{FileOptions, ZipWriter};
 
@@ -347,6 +347,7 @@ fn deck_round_trip_serialization() {
         animation: None,
         transition: None,
         rich_notes: None,
+        layout_ref: None,
     });
 
     let json = serde_json::to_string(&deck).expect("serialize");
@@ -1358,6 +1359,9 @@ fn session_from_slide_xml(slide_xml: &str, slide: Slide) -> Session {
             sections: Vec::new(),
             media: MediaStore::default(),
             presenter_settings: slides_core::PresenterSettings::default(),
+            template: None,
+            layouts: Vec::new(),
+            master: Master::default(),
         },
         original,
         package_rels,
@@ -1382,6 +1386,7 @@ fn save_no_edit_keeps_byte_identical() {
         animation: None,
         transition: Some(Transition::new(TransitionKind::Fade, 500)),
         rich_notes: None,
+        layout_ref: None,
     };
     let session = session_from_slide_xml(&slide_xml, slide);
     let saved = save(&session).expect("save should succeed");
@@ -1415,6 +1420,7 @@ fn save_edits_transition_preserves_other_parts() {
         animation: None,
         transition: Some(Transition::new(TransitionKind::Push, 750)),
         rich_notes: None,
+        layout_ref: None,
     };
     let mut session = session_from_slide_xml(&slide_xml, slide);
     session.mark_slide_dirty("ppt/slides/slide1.xml");
@@ -1472,6 +1478,7 @@ fn save_edits_animation_patches_timing() {
         )])),
         transition: None,
         rich_notes: None,
+        layout_ref: None,
     };
     let mut session = session_from_slide_xml(&slide_xml, slide);
     session.mark_slide_dirty("ppt/slides/slide1.xml");
@@ -1505,6 +1512,7 @@ fn clear_transition_then_save() {
         animation: None,
         transition: None,
         rich_notes: None,
+        layout_ref: None,
     };
     let mut session = session_from_slide_xml(&slide_xml, slide);
     session.mark_slide_dirty("ppt/slides/slide1.xml");
