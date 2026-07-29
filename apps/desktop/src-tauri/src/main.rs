@@ -82,6 +82,7 @@ fn main() {
             commands::set_comment_resolved,
             commands::assign_comment,
             commands::delete_comment_thread,
+            commands::check_accessibility,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -13,7 +13,9 @@
   import VersionHistory from './VersionHistory.svelte'
   import TemplatePicker from './TemplatePicker.svelte'
   import Comments from './Comments.svelte'
+  import AccessibilityPanel from './AccessibilityPanel.svelte'
   import type {
+    AccessibilityReportDto,
     AnimationDto,
     BuildEffectDto,
     BuildStepDto,
@@ -80,6 +82,15 @@
   let showVersionHistory = $state(false)
   /** Whether the comments sidebar is open. */
   let showComments = $state(false)
+  /** Whether the accessibility checker panel is open. */
+  let showAccessibility = $state(false)
+  /** Latest WCAG 2.2 AA report, or null while loading/none. */
+  let accessibility = $state<AccessibilityReportDto | null>(null)
+  /** True while an accessibility check is running. */
+  let checkingAccessibility = $state(false)
+  /** Index of a shape to highlight on the active slide (driven by the
+   *  accessibility panel); null draws no selection ring. */
+  let a11ySelectedShapeIndex = $state<number | null>(null)
   /** Pending comment anchor invoked from a context menu, or null. */
   let commentDraft = $state<CommentAnchorDto | null>(null)
   /** Open "Add comment" shape context menu, or null. */
@@ -388,6 +399,43 @@
     showComments = false
     commentDraft = null
   }
+
+  /** Runs the WCAG 2.2 AA accessibility check on the current deck. */
+  async function runAccessibility(): Promise<void> {
+    checkingAccessibility = true
+    try {
+      accessibility = await invoke<AccessibilityReportDto>('check_accessibility')
+    } catch (err) {
+      console.error('Accessibility check failed:', err)
+      accessibility = null
+    } finally {
+      checkingAccessibility = false
+    }
+  }
+
+  /** Opens the accessibility panel and runs the first check. */
+  function openAccessibility(): void {
+    showAccessibility = true
+    void runAccessibility()
+  }
+
+  /** Navigates to an issue's slide and highlights its shape, when applicable. */
+  function navigateToIssue(slideId: string | null, shapeIndex: number | null): void {
+    if (slideId && deck) {
+      const idx = deck.slides.findIndex((s) => s.id === slideId)
+      if (idx >= 0) activeIndex = idx
+    }
+    a11ySelectedShapeIndex = shapeIndex
+  }
+
+  // Keep the accessibility report fresh while the panel is open: re-run the
+  // offline check shortly after any deck edit (coalesces rapid keystrokes).
+  $effect(() => {
+    void deck
+    if (!showAccessibility) return
+    const timer = setTimeout(() => void runAccessibility(), 300)
+    return () => clearTimeout(timer)
+  })
 
   /** Opens the presenter window. */
   async function onStartPresenter(): Promise<void> {
@@ -834,6 +882,7 @@
   /** Selects a different slide in the thumbnail panel. */
   function selectSlide(index: number): void {
     activeIndex = index
+    a11ySelectedShapeIndex = null
   }
 
   /** Restores a recovery snapshot as the current deck. */
@@ -1172,6 +1221,15 @@
         >
           Comments
         </button>
+        <button
+          onclick={openAccessibility}
+          type="button"
+          class:active-toggle={showAccessibility}
+          disabled={!deck}
+          title="Accessibility checker (WCAG 2.2 AA score)"
+        >
+          A11y
+        </button>
         <span class="export-picker-wrap">
           <button
             onclick={() => (showExportMenu = !showExportMenu)}
@@ -1310,6 +1368,7 @@
             media={deck.media}
             slideSize={slideSize}
             highContrast={highContrast}
+            selectedShapeIndex={a11ySelectedShapeIndex}
             onEditTextBox={handleTextEdit}
             onSetCellText={handleSetCellText}
             onCellFocus={handleCellFocus}
@@ -1545,6 +1604,17 @@
         onApplied={handleCommentApplied}
         onClearDraft={() => (commentDraft = null)}
         onClose={closeComments}
+      />
+    {/if}
+
+    {#if showAccessibility && deck}
+      <AccessibilityPanel
+        report={accessibility}
+        {deck}
+        checking={checkingAccessibility}
+        onRecheck={() => void runAccessibility()}
+        onNavigate={navigateToIssue}
+        onClose={() => (showAccessibility = false)}
       />
     {/if}
 
