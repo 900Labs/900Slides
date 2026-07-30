@@ -350,6 +350,7 @@ fn deck_round_trip_serialization() {
         rich_notes: None,
         layout_ref: None,
         reduce_motion: None,
+        rehearsed_duration_ms: None,
     });
 
     let json = serde_json::to_string(&deck).expect("serialize");
@@ -1447,6 +1448,7 @@ fn save_no_edit_keeps_byte_identical() {
         rich_notes: None,
         layout_ref: None,
         reduce_motion: None,
+        rehearsed_duration_ms: None,
     };
     let session = session_from_slide_xml(&slide_xml, slide);
     let saved = save(&session).expect("save should succeed");
@@ -1482,6 +1484,7 @@ fn save_edits_transition_preserves_other_parts() {
         rich_notes: None,
         layout_ref: None,
         reduce_motion: None,
+        rehearsed_duration_ms: None,
     };
     let mut session = session_from_slide_xml(&slide_xml, slide);
     session.mark_slide_dirty("ppt/slides/slide1.xml");
@@ -1541,6 +1544,7 @@ fn save_edits_animation_patches_timing() {
         rich_notes: None,
         layout_ref: None,
         reduce_motion: None,
+        rehearsed_duration_ms: None,
     };
     let mut session = session_from_slide_xml(&slide_xml, slide);
     session.mark_slide_dirty("ppt/slides/slide1.xml");
@@ -1576,6 +1580,7 @@ fn clear_transition_then_save() {
         rich_notes: None,
         layout_ref: None,
         reduce_motion: None,
+        rehearsed_duration_ms: None,
     };
     let mut session = session_from_slide_xml(&slide_xml, slide);
     session.mark_slide_dirty("ppt/slides/slide1.xml");
@@ -1605,6 +1610,7 @@ fn save_morph_transition_round_trips() {
         rich_notes: None,
         layout_ref: None,
         reduce_motion: None,
+        rehearsed_duration_ms: None,
     };
     let mut session = session_from_slide_xml(&slide_xml, slide);
     session.mark_slide_dirty("ppt/slides/slide1.xml");
@@ -1638,6 +1644,7 @@ fn save_morph_preserves_other_parts() {
         rich_notes: None,
         layout_ref: None,
         reduce_motion: None,
+        rehearsed_duration_ms: None,
     };
     let mut session = session_from_slide_xml(&slide_xml, slide);
     session.mark_slide_dirty("ppt/slides/slide1.xml");

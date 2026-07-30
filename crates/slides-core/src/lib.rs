@@ -402,6 +402,10 @@ pub struct Slide {
     /// unchanged — a non-breaking, additive change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reduce_motion: Option<bool>,
+    /// Per-slide rehearsed duration in milliseconds. `None` means no timing
+    /// recorded. Used by the presenter's auto-advance mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rehearsed_duration_ms: Option<u32>,
 }
 
 /// A shape or content object placed on a slide.
@@ -4650,6 +4654,53 @@ impl Command for SetSlideReduceMotion {
     }
 }
 
+/// Sets or clears a slide's rehearsed duration (for auto-advance).
+/// Inverse snapshots the prior `Option<u32>`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetSlideRehearsedDuration {
+    slide_id: String,
+    duration_ms: Option<u32>,
+}
+
+impl SetSlideRehearsedDuration {
+    pub fn new(slide_id: impl Into<String>, duration_ms: Option<u32>) -> Self {
+        Self {
+            slide_id: slide_id.into(),
+            duration_ms,
+        }
+    }
+}
+
+impl Command for SetSlideRehearsedDuration {
+    fn apply(&self, deck: &mut Deck) {
+        if let Some(slide) = deck.slide_mut(&self.slide_id) {
+            slide.rehearsed_duration_ms = self.duration_ms;
+        }
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        let prior = deck
+            .slide(&self.slide_id)
+            .and_then(|slide| slide.rehearsed_duration_ms);
+        Box::new(Self {
+            slide_id: self.slide_id.clone(),
+            duration_ms: prior,
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        deck.slide(&self.slide_id).is_some()
+    }
+}
+
 /// Sets or clears the deck's slide size (aspect ratio).
 ///
 /// This is a deck-level command: it affects the whole deck rather than a
@@ -5465,6 +5516,7 @@ mod tests {
             rich_notes: None,
             layout_ref: None,
             reduce_motion: None,
+            rehearsed_duration_ms: None,
         });
 
         let json = serde_json::to_string(&deck).expect("serialize deck");
@@ -5492,6 +5544,7 @@ mod tests {
             rich_notes: None,
             layout_ref: None,
             reduce_motion: None,
+            rehearsed_duration_ms: None,
         });
 
         let mut bus = CommandBus::default();
@@ -5532,6 +5585,7 @@ mod tests {
             rich_notes: None,
             layout_ref: None,
             reduce_motion: None,
+            rehearsed_duration_ms: None,
         });
 
         let mut bus = CommandBus::default();
@@ -5569,6 +5623,7 @@ mod tests {
             rich_notes: None,
             layout_ref: None,
             reduce_motion: None,
+            rehearsed_duration_ms: None,
         });
 
         let mut bus = CommandBus::default();
@@ -5610,6 +5665,7 @@ mod tests {
             rich_notes: None,
             layout_ref: None,
             reduce_motion: None,
+            rehearsed_duration_ms: None,
         });
 
         let mut bus = CommandBus::default();
@@ -5663,6 +5719,7 @@ mod tests {
             rich_notes: None,
             layout_ref: None,
             reduce_motion: None,
+            rehearsed_duration_ms: None,
         }
     }
 
@@ -6253,6 +6310,7 @@ mod tests {
             rich_notes: None,
             layout_ref: None,
             reduce_motion: None,
+            rehearsed_duration_ms: None,
         });
 
         let mut value = serde_json::to_value(&deck).expect("serialize to value");
@@ -6376,6 +6434,7 @@ mod tests {
             rich_notes: None,
             layout_ref: None,
             reduce_motion: None,
+            rehearsed_duration_ms: None,
         });
         let original = deck.clone();
 
@@ -6430,6 +6489,7 @@ mod tests {
             rich_notes: None,
             layout_ref: None,
             reduce_motion: None,
+            rehearsed_duration_ms: None,
         });
 
         let mut bus = CommandBus::default();
@@ -6475,6 +6535,7 @@ mod tests {
             rich_notes: None,
             layout_ref: None,
             reduce_motion: None,
+            rehearsed_duration_ms: None,
         });
 
         let mut bus = CommandBus::default();
@@ -9100,6 +9161,7 @@ mod tests {
             rich_notes: None,
             layout_ref: None,
             reduce_motion: None,
+            rehearsed_duration_ms: None,
         };
         let json = serde_json::to_string(&slide).expect("serialize slide");
         let restored: Slide = serde_json::from_str(&json).expect("deserialize slide");
@@ -9140,6 +9202,7 @@ mod tests {
             rich_notes: None,
             layout_ref: None,
             reduce_motion: None,
+            rehearsed_duration_ms: None,
         };
         let mut deck = Deck::new();
         deck.slides.push(slide);
@@ -9918,6 +9981,33 @@ mod tests {
         assert_eq!(deck.slides[0].reduce_motion, Some(false));
         assert!(bus.undo(&mut deck).is_some());
         assert_eq!(deck.slides[0].reduce_motion, Some(true));
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn set_slide_rehearsed_duration_applies_and_undoes() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with("s1", vec![geo_rectangle()]));
+        let original = deck.clone();
+
+        let mut bus = CommandBus::default();
+        bus.apply(
+            Box::new(SetSlideRehearsedDuration::new("s1", Some(5000))),
+            &mut deck,
+        )
+        .expect("set duration");
+        assert_eq!(deck.slides[0].rehearsed_duration_ms, Some(5000));
+
+        bus.apply(
+            Box::new(SetSlideRehearsedDuration::new("s1", None)),
+            &mut deck,
+        )
+        .expect("clear duration");
+        assert_eq!(deck.slides[0].rehearsed_duration_ms, None);
+
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck.slides[0].rehearsed_duration_ms, Some(5000));
         assert!(bus.undo(&mut deck).is_some());
         assert_eq!(deck, original);
     }
