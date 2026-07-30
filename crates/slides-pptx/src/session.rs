@@ -221,6 +221,23 @@ impl Session {
         }
     }
 
+    /// Re-applies the most recently undone command.
+    pub fn redo(&mut self) -> bool {
+        if let Some(affected) = self.command_bus.redo(&mut self.deck) {
+            for id in affected {
+                self.mark_slide_dirty(&id);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns the number of transactions available to redo.
+    pub fn redo_len(&self) -> usize {
+        self.command_bus.redo_len()
+    }
+
     /// Commits a successful save by replacing the original bytes and clearing
     /// the dirty slide set.
     pub fn commit_save(&mut self, new_bytes: Vec<u8>) {

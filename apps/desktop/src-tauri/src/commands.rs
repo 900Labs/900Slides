@@ -1497,6 +1497,15 @@ impl slides_core::Command for RestoreDeck {
     fn serialized_size(&self) -> usize {
         serde_json::to_string(self.replacement.as_ref()).map_or(0, |s| s.len())
     }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        // Return ALL slide ids from the replacement deck so that undo (which
+        // wraps the prior deck in another RestoreDeck) correctly re-marks
+        // slides as dirty. Without this, undo-after-save would leave the
+        // model and file desynced (the file would contain the restored deck
+        // while the editor shows the prior one).
+        self.replacement.slides.iter().map(|s| s.id.clone()).collect()
+    }
 }
 
 /// Lists every saved version for the current deck, newest first. Reads only
@@ -2679,6 +2688,20 @@ pub fn undo(app: AppHandle, state: State<'_, AppState>) -> Result<DeckSnapshot, 
     let session = guard.as_mut().ok_or("no deck is open")?;
     if !session.undo() {
         return Err("nothing to undo".to_string());
+    }
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Re-applies the most recently undone edit.
+#[tauri::command]
+pub fn redo(app: AppHandle, state: State<'_, AppState>) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    if !session.redo() {
+        return Err("nothing to redo".to_string());
     }
     let snapshot = state.snapshot(session.deck());
     drop(guard);
