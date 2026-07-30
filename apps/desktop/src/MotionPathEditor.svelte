@@ -12,8 +12,7 @@
 
   let { waypoints, onCancel, onSave }: Props = $props()
 
-  /** Local editable copy of the waypoints (EMU), initialized once when the
-   *  editor opens. */
+  // svelte-ignore state_referenced_locally
   let draft = $state<RectDto[]>(waypoints.map((w) => ({ ...w })))
   /** Bound canvas element for imperative 2D rendering. */
   let canvasEl = $state<HTMLCanvasElement | null>(null)
