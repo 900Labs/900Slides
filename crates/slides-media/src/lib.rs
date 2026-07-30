@@ -386,14 +386,37 @@ fn validate_svg(text: &str) -> Result<()> {
                 if local_str.eq_ignore_ascii_case("script") {
                     return Err(Error::UnsafeSvg("contains a <script> element".into()));
                 }
-                for attr in e.attributes().flatten() {
+                if local_str.eq_ignore_ascii_case("style") {
+                    return Err(Error::UnsafeSvg("contains a <style> element".into()));
+                }
+                for attr in e.attributes() {
+                    let attr = match attr {
+                        Ok(a) => a,
+                        Err(_) => {
+                            return Err(Error::UnsafeSvg(
+                                "attribute with unparseable entity".into(),
+                            ));
+                        }
+                    };
                     let key = String::from_utf8_lossy(attr.key.as_ref());
                     let lower = key.to_ascii_lowercase();
                     if lower.starts_with("on") && lower.len() > 2 {
                         return Err(Error::UnsafeSvg(format!("event-handler attribute '{key}'")));
                     }
+                    if lower == "style" {
+                        return Err(Error::UnsafeSvg(
+                            "inline style attribute not allowed".into(),
+                        ));
+                    }
                     if matches!(lower.as_str(), "href" | "xlink:href" | "src") {
-                        let value = attr.unescape_value().unwrap_or_default();
+                        let value = match attr.unescape_value() {
+                            Ok(v) => v.into_owned(),
+                            Err(_) => {
+                                return Err(Error::UnsafeSvg(
+                                    "URL attribute with unparseable entity".into(),
+                                ));
+                            }
+                        };
                         if is_unsafe_url(&value) {
                             return Err(Error::UnsafeSvg(format!("external reference '{value}'")));
                         }
@@ -418,6 +441,11 @@ fn is_unsafe_url(value: &str) -> bool {
     let trimmed = value.trim();
     if trimmed.starts_with('#') {
         return false;
+    }
+    // Reject protocol-relative URLs (e.g. //evil.example/x) which resolve to
+    // https://evil.example/x in a browser context.
+    if trimmed.starts_with("//") {
+        return true;
     }
     let lowered = trimmed.to_ascii_lowercase();
     // Reject known dangerous script schemes explicitly...
@@ -627,6 +655,27 @@ mod tests {
     #[test]
     fn rejects_svg_with_script_element() {
         let svg = b"<svg><script>alert(1)</script></svg>";
+        let err = ingest(svg, &IngestOptions::default()).unwrap_err();
+        assert!(matches!(err, Error::UnsafeSvg(_)));
+    }
+
+    #[test]
+    fn rejects_svg_with_style_element() {
+        let svg = b"<svg><style>@import url(http://evil.example/x)</style></svg>";
+        let err = ingest(svg, &IngestOptions::default()).unwrap_err();
+        assert!(matches!(err, Error::UnsafeSvg(_)));
+    }
+
+    #[test]
+    fn rejects_svg_with_inline_style_attribute() {
+        let svg = b"<svg><rect style=\"fill:url(http://evil.example/x)\"/></svg>";
+        let err = ingest(svg, &IngestOptions::default()).unwrap_err();
+        assert!(matches!(err, Error::UnsafeSvg(_)));
+    }
+
+    #[test]
+    fn rejects_svg_with_protocol_relative_url() {
+        let svg = b"<svg><image href=\"//evil.example/track.png\"/></svg>";
         let err = ingest(svg, &IngestOptions::default()).unwrap_err();
         assert!(matches!(err, Error::UnsafeSvg(_)));
     }
