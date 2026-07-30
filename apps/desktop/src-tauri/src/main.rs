@@ -224,6 +224,8 @@ fn main() {
             commands::set_paragraph_style,
             commands::insert_image,
             commands::add_shape,
+            commands::add_text_box,
+            commands::new_slide,
             commands::update_shape_transform,
             commands::update_shape_style,
             commands::delete_shape,

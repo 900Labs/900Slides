@@ -1854,6 +1854,61 @@ pub fn add_shape(
     Ok(snapshot)
 }
 
+/// Appends a new, empty editable text box at the given EMU frame to a slide and
+/// returns the updated deck snapshot. Created through the verified
+/// [`slides_core::AddShape`] command (with a [`slides_core::Shape::TextBox`]),
+/// so the insertion is undoable and saves with the rest of the slide.
+#[tauri::command]
+pub fn add_text_box(
+    slide_id: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let shape = slides_core::Shape::TextBox(slides_core::TextBox {
+        id: slides_core::Shape::generate_id(),
+        frame: slides_core::Rect::new(x, y, width, height),
+        paragraphs: Vec::new(),
+    });
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let command = Box::new(slides_core::AddShape::new(slide_id, shape));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Appends a new blank slide to the deck and returns the updated snapshot. The
+/// slide is added to the in-memory model so it is immediately editable; it is
+/// inserted after the current slide's position when an index is supplied,
+/// otherwise at the end.
+#[tauri::command]
+pub fn new_slide(
+    after_index: Option<usize>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let slide = slides_core::Slide {
+        id: slides_core::Shape::generate_id(),
+        ..Default::default()
+    };
+    let insert_at = after_index
+        .map(|i| (i + 1).min(session.deck().slides.len()))
+        .unwrap_or_else(|| session.deck().slides.len());
+    session.deck_mut().slides.insert(insert_at, slide);
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
 /// Updates a shape's transform (position/size/rotation) and returns the updated
 /// deck snapshot.
 #[tauri::command]
