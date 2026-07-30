@@ -26,6 +26,20 @@ This section tracks work toward v0.2.0 (editor completeness). See
 
 ## [v0.4.0 — in progress]
 
+### Added — Wave 20 (custom layouts + rehearse timings)
+
+- **Layout picker**: a dropdown in the slide context menu showing the
+  current template's available layouts. Selecting one sets the slide's
+  layout and re-renders with placeholder guides.
+- **Rehearse timings**: a "Rehearse" button in the presenter records
+  per-slide durations. When done, timings are committed to the deck. A
+  "Use timings" toggle enables auto-advance — the presenter advances
+  automatically after each slide's rehearsed duration, with a countdown
+  indicator.
+- `Slide.rehearsed_duration_ms: Option<u32>` (additive). New
+  `SetSlideRehearsedDuration` command (reversible).
+- `docs/sprint-records/wave-20.md` documenting the wave scope.
+
 ### Added — Wave 19 (animation enhancements)
 
 - **Trigger model**: build steps now fire on click, with the previous step,
