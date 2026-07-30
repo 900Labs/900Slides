@@ -1,8 +1,11 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core'
+  import { listen } from '@tauri-apps/api/event'
+  import { tick } from 'svelte'
   import { open, save } from '@tauri-apps/plugin-dialog'
   import SlideThumbnail from './SlideThumbnail.svelte'
   import SlideCanvas from './SlideCanvas.svelte'
+  import ShapePicker from './ShapePicker.svelte'
   import Presenter from './Presenter.svelte'
   import AudienceWindow from './AudienceWindow.svelte'
   import RecoveryPrompt from './RecoveryPrompt.svelte'
@@ -113,6 +116,12 @@
   } | null>(null)
   /** Bound step-ranges input, so committing the value does not hide it. */
   let codeStepsInput = $state<HTMLInputElement | null>(null)
+  /** Whether the shape picker flyout is open. */
+  let showShapeFlyout = $state(false)
+  /** Whether "Text Box" creation mode is armed (next canvas click places one). */
+  let creatingTextBox = $state(false)
+  /** The editor canvas-area element, used to map clicks to slide coordinates. */
+  let canvasAreaEl = $state<HTMLElement | null>(null)
 
   /** Maximum grid dimension offered by the table size picker. */
   const PICKER_MAX = 6
@@ -682,11 +691,177 @@
   /** Appends a geometric shape of the given kind to the active slide. */
   async function onAddShape(geometryKind: string): Promise<void> {
     if (!activeSlide) return
+    showShapeFlyout = false
     deck = await invoke<DeckSnapshot>('add_shape', {
       slide_id: activeSlide.id,
       geometry_kind: geometryKind,
     })
   }
+
+  /** Re-applies the most recently undone edit. */
+  async function onRedo(): Promise<void> {
+    deck = await invoke<DeckSnapshot>('redo')
+    activeIndex = Math.min(activeIndex, (deck?.slides.length ?? 1) - 1)
+  }
+
+  /** Inserts a new blank slide after the active one and selects it. */
+  async function onNewSlide(): Promise<void> {
+    if (!deck) return
+    deck = await invoke<DeckSnapshot>('new_slide', { after_index: activeIndex })
+    activeIndex = Math.min(activeIndex + 1, (deck?.slides.length ?? 1) - 1)
+    a11ySelectedShapeIndex = null
+  }
+
+  /** Arms text-box creation mode: the next click on the canvas places a box. */
+  function enterCreateTextBox(): void {
+    creatingTextBox = true
+  }
+
+  /** Cancels text-box creation mode without placing a box. */
+  function cancelCreateTextBox(): void {
+    creatingTextBox = false
+  }
+
+  /** Default text-box size (EMU) for click-to-create placement. */
+  const TEXT_BOX_DEFAULT_W_EMU = 2_743_200
+  const TEXT_BOX_DEFAULT_H_EMU = 1_371_600
+
+  /** Maps a pointer event on the canvas-area to a top-left EMU frame for a new
+   *  text box, centered on the click and clamped to the slide bounds. Returns
+   *  null when the click landed outside the rendered slide. */
+  function textBoxFrameFromClick(event: MouseEvent): { x: number; y: number; w: number; h: number } | null {
+    const canvas = canvasAreaEl?.querySelector<HTMLElement>('.canvas')
+    if (!canvas) return null
+    const rect = canvas.getBoundingClientRect()
+    const insideX = event.clientX >= rect.left && event.clientX <= rect.right
+    const insideY = event.clientY >= rect.top && event.clientY <= rect.bottom
+    if (!insideX || !insideY) return null
+    const slideW = slideSize?.widthEmu ?? 12_192_000
+    const slideH = slideSize?.heightEmu ?? 6_858_000
+    const relX = (event.clientX - rect.left) / rect.width
+    const relY = (event.clientY - rect.top) / rect.height
+    const cx = relX * slideW
+    const cy = relY * slideH
+    const w = TEXT_BOX_DEFAULT_W_EMU
+    const h = TEXT_BOX_DEFAULT_H_EMU
+    const x = Math.min(Math.max(cx - w / 2, 0), Math.max(slideW - w, 0))
+    const y = Math.min(Math.max(cy - h / 2, 0), Math.max(slideH - h, 0))
+    return { x, y, w, h }
+  }
+
+  /** Places a new text box at the click position, selects it, and focuses its
+   *  editor so the user can start typing immediately. */
+  async function onCanvasClickCreateTextBox(event: MouseEvent): Promise<void> {
+    const frame = textBoxFrameFromClick(event)
+    creatingTextBox = false
+    if (!frame || !activeSlide) return
+    deck = await invoke<DeckSnapshot>('add_text_box', {
+      slide_id: activeSlide.id,
+      x: frame.x,
+      y: frame.y,
+      width: frame.w,
+      height: frame.h,
+    })
+    // The new box is the last shape on the active slide; focus its textarea.
+    const newIndex = (deck?.slides[activeIndex]?.shapes.length ?? 0) - 1
+    await tick()
+    const ta = document.querySelector<HTMLTextAreaElement>(
+      `textarea.text-box[data-shape-index="${newIndex}"]`,
+    )
+    ta?.focus()
+  }
+
+  /** Dispatches a native menu-event id to the matching editor action. */
+  function handleMenuEvent(id: string): void {
+    switch (id) {
+      case 'menu_new':
+        void openTemplatePicker()
+        break
+      case 'menu_open':
+        void onOpen()
+        break
+      case 'menu_save':
+      case 'menu_save_as':
+        void onSave()
+        break
+      case 'menu_undo':
+        void onUndo()
+        break
+      case 'menu_redo':
+        void onRedo()
+        break
+      case 'menu_new_slide':
+        void onNewSlide()
+        break
+      case 'menu_text_box':
+        enterCreateTextBox()
+        break
+      case 'menu_image':
+        onInsertImage()
+        break
+      case 'menu_shape':
+        showShapeFlyout = true
+        break
+      case 'menu_table':
+        showTablePicker = true
+        break
+      case 'menu_chart':
+        showChartDropdown = true
+        break
+      case 'menu_comment':
+        if (deck) showComments = !showComments
+        break
+      case 'menu_bold':
+        void toggleRunFlag('bold')
+        break
+      case 'menu_italic':
+        void toggleRunFlag('italic')
+        break
+      case 'menu_underline':
+        void toggleRunFlag('underline')
+        break
+      case 'menu_present':
+        void onStartPresenter()
+        break
+      case 'menu_export_svg':
+        void onExportSvg()
+        break
+      case 'menu_export_png':
+        void onExportPng()
+        break
+      case 'menu_export_pdf':
+        void onExportPdf()
+        break
+      case 'menu_find':
+        findReplaceMode = 'find'
+        showFindReplace = true
+        break
+      case 'menu_find_replace':
+        findReplaceMode = 'replace'
+        showFindReplace = true
+        break
+      case 'menu_shortcuts':
+        showShortcuts = true
+        break
+      default:
+        break
+    }
+  }
+
+  // Listen for native menu actions emitted by the Tauri backend.
+  $effect(() => {
+    if (isPresenter || isAudience) return
+    let unlisten: (() => void) | undefined
+    let cancelled = false
+    void listen<string>('menu-event', (event) => handleMenuEvent(event.payload)).then((fn) => {
+      if (cancelled) fn()
+      else unlisten = fn
+    })
+    return () => {
+      cancelled = true
+      unlisten?.()
+    }
+  })
 
   /** Appends a new `rows` x `cols` table to the active slide. */
   async function onAddTable(rows: number, cols: number): Promise<void> {
@@ -973,6 +1148,12 @@
       target instanceof HTMLTextAreaElement ||
       (target?.isContentEditable ?? false)
 
+    if (creatingTextBox && event.key === 'Escape') {
+      event.preventDefault()
+      cancelCreateTextBox()
+      return
+    }
+
     if (mod && event.key.toLowerCase() === 'f') {
       event.preventDefault()
       findReplaceMode = 'find'
@@ -997,32 +1178,97 @@
   <AudienceWindow />
 {:else}
   <div class="app">
-    <header class="toolbar">
-      <button onclick={openTemplatePicker} type="button">New</button>
-      <button onclick={onOpen} type="button">Open</button>
-      <button onclick={onSave} type="button">Save</button>
-      <button onclick={onUndo} type="button">Undo</button>
-      <button onclick={onStartPresenter} type="button">Present</button>
-      <span class="toolbar-divider"></span>
-      <button onclick={onInsertImage} type="button">Insert Image</button>
-      <span class="shape-group">
-        <span class="shape-label">Shape:</span>
-        <button onclick={() => onAddShape('rectangle')} type="button">Rectangle</button>
-        <button onclick={() => onAddShape('ellipse')} type="button">Ellipse</button>
-        <button onclick={() => onAddShape('triangle')} type="button">Triangle</button>
+    <header class="toolbar" role="toolbar" aria-label="Editor toolbar">
+      <!-- Left group: Undo | Redo | Save | separator | New Slide -->
+      <span class="tb-group">
+        <button class="tb-btn" onclick={onUndo} type="button" title="Undo (Cmd/Ctrl+Z)" aria-label="Undo">
+          <svg viewBox="0 0 24 24"><path d="M9 14 4 9l5-5"></path><path d="M4 9h9a6 6 0 0 1 0 12H9"></path></svg>
+        </button>
+        <button class="tb-btn" onclick={onRedo} type="button" title="Redo (Cmd/Ctrl+Shift+Z)" aria-label="Redo">
+          <svg viewBox="0 0 24 24"><path d="M15 14l5-5-5-5"></path><path d="M20 9h-9a6 6 0 0 0 0 12h4"></path></svg>
+        </button>
+        <button class="tb-btn" onclick={onSave} type="button" title="Save (Cmd/Ctrl+S)" aria-label="Save">
+          <svg viewBox="0 0 24 24"><path d="M6 3h9l4 4v14H6z"></path><path d="M9 3v5h6"></path><rect x="9" y="13" width="6" height="6"></rect></svg>
+        </button>
+        <span class="tb-sep"></span>
+        <button
+          class="tb-btn"
+          onclick={onNewSlide}
+          type="button"
+          disabled={!deck}
+          title="New slide (Cmd/Ctrl+Shift+N)"
+          aria-label="New slide"
+        >
+          <svg viewBox="0 0 24 24"><rect x="3" y="4" width="13" height="16" rx="1"></rect><path d="M17 10h5v10h-8"></path><path d="M19.5 13v4M17.5 15h4"></path></svg>
+        </button>
       </span>
-      <span class="toolbar-divider"></span>
-      <span class="table-group">
-        <div class="table-picker-wrap">
+
+      <span class="tb-sep"></span>
+
+      <!-- Center group: Text Box | Shape (flyout) | Image | Table | Chart -->
+      <span class="tb-group">
+        <button
+          class="tb-btn"
+          class:active={creatingTextBox}
+          onclick={enterCreateTextBox}
+          type="button"
+          disabled={!deck || !activeSlide}
+          title="Text box — then click the slide to place it"
+          aria-label="Text box"
+          aria-pressed={creatingTextBox}
+        >
+          <svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="1"></rect><text x="12" y="17" text-anchor="middle" font-size="12" font-weight="bold" stroke="none" fill="currentColor">T</text></svg>
+        </button>
+        <span class="shape-picker-wrap">
           <button
+            class="tb-btn"
+            class:active={showShapeFlyout}
+            onclick={() => (showShapeFlyout = !showShapeFlyout)}
+            type="button"
+            disabled={!deck || !activeSlide}
+            title="Shapes"
+            aria-label="Shapes"
+            aria-expanded={showShapeFlyout}
+          >
+            <svg viewBox="0 0 24 24"><path d="M4 17l4-8 4 8z"></path><rect x="13" y="9" width="7" height="7" rx="1"></rect></svg>
+          </button>
+          {#if showShapeFlyout}
+            <button
+              class="picker-backdrop"
+              onclick={() => (showShapeFlyout = false)}
+              type="button"
+              aria-label="Close shape picker"
+            ></button>
+            <div class="shape-picker-popover">
+              <ShapePicker onPick={(kind) => onAddShape(kind)} />
+            </div>
+          {/if}
+        </span>
+        <button
+          class="tb-btn"
+          onclick={onInsertImage}
+          type="button"
+          disabled={!deck || !activeSlide}
+          title="Insert image"
+          aria-label="Insert image"
+        >
+          <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="1"></rect><circle cx="8.5" cy="9.5" r="1.6"></circle><path d="M4 18l5-5 4 4 3-3 4 4"></path></svg>
+        </button>
+        <span class="table-picker-wrap">
+          <button
+            class="tb-btn"
             onclick={() => {
               showTablePicker = !showTablePicker
               pickerRows = 1
               pickerCols = 1
             }}
             type="button"
+            disabled={!deck || !activeSlide}
+            title="Table"
+            aria-label="Table"
+            aria-expanded={showTablePicker}
           >
-            Table
+            <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="1"></rect><path d="M3 10h18M3 15h18M9 4v16M15 4v16"></path></svg>
           </button>
           {#if showTablePicker}
             <button
@@ -1052,20 +1298,18 @@
               <div class="table-picker-label">{pickerRows} × {pickerCols}</div>
             </div>
           {/if}
-        </div>
-        <button onclick={onInsertRow} type="button" disabled={!hasActiveCell} title="Insert row below">+ Row</button>
-        <button onclick={onInsertColumn} type="button" disabled={!hasActiveCell} title="Insert column right">+ Col</button>
-        <button onclick={onDeleteRow} type="button" disabled={!hasActiveCell} title="Delete row">− Row</button>
-        <button onclick={onDeleteColumn} type="button" disabled={!hasActiveCell} title="Delete column">− Col</button>
-      </span>
-      <span class="toolbar-divider"></span>
-      <span class="chart-group">
-        <div class="chart-picker-wrap">
+        </span>
+        <span class="chart-picker-wrap">
           <button
+            class="tb-btn"
             onclick={() => (showChartDropdown = !showChartDropdown)}
             type="button"
+            disabled={!deck || !activeSlide}
+            title="Chart"
+            aria-label="Chart"
+            aria-expanded={showChartDropdown}
           >
-            Chart
+            <svg viewBox="0 0 24 24"><rect x="4" y="11" width="4" height="9" fill="currentColor" stroke="none"></rect><rect x="10" y="6" width="4" height="14" fill="currentColor" stroke="none"></rect><rect x="16" y="14" width="4" height="6" fill="currentColor" stroke="none"></rect></svg>
           </button>
           {#if showChartDropdown}
             <button
@@ -1086,116 +1330,31 @@
               {/each}
             </div>
           {/if}
-        </div>
+        </span>
       </span>
-      <span class="toolbar-divider"></span>
-      <span class="text-group">
-        <span class="shape-label">Text:</span>
-        <button onclick={() => toggleRunFlag('bold')} type="button" title="Bold">B</button>
-        <button onclick={() => toggleRunFlag('italic')} type="button" title="Italic">I</button>
-        <button onclick={() => toggleRunFlag('underline')} type="button" title="Underline">U</button>
-        <button onclick={() => toggleRunFlag('strikethrough')} type="button" title="Strikethrough">S</button>
-        <button onclick={toggleSuperscript} type="button" title="Superscript">x²</button>
-        <button onclick={toggleSubscript} type="button" title="Subscript">x₂</button>
-        <button onclick={() => toggleRunFlag('code')} type="button" title="Inline code">&lt;/&gt;</button>
-        <select
-          onchange={(event) => {
-            const value = (event.target as HTMLSelectElement).value
-            setHeading(value === 'paragraph' ? null : (value as HeadingLevelDto))
-          }}
-          title="Heading"
-        >
-          <option value="paragraph">Paragraph</option>
-          <option value="h1">Heading 1</option>
-          <option value="h2">Heading 2</option>
-          <option value="h3">Heading 3</option>
-          <option value="h4">Heading 4</option>
-          <option value="h5">Heading 5</option>
-          <option value="h6">Heading 6</option>
-        </select>
-        <button onclick={() => toggleParagraphFlag('blockquote')} type="button" title="Blockquote">Quote</button>
-        <button onclick={() => toggleParagraphFlag('codeBlock')} type="button" title="Code block">Block</button>
-        {#if activeTextTarget?.style.codeBlock}
-          <input
-            bind:this={codeStepsInput}
-            class="code-steps-input"
-            type="text"
-            value={activeTextTarget.style.codeStepRanges ?? ''}
-            placeholder="Steps: 1-3|4|5,7"
-            title="Stepped code ranges (pipe = next step, comma = same step, e.g. 1-3|4|5,7)"
-            onchange={onCodeStepRangesChange}
-          />
-        {/if}
-      </span>
-      <span class="toolbar-divider"></span>
-      <span class="deck-group">
-        <span class="shape-label">Ratio:</span>
-        <select
-          value={currentAspectRatio}
-          onchange={(event) =>
-            onSetAspectRatio(
-              (event.target as HTMLSelectElement).value as '16:9' | '4:3' | '16:10' | 'default',
-            )
-          }
-          title="Slide aspect ratio"
-        >
-          <option value="16:9">16:9</option>
-          <option value="4:3">4:3</option>
-          <option value="16:10">16:10</option>
-          <option value="default">Reset</option>
-        </select>
-        <button
-          onclick={toggleHighContrast}
-          type="button"
-          class:active-toggle={highContrast}
-          title="Toggle high-contrast theme"
-        >
-          Contrast
-        </button>
-        <button
-          onclick={() => {
-            findReplaceMode = 'find'
-            showFindReplace = true
-          }}
-          type="button"
-          title="Find (Ctrl/Cmd+F)"
-        >
-          Find
-        </button>
-        <button
-          onclick={() => (showVersionHistory = true)}
-          type="button"
-          disabled={!deck}
-          title="Local version history"
-        >
-          History
-        </button>
-        <button
-          onclick={() => (showComments = !showComments)}
-          type="button"
-          class:active-toggle={showComments}
-          disabled={!deck}
-          title="Comments (C)"
-        >
-          Comments
-        </button>
-        <button
-          onclick={openAccessibility}
-          type="button"
-          class:active-toggle={showAccessibility}
-          disabled={!deck}
-          title="Accessibility checker (WCAG 2.2 AA score)"
-        >
-          A11y
+
+      <span class="tb-spacer"></span>
+
+      <!-- Right group: Bold | Italic | Underline | separator | Present | Export | Help -->
+      <span class="tb-group">
+        <button class="tb-btn tb-text" onclick={() => toggleRunFlag('bold')} type="button" title="Bold (Cmd/Ctrl+B)" aria-label="Bold"><strong>B</strong></button>
+        <button class="tb-btn tb-text" onclick={() => toggleRunFlag('italic')} type="button" title="Italic (Cmd/Ctrl+I)" aria-label="Italic"><em>I</em></button>
+        <button class="tb-btn tb-text" onclick={() => toggleRunFlag('underline')} type="button" title="Underline (Cmd/Ctrl+U)" aria-label="Underline"><u>U</u></button>
+        <span class="tb-sep"></span>
+        <button class="tb-btn" onclick={onStartPresenter} type="button" disabled={!deck} title="Present (Cmd/Ctrl+Enter)" aria-label="Present">
+          <svg viewBox="0 0 24 24"><path d="M5 4l13 8-13 8z" fill="currentColor" stroke="none"></path></svg>
         </button>
         <span class="export-picker-wrap">
           <button
+            class="tb-btn"
             onclick={() => (showExportMenu = !showExportMenu)}
             type="button"
             disabled={!deck || exporting !== ''}
-            title="Export the current slide or the whole deck"
+            title="Export"
+            aria-label="Export"
+            aria-expanded={showExportMenu}
           >
-            Export
+            <svg viewBox="0 0 24 24"><path d="M12 3v11"></path><path d="M8 10l4 4 4-4"></path><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"></path></svg>
           </button>
           {#if showExportMenu}
             <button
@@ -1217,9 +1376,7 @@
             </div>
           {/if}
         </span>
-        <button onclick={() => (showShortcuts = true)} type="button" title="Keyboard shortcuts (?)">
-          ?
-        </button>
+        <button class="tb-btn tb-text" onclick={() => (showShortcuts = true)} type="button" title="Keyboard shortcuts (?)" aria-label="Help">?</button>
       </span>
       <input
         bind:this={imageInput}
@@ -1229,6 +1386,128 @@
         onchange={handleImageSelected}
       />
     </header>
+
+    <!-- Secondary format bar: advanced text formatting, table ops, deck tools. -->
+    <div class="format-bar" role="toolbar" aria-label="Formatting">
+      <span class="tb-group">
+        <button class="tb-btn tb-text" onclick={() => toggleRunFlag('strikethrough')} type="button" title="Strikethrough" aria-label="Strikethrough"><s>S</s></button>
+        <button class="tb-btn tb-text" onclick={toggleSuperscript} type="button" title="Superscript" aria-label="Superscript">x<sup>2</sup></button>
+        <button class="tb-btn tb-text" onclick={toggleSubscript} type="button" title="Subscript" aria-label="Subscript">x<sub>2</sub></button>
+        <button class="tb-btn tb-text" onclick={() => toggleRunFlag('code')} type="button" title="Inline code" aria-label="Inline code">&lt;/&gt;</button>
+        <select
+          class="tb-select"
+          onchange={(event) => {
+            const value = (event.target as HTMLSelectElement).value
+            setHeading(value === 'paragraph' ? null : (value as HeadingLevelDto))
+          }}
+          title="Heading level"
+          aria-label="Heading level"
+        >
+          <option value="paragraph">Paragraph</option>
+          <option value="h1">Heading 1</option>
+          <option value="h2">Heading 2</option>
+          <option value="h3">Heading 3</option>
+          <option value="h4">Heading 4</option>
+          <option value="h5">Heading 5</option>
+          <option value="h6">Heading 6</option>
+        </select>
+        <button class="tb-btn" onclick={() => toggleParagraphFlag('blockquote')} type="button" title="Blockquote" aria-label="Blockquote">
+          <svg viewBox="0 0 24 24"><path d="M4 7v6h5l-2 4M13 7v6h5l-2 4" fill="none"></path></svg>
+        </button>
+        <button class="tb-btn" onclick={() => toggleParagraphFlag('codeBlock')} type="button" title="Code block" aria-label="Code block">
+          <svg viewBox="0 0 24 24"><path d="M9 9l-4 3 4 3M15 9l4 3-4 3"></path></svg>
+        </button>
+        {#if activeTextTarget?.style.codeBlock}
+          <input
+            bind:this={codeStepsInput}
+            class="code-steps-input"
+            type="text"
+            value={activeTextTarget.style.codeStepRanges ?? ''}
+            placeholder="Steps: 1-3|4|5,7"
+            title="Stepped code ranges (pipe = next step, comma = same step, e.g. 1-3|4|5,7)"
+            onchange={onCodeStepRangesChange}
+          />
+        {/if}
+      </span>
+      <span class="tb-sep"></span>
+      <span class="tb-group">
+        <button class="tb-btn tb-text sm" onclick={onInsertRow} type="button" disabled={!hasActiveCell} title="Insert row below">+ Row</button>
+        <button class="tb-btn tb-text sm" onclick={onInsertColumn} type="button" disabled={!hasActiveCell} title="Insert column right">+ Col</button>
+        <button class="tb-btn tb-text sm" onclick={onDeleteRow} type="button" disabled={!hasActiveCell} title="Delete row">− Row</button>
+        <button class="tb-btn tb-text sm" onclick={onDeleteColumn} type="button" disabled={!hasActiveCell} title="Delete column">− Col</button>
+      </span>
+      <span class="tb-sep"></span>
+      <span class="tb-group">
+        <select
+          class="tb-select"
+          value={currentAspectRatio}
+          onchange={(event) =>
+            onSetAspectRatio(
+              (event.target as HTMLSelectElement).value as '16:9' | '4:3' | '16:10' | 'default',
+            )
+          }
+          title="Slide aspect ratio"
+          aria-label="Slide aspect ratio"
+        >
+          <option value="16:9">16:9</option>
+          <option value="4:3">4:3</option>
+          <option value="16:10">16:10</option>
+          <option value="default">Reset</option>
+        </select>
+        <button
+          class="tb-btn tb-text"
+          onclick={toggleHighContrast}
+          type="button"
+          class:active={highContrast}
+          title="Toggle high-contrast theme"
+          aria-pressed={highContrast}
+        >
+          Contrast
+        </button>
+        <button
+          class="tb-btn tb-text"
+          onclick={() => {
+            findReplaceMode = 'find'
+            showFindReplace = true
+          }}
+          type="button"
+          title="Find (Cmd/Ctrl+F)"
+        >
+          Find
+        </button>
+        <button
+          class="tb-btn tb-text"
+          onclick={() => (showVersionHistory = true)}
+          type="button"
+          disabled={!deck}
+          title="Local version history"
+        >
+          History
+        </button>
+        <button
+          class="tb-btn tb-text"
+          onclick={() => (showComments = !showComments)}
+          type="button"
+          class:active={showComments}
+          disabled={!deck}
+          title="Comments (C)"
+          aria-pressed={showComments}
+        >
+          Comments
+        </button>
+        <button
+          class="tb-btn tb-text"
+          onclick={openAccessibility}
+          type="button"
+          class:active={showAccessibility}
+          disabled={!deck}
+          title="Accessibility checker (WCAG 2.2 AA score)"
+          aria-pressed={showAccessibility}
+        >
+          A11y
+        </button>
+      </span>
+    </div>
 
     {#if exporting !== ''}
       <div class="banner export-progress" role="status" aria-live="polite">
@@ -1252,6 +1531,13 @@
           {/each}
         </ul>
         <button onclick={() => (showWarnings = false)} type="button">Dismiss</button>
+      </div>
+    {/if}
+
+    {#if creatingTextBox}
+      <div class="banner banner-info" role="status">
+        <strong>Text box:</strong> click on the slide to place it.
+        <button onclick={cancelCreateTextBox} type="button">Cancel (Esc)</button>
       </div>
     {/if}
 
@@ -1318,7 +1604,12 @@
         {/if}
       </aside>
 
-      <main class="canvas-area" aria-label="Editor canvas">
+      <main
+        class="canvas-area"
+        class:text-box-mode={creatingTextBox}
+        bind:this={canvasAreaEl}
+        aria-label="Editor canvas"
+      >
         {#if activeSlide && deck}
           <SlideCanvas
             slide={activeSlide}
@@ -1335,6 +1626,14 @@
             onShapeContextMenu={handleShapeContextMenu}
             onCommentOnSelection={handleCommentOnSelection}
           />
+          {#if creatingTextBox}
+            <button
+              class="text-box-catcher"
+              type="button"
+              aria-label="Click to place a text box"
+              onclick={onCanvasClickCreateTextBox}
+            ></button>
+          {/if}
         {:else}
           <div class="empty-canvas">Open or create a deck to start editing.</div>
         {/if}
@@ -1556,47 +1855,108 @@
   }
   .toolbar {
     display: flex;
-    gap: 0.5rem;
-    padding: 0.5rem;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.3rem 0.5rem;
     border-bottom: 1px solid #ccc;
     background: #f4f4f4;
+    flex-wrap: wrap;
   }
-  .toolbar button {
-    padding: 0.4rem 0.8rem;
+  .tb-group {
+    display: flex;
+    align-items: center;
+    gap: 0.2rem;
   }
-  .toolbar-divider {
+  .tb-sep {
     width: 1px;
     align-self: stretch;
-    background: #ccc;
-    margin: 0 0.25rem;
+    background: #d0d0d0;
+    margin: 0.1rem 0.15rem;
   }
-  .shape-group {
+  .tb-spacer {
+    flex: 1;
+  }
+  .tb-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 30px;
+    height: 30px;
+    padding: 0 0.4rem;
+    background: #fff;
+    border: 1px solid #d0d0d0;
+    border-radius: 4px;
+    color: #333;
+    cursor: pointer;
+    line-height: 1;
+  }
+  .tb-btn:hover:not(:disabled) {
+    background: #e8f1fb;
+    border-color: #0070c0;
+  }
+  .tb-btn:active:not(:disabled) {
+    background: #d6e9fa;
+  }
+  .tb-btn:disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
+  .tb-btn.active {
+    background: #0070c0;
+    border-color: #0070c0;
+    color: #fff;
+  }
+  .tb-btn svg {
+    width: 16px;
+    height: 16px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.8;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  .tb-text {
+    font-size: 0.85rem;
+    font-weight: 600;
+    padding: 0 0.5rem;
+  }
+  .tb-text.sm {
+    font-size: 0.72rem;
+    font-weight: 500;
+  }
+  .tb-select {
+    height: 30px;
+    padding: 0 0.3rem;
+    border: 1px solid #d0d0d0;
+    border-radius: 4px;
+    background: #fff;
+    font-size: 0.8rem;
+  }
+  .format-bar {
     display: flex;
     align-items: center;
-    gap: 0.25rem;
+    gap: 0.35rem;
+    padding: 0.25rem 0.5rem;
+    border-bottom: 1px solid #ccc;
+    background: #ededed;
+    flex-wrap: wrap;
   }
-  .text-group {
-    display: flex;
-    align-items: center;
-    gap: 0.25rem;
+  .shape-picker-wrap {
+    position: relative;
+    display: inline-flex;
   }
-  .text-group select {
-    padding: 0.3rem 0.4rem;
+  .shape-picker-popover {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    z-index: 20;
+    margin-top: 0.25rem;
   }
   .code-steps-input {
     width: 9rem;
     padding: 0.3rem 0.4rem;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 0.8rem;
-  }
-  .table-group {
-    display: flex;
-    align-items: center;
-    gap: 0.25rem;
-  }
-  .table-group button:disabled {
-    opacity: 0.45;
-    cursor: default;
   }
   .table-picker-wrap {
     position: relative;
@@ -1643,11 +2003,6 @@
     font-size: 0.75rem;
     color: #555;
     text-align: center;
-  }
-  .chart-group {
-    display: flex;
-    align-items: center;
-    gap: 0.25rem;
   }
   .chart-picker-wrap {
     position: relative;
@@ -1715,10 +2070,6 @@
   .export-dropdown button:hover {
     background: #f0f0f0;
   }
-  .shape-label {
-    font-size: 0.85rem;
-    color: #555;
-  }
   .hidden-input {
     display: none;
   }
@@ -1739,6 +2090,10 @@
     background: #d1ecf1;
     border-bottom-color: #9ecfe0;
   }
+  .banner-info {
+    background: #e7f3ff;
+    border-bottom-color: #b9d8f5;
+  }
   .workspace {
     display: flex;
     flex: 1;
@@ -1753,11 +2108,24 @@
   }
   .canvas-area {
     flex: 1;
+    position: relative;
     display: flex;
     align-items: center;
     justify-content: center;
     background: #e0e0e0;
     overflow: auto;
+  }
+  .canvas-area.text-box-mode {
+    cursor: crosshair;
+  }
+  .text-box-catcher {
+    position: absolute;
+    inset: 0;
+    z-index: 40;
+    background: transparent;
+    border: none;
+    padding: 0;
+    cursor: crosshair;
   }
   .empty-canvas {
     color: #666;
@@ -1821,18 +2189,6 @@
   }
   .placeholder {
     color: #888;
-  }
-  .deck-group {
-    display: flex;
-    align-items: center;
-    gap: 0.25rem;
-  }
-  .deck-group select {
-    padding: 0.3rem 0.4rem;
-  }
-  .active-toggle {
-    background: #0070c0 !important;
-    color: #fff !important;
   }
   .shape-context-menu {
     position: fixed;
