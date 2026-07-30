@@ -174,26 +174,6 @@ fn blank_slide1_xml() -> String {
         <p:nvPr/>
       </p:nvGrpSpPr>
       <p:grpSpPr/>
-      <p:sp>
-        <p:nvSpPr>
-          <p:cNvPr id="2" name="TextBox 1"/>
-          <p:cNvSpPr/>
-          <p:nvPr/>
-        </p:nvSpPr>
-        <p:spPr>
-          <a:xfrm>
-            <a:off x="914400" y="457200"/>
-            <a:ext cx="4572000" cy="762000"/>
-          </a:xfrm>
-        </p:spPr>
-        <p:txBody>
-          <a:bodyPr/>
-          <a:lstStyle/>
-          <a:p>
-            <a:pPr/>
-          </a:p>
-        </p:txBody>
-      </p:sp>
     </p:spTree>
   </p:cSld>
 </p:sld>"#
