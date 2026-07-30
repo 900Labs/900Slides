@@ -22,18 +22,26 @@
     ChartTypeDto,
     CommentAnchorDto,
     DeckSnapshot,
+    GeometricShapeSnapshot,
     HeadingLevelDto,
+    ImageShapeSnapshot,
     ParagraphDto,
     ParagraphStyleDto,
+    PassthroughSnapshot,
     PlaceholderDefDto,
     RecoverySnapshot,
+    RectDto,
     RunDto,
+    ShapeSnapshot,
     SlideSectionDto,
     SlideSizeDto,
     SlideSnapshot,
+    TableShapeSnapshot,
     TemplateInfoDto,
     TextBoxSnapshot,
+    TransformDto,
     TransitionKindDto,
+    VerticalAlignDto,
     WarningDto,
   } from './lib/types'
 
@@ -84,6 +92,10 @@
   /** Index of a shape to highlight on the active slide (driven by the
    *  accessibility panel); null draws no selection ring. */
   let a11ySelectedShapeIndex = $state<number | null>(null)
+  /** Index of the shape the user has selected on the canvas, or null. */
+  let selectedShapeIndex = $state<number | null>(null)
+  /** Index of a text box currently in text-edit mode, or null. */
+  let editingShapeIndex = $state<number | null>(null)
   /** Pending comment anchor invoked from a context menu, or null. */
   let commentDraft = $state<CommentAnchorDto | null>(null)
   /** Open "Add comment" shape context menu, or null. */
@@ -134,6 +146,11 @@
   const slideSize = $derived<SlideSizeDto | undefined>(deck?.slideSize)
   /** Whether the deck theme is in high-contrast mode. */
   const highContrast = $derived<boolean>(deck?.theme.highContrast ?? false)
+  /** Shape index to render with the selection ring: the user's canvas
+   *  selection, falling back to the accessibility panel's highlight. */
+  const canvasSelectedShapeIndex = $derived<number | null>(
+    selectedShapeIndex ?? a11ySelectedShapeIndex,
+  )
   /** Rich-text notes for the active slide, when present. */
   const activeRichNotes = $derived<ParagraphDto[] | undefined>(activeSlide?.richNotes)
 
@@ -423,6 +440,8 @@
       if (idx >= 0) activeIndex = idx
     }
     a11ySelectedShapeIndex = shapeIndex
+    selectedShapeIndex = shapeIndex
+    editingShapeIndex = null
   }
 
   // Keep the accessibility report fresh while the panel is open: re-run the
@@ -568,46 +587,105 @@
     return { slideId, shapeIndex, paragraphIndex, runIndex, run, paragraph }
   }
 
-  /** Toggles a run-level boolean flag by wrapping SetRunStyle. */
+  /** Applies a run-level boolean flag. When a text box is being edited, it
+   *  toggles the active run; otherwise it applies to every run in the selected
+   *  text box. */
   async function toggleRunFlag(flag: 'bold' | 'italic' | 'underline' | 'strikethrough' | 'code'): Promise<void> {
     const target = getTextTarget()
-    if (!target) return
-    const value = !target.run[flag]
-    deck = await invoke<DeckSnapshot>('set_run_style', {
-      slide_id: target.slideId,
-      shape_index: target.shapeIndex,
-      paragraph_index: target.paragraphIndex,
-      run_index: target.runIndex,
-      [flag]: value,
+    if (target) {
+      const value = !target.run[flag]
+      deck = await invoke<DeckSnapshot>('set_run_style', {
+        slide_id: target.slideId,
+        shape_index: target.shapeIndex,
+        paragraph_index: target.paragraphIndex,
+        run_index: target.runIndex,
+        [flag]: value,
+      })
+      return
+    }
+    await applyRunFlagToAll((run) => ({ ...run, [flag]: !allRunsHave(run, flag) }))
+  }
+
+  /** Returns true when every run in the selected text box already has `flag`
+   *  set; used to decide whether applying to all should turn the flag on/off. */
+  function allRunsHave(run: RunDto, flag: 'bold' | 'italic' | 'underline' | 'strikethrough' | 'code'): boolean {
+    if (!activeSlide || selectedShapeIndex === null) return run[flag]
+    const shape = activeSlide.shapes[selectedShapeIndex]
+    if (!shape || shape.kind !== 'text_box') return run[flag]
+    const textBox = shape.value as TextBoxSnapshot
+    const runs = textBox.paragraphs.flatMap((p) => p.runs)
+    return runs.length > 0 && runs.every((r) => r[flag])
+  }
+
+  /** Applies a per-run transform to every run of the selected text box and
+   *  commits it as a single text-box edit. */
+  async function applyRunFlagToAll(
+    transform: (run: RunDto) => RunDto,
+  ): Promise<void> {
+    if (selectedShapeIndex === null || !activeSlide) return
+    const shape = activeSlide.shapes[selectedShapeIndex]
+    if (!shape || shape.kind !== 'text_box') return
+    const textBox = shape.value as TextBoxSnapshot
+    if (textBox.paragraphs.every((p) => p.runs.length === 0)) return
+    const paragraphs = textBox.paragraphs.map((p) => ({
+      ...p,
+      runs: p.runs.map(transform),
+    }))
+    deck = await invoke<DeckSnapshot>('edit_text_box', {
+      slide_id: activeSlide.id,
+      shape_index: selectedShapeIndex,
+      paragraphs,
     })
   }
 
-  /** Toggles superscript on the active run. */
+  /** Toggles superscript on the active run, or across the selected text box. */
   async function toggleSuperscript(): Promise<void> {
     const target = getTextTarget()
-    if (!target) return
-    const value = target.run.verticalAlign === 'superscript' ? 'baseline' : 'superscript'
-    deck = await invoke<DeckSnapshot>('set_run_style', {
-      slide_id: target.slideId,
-      shape_index: target.shapeIndex,
-      paragraph_index: target.paragraphIndex,
-      run_index: target.runIndex,
-      vertical_align: value,
-    })
+    if (target) {
+      const value: VerticalAlignDto =
+        target.run.verticalAlign === 'superscript' ? 'baseline' : 'superscript'
+      deck = await invoke<DeckSnapshot>('set_run_style', {
+        slide_id: target.slideId,
+        shape_index: target.shapeIndex,
+        paragraph_index: target.paragraphIndex,
+        run_index: target.runIndex,
+        vertical_align: value,
+      })
+      return
+    }
+    await applyVerticalAlignToAll('superscript')
   }
 
-  /** Toggles subscript on the active run. */
+  /** Toggles subscript on the active run, or across the selected text box. */
   async function toggleSubscript(): Promise<void> {
     const target = getTextTarget()
-    if (!target) return
-    const value = target.run.verticalAlign === 'subscript' ? 'baseline' : 'subscript'
-    deck = await invoke<DeckSnapshot>('set_run_style', {
-      slide_id: target.slideId,
-      shape_index: target.shapeIndex,
-      paragraph_index: target.paragraphIndex,
-      run_index: target.runIndex,
-      vertical_align: value,
-    })
+    if (target) {
+      const value: VerticalAlignDto =
+        target.run.verticalAlign === 'subscript' ? 'baseline' : 'subscript'
+      deck = await invoke<DeckSnapshot>('set_run_style', {
+        slide_id: target.slideId,
+        shape_index: target.shapeIndex,
+        paragraph_index: target.paragraphIndex,
+        run_index: target.runIndex,
+        vertical_align: value,
+      })
+      return
+    }
+    await applyVerticalAlignToAll('subscript')
+  }
+
+  /** Applies a vertical-align toggle to every run of the selected text box. */
+  async function applyVerticalAlignToAll(kind: 'superscript' | 'subscript'): Promise<void> {
+    if (selectedShapeIndex === null || !activeSlide) return
+    const shape = activeSlide.shapes[selectedShapeIndex]
+    if (!shape || shape.kind !== 'text_box') return
+    const textBox = shape.value as TextBoxSnapshot
+    const runs = textBox.paragraphs.flatMap((p) => p.runs)
+    if (runs.length === 0) return
+    const value: VerticalAlignDto = runs.every((r) => r.verticalAlign === kind)
+      ? 'baseline'
+      : kind
+    await applyRunFlagToAll((run) => ({ ...run, verticalAlign: value }))
   }
 
   /** Applies a heading level to the active paragraph. */
@@ -686,6 +764,97 @@
       slide_id: activeSlide.id,
       geometry_kind: geometryKind,
     })
+  }
+
+  /** Returns the bounding frame (EMU) for any shape kind, or undefined. */
+  function shapeFrameOf(shape: ShapeSnapshot): RectDto | undefined {
+    switch (shape.kind) {
+      case 'text_box':
+        return (shape.value as TextBoxSnapshot).frame
+      case 'image':
+        return (shape.value as ImageShapeSnapshot).transform.frame
+      case 'geometric':
+        return (shape.value as GeometricShapeSnapshot).transform.frame
+      case 'table':
+        return (shape.value as TableShapeSnapshot).transform.frame
+      case 'chart':
+        return (shape.value as ChartShapeSnapshot).transform.frame
+      case 'passthrough':
+        return (shape.value as PassthroughSnapshot).frame
+      default:
+        return undefined
+    }
+  }
+
+  /** Returns a shape's rotation in degrees (0 for text boxes). */
+  function shapeRotationOf(shape: ShapeSnapshot): number {
+    switch (shape.kind) {
+      case 'image':
+        return (shape.value as ImageShapeSnapshot).transform.rotation
+      case 'geometric':
+        return (shape.value as GeometricShapeSnapshot).transform.rotation
+      case 'table':
+        return (shape.value as TableShapeSnapshot).transform.rotation
+      case 'chart':
+        return (shape.value as ChartShapeSnapshot).transform.rotation
+      default:
+        return 0
+    }
+  }
+
+  /** Sets the canvas selection; clears text-edit mode unless re-selecting the
+   *  shape currently being edited. */
+  function handleSelectShape(detail: { shapeIndex: number | null }): void {
+    selectedShapeIndex = detail.shapeIndex
+    if (detail.shapeIndex === null || detail.shapeIndex !== editingShapeIndex) {
+      editingShapeIndex = null
+    }
+  }
+
+  /** Enters (`index`) or leaves (`null`) text-edit mode for a text box. */
+  function handleEditShape(detail: { shapeIndex: number | null }): void {
+    editingShapeIndex = detail.shapeIndex
+    if (detail.shapeIndex !== null) selectedShapeIndex = detail.shapeIndex
+  }
+
+  /** Commits a shape's new transform (after a drag or resize). */
+  async function handleUpdateShapeTransform(detail: {
+    shapeIndex: number
+    transform: TransformDto
+  }): Promise<void> {
+    if (!activeSlide) return
+    deck = await invoke<DeckSnapshot>('update_shape_transform', {
+      slide_id: activeSlide.id,
+      shape_index: detail.shapeIndex,
+      transform: detail.transform,
+    })
+  }
+
+  /** Nudges the selected shape by the given EMU delta. */
+  async function nudgeSelected(dxEmu: number, dyEmu: number): Promise<void> {
+    if (selectedShapeIndex === null || !activeSlide) return
+    const shape = activeSlide.shapes[selectedShapeIndex]
+    if (!shape) return
+    const frame = shapeFrameOf(shape)
+    if (!frame) return
+    await handleUpdateShapeTransform({
+      shapeIndex: selectedShapeIndex,
+      transform: {
+        frame: { x: frame.x + dxEmu, y: frame.y + dyEmu, width: frame.width, height: frame.height },
+        rotation: shapeRotationOf(shape),
+      },
+    })
+  }
+
+  /** Deletes the currently selected shape. */
+  async function deleteSelectedShape(): Promise<void> {
+    if (selectedShapeIndex === null || !activeSlide) return
+    deck = await invoke<DeckSnapshot>('delete_shape', {
+      slide_id: activeSlide.id,
+      shape_index: selectedShapeIndex,
+    })
+    selectedShapeIndex = null
+    editingShapeIndex = null
   }
 
   /** Appends a new `rows` x `cols` table to the active slide. */
@@ -841,7 +1010,19 @@
   function selectSlide(index: number): void {
     activeIndex = index
     a11ySelectedShapeIndex = null
+    selectedShapeIndex = null
+    editingShapeIndex = null
   }
+
+  // Drop a selection that no longer points at a valid shape (e.g. after an
+  // undo/redo or an edit that changed the shape count).
+  $effect(() => {
+    const count = activeSlide?.shapes.length ?? 0
+    if (selectedShapeIndex !== null && selectedShapeIndex >= count) {
+      selectedShapeIndex = null
+      editingShapeIndex = null
+    }
+  })
 
   /** Restores a recovery snapshot as the current deck. */
   async function handleRestore(id: string): Promise<void> {
@@ -987,6 +1168,24 @@
     } else if (!mod && !typing && (event.key === 'c' || event.key === 'C')) {
       event.preventDefault()
       showComments = !showComments
+    } else if (!typing && selectedShapeIndex !== null) {
+      const step = event.shiftKey ? 10 : 1
+      if (event.key === 'Delete' || event.key === 'Backspace') {
+        event.preventDefault()
+        void deleteSelectedShape()
+      } else if (event.key === 'ArrowLeft') {
+        event.preventDefault()
+        void nudgeSelected(-step, 0)
+      } else if (event.key === 'ArrowRight') {
+        event.preventDefault()
+        void nudgeSelected(step, 0)
+      } else if (event.key === 'ArrowUp') {
+        event.preventDefault()
+        void nudgeSelected(0, -step)
+      } else if (event.key === 'ArrowDown') {
+        event.preventDefault()
+        void nudgeSelected(0, step)
+      }
     }
   }
 </script>
@@ -1091,13 +1290,13 @@
       <span class="toolbar-divider"></span>
       <span class="text-group">
         <span class="shape-label">Text:</span>
-        <button onclick={() => toggleRunFlag('bold')} type="button" title="Bold">B</button>
-        <button onclick={() => toggleRunFlag('italic')} type="button" title="Italic">I</button>
-        <button onclick={() => toggleRunFlag('underline')} type="button" title="Underline">U</button>
-        <button onclick={() => toggleRunFlag('strikethrough')} type="button" title="Strikethrough">S</button>
-        <button onclick={toggleSuperscript} type="button" title="Superscript">x²</button>
-        <button onclick={toggleSubscript} type="button" title="Subscript">x₂</button>
-        <button onclick={() => toggleRunFlag('code')} type="button" title="Inline code">&lt;/&gt;</button>
+        <button onclick={() => toggleRunFlag('bold')} onmousedown={(event) => event.preventDefault()} type="button" title="Bold">B</button>
+        <button onclick={() => toggleRunFlag('italic')} onmousedown={(event) => event.preventDefault()} type="button" title="Italic">I</button>
+        <button onclick={() => toggleRunFlag('underline')} onmousedown={(event) => event.preventDefault()} type="button" title="Underline">U</button>
+        <button onclick={() => toggleRunFlag('strikethrough')} onmousedown={(event) => event.preventDefault()} type="button" title="Strikethrough">S</button>
+        <button onclick={toggleSuperscript} onmousedown={(event) => event.preventDefault()} type="button" title="Superscript">x²</button>
+        <button onclick={toggleSubscript} onmousedown={(event) => event.preventDefault()} type="button" title="Subscript">x₂</button>
+        <button onclick={() => toggleRunFlag('code')} onmousedown={(event) => event.preventDefault()} type="button" title="Inline code">&lt;/&gt;</button>
         <select
           onchange={(event) => {
             const value = (event.target as HTMLSelectElement).value
@@ -1326,12 +1525,16 @@
             media={deck.media}
             slideSize={slideSize}
             highContrast={highContrast}
-            selectedShapeIndex={a11ySelectedShapeIndex}
+            selectedShapeIndex={canvasSelectedShapeIndex}
+            {editingShapeIndex}
             placeholderGuides={activeLayoutPlaceholders}
             onEditTextBox={handleTextEdit}
             onSetCellText={handleSetCellText}
             onCellFocus={handleCellFocus}
             onEditChart={handleEditChart}
+            onSelectShape={handleSelectShape}
+            onEditShape={handleEditShape}
+            onUpdateShapeTransform={handleUpdateShapeTransform}
             onShapeContextMenu={handleShapeContextMenu}
             onCommentOnSelection={handleCommentOnSelection}
           />

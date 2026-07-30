@@ -20,10 +20,13 @@
     ParagraphStyleDto,
     PassthroughSnapshot,
     PlaceholderDefDto,
+    RectDto,
     RunDto,
+    ShapeSnapshot,
     SlideSizeDto,
     SlideSnapshot,
     StyleDto,
+    TransformDto,
     TableBordersDto,
     TableCellDto,
     TableShapeSnapshot,
@@ -58,8 +61,14 @@
     onCellFocus?: (detail: { shapeIndex: number; row: number; col: number }) => void
     /** Callback invoked when a chart shape is double-clicked. */
     onEditChart?: (detail: { slideId: string; shapeIndex: number }) => void
-    /** Callback invoked when a shape is clicked to select it. */
-    onSelectShape?: (detail: { shapeIndex: number }) => void
+    /** Callback invoked when a shape is clicked to select it. Pass `null` to
+     *  clear the selection (click on empty canvas). */
+    onSelectShape?: (detail: { shapeIndex: number | null }) => void
+    /** Callback invoked when a text box enters (`index`) or leaves (`null`)
+     *  text-edit mode. */
+    onEditShape?: (detail: { shapeIndex: number | null }) => void
+    /** Callback invoked to commit a shape's new transform after a drag/resize. */
+    onUpdateShapeTransform?: (detail: { shapeIndex: number; transform: TransformDto }) => void
     /** Callback invoked when a non-text shape is right-clicked, so the host can
      *  offer an "Add comment" (shape-anchored) action. */
     onShapeContextMenu?: (detail: { shapeId: string; shapeIndex: number; x: number; y: number }) => void
@@ -87,6 +96,9 @@
     /** Index of a shape to highlight as selected (e.g. from the accessibility
      *  panel). `null` (or omitted) draws no selection ring. */
     selectedShapeIndex?: number | null
+    /** Index of a text box currently in text-edit mode (textarea visible), or
+     *  `null` when none is being edited. */
+    editingShapeIndex?: number | null
     /** Placeholder frames for the slide's active layout, drawn as non-editable
      *  guide outlines in the editor. Omitted or empty draws no guides. */
     placeholderGuides?: PlaceholderDefDto[]
@@ -101,6 +113,8 @@
     onCellFocus,
     onEditChart,
     onSelectShape,
+    onEditShape,
+    onUpdateShapeTransform,
     onShapeContextMenu,
     onCommentOnSelection,
     readonly = false,
@@ -109,6 +123,7 @@
     slideSize,
     highContrast = false,
     selectedShapeIndex = null,
+    editingShapeIndex = null,
     placeholderGuides,
   }: Props = $props()
 
@@ -957,6 +972,208 @@
     spellMenuTextarea = null
   }
 
+  // --- Canvas interaction (Wave 21): selection, drag-to-move, resize -------
+
+  /** Inverse of `EMU_TO_PX`: converts CSS pixels back to EMU. */
+  const PX_TO_EMU = 9525.0
+  /** Pointer-drag movement threshold in CSS pixels (below this it is a click). */
+  const DRAG_THRESHOLD_PX = 3
+  /** Minimum shape side, in EMU, enforced while resizing. */
+  const MIN_SIDE_EMU = 8 * PX_TO_EMU
+
+  /** The eight resize-handle directions, clockwise from top-left. */
+  type DragMode = 'move' | 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w'
+  const HANDLE_DIRECTIONS: DragMode[] = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w']
+
+  /** Returns the bounding frame (EMU) for any shape kind, or undefined when the
+   *  shape has no placeable frame. */
+  function shapeFrameOf(shape: ShapeSnapshot): RectDto | undefined {
+    switch (shape.kind) {
+      case 'text_box':
+        return (shape.value as TextBoxSnapshot).frame
+      case 'image':
+        return (shape.value as ImageShapeSnapshot).transform.frame
+      case 'geometric':
+        return (shape.value as GeometricShapeSnapshot).transform.frame
+      case 'table':
+        return (shape.value as TableShapeSnapshot).transform.frame
+      case 'chart':
+        return (shape.value as ChartShapeSnapshot).transform.frame
+      case 'passthrough':
+        return (shape.value as PassthroughSnapshot).frame
+      default:
+        return undefined
+    }
+  }
+
+  /** Returns the rotation (degrees) for a shape kind (0 for text boxes). */
+  function shapeRotationOf(shape: ShapeSnapshot): number {
+    switch (shape.kind) {
+      case 'image':
+        return (shape.value as ImageShapeSnapshot).transform.rotation
+      case 'geometric':
+        return (shape.value as GeometricShapeSnapshot).transform.rotation
+      case 'table':
+        return (shape.value as TableShapeSnapshot).transform.rotation
+      case 'chart':
+        return (shape.value as ChartShapeSnapshot).transform.rotation
+      default:
+        return 0
+    }
+  }
+
+  /** The frame to render for a shape: the live drag preview while it is being
+   *  dragged/resized, otherwise its stored frame. */
+  function liveFrame(shapeIndex: number, fallback: RectDto | undefined): RectDto | undefined {
+    if (dragPreview && dragPreview.shapeIndex === shapeIndex) return dragPreview.frame
+    return fallback
+  }
+
+  /** Whether a shape should show its move cursor and resize handles. */
+  function isInteractiveShape(shapeIndex: number): boolean {
+    return (
+      !readonly &&
+      shapeIndex === selectedShapeIndex &&
+      shapeIndex !== editingShapeIndex &&
+      shapeFrameOf(slide.shapes[shapeIndex]) !== undefined
+    )
+  }
+
+  /** Active pointer-drag session (imperative, not reactive). */
+  let dragStart: {
+    shapeIndex: number
+    mode: DragMode
+    startX: number
+    startY: number
+    startFrame: RectDto
+    rotation: number
+    moved: boolean
+  } | null = null
+  /** Live preview frame during a drag, driving optimistic re-rendering. */
+  let dragPreview = $state<{ shapeIndex: number; frame: RectDto } | null>(null)
+
+  /** Frame of the currently selected, non-edited shape, used to position the
+   *  resize-handle overlay (follows the live drag preview). Null when no shape
+   *  is selected, is being edited, or has no placeable frame. */
+  const selectionFrame = $derived.by<RectDto | null>(() => {
+    if (readonly || selectedShapeIndex === null || selectedShapeIndex === editingShapeIndex) {
+      return null
+    }
+    const shape = slide.shapes[selectedShapeIndex]
+    if (!shape) return null
+    return liveFrame(selectedShapeIndex, shapeFrameOf(shape)) ?? shapeFrameOf(shape) ?? null
+  })
+
+  /** Computes a moved/resized frame for the given mode and EMU deltas. */
+  function applyDrag(mode: DragMode, start: RectDto, dxEmu: number, dyEmu: number): RectDto {
+    if (mode === 'move') {
+      return { x: start.x + dxEmu, y: start.y + dyEmu, width: start.width, height: start.height }
+    }
+    let x = start.x
+    let y = start.y
+    let width = start.width
+    let height = start.height
+    if (mode.includes('e')) width = Math.max(MIN_SIDE_EMU, start.width + dxEmu)
+    if (mode.includes('s')) height = Math.max(MIN_SIDE_EMU, start.height + dyEmu)
+    if (mode.includes('w')) {
+      width = Math.max(MIN_SIDE_EMU, start.width - dxEmu)
+      x = start.x + (start.width - width)
+    }
+    if (mode.includes('n')) {
+      height = Math.max(MIN_SIDE_EMU, start.height - dyEmu)
+      y = start.y + (start.height - height)
+    }
+    return { x, y, width, height }
+  }
+
+  /** Begins a drag (move or resize) session for a shape. */
+  function beginDrag(event: PointerEvent, shapeIndex: number, mode: DragMode): void {
+    if (event.button !== 0) return
+    const shape = slide.shapes[shapeIndex]
+    const frame = shapeFrameOf(shape)
+    if (!frame) return
+    // Resize handles sit above the body; stop the event so the body's move
+    // pointer-down handler does not also run.
+    if (mode !== 'move') event.stopPropagation()
+    dragStart = {
+      shapeIndex,
+      mode,
+      startX: event.clientX,
+      startY: event.clientY,
+      startFrame: { ...frame },
+      rotation: shapeRotationOf(shape),
+      moved: false,
+    }
+    window.addEventListener('pointermove', onDragMove)
+    window.addEventListener('pointerup', onDragUp)
+  }
+
+  /** Updates the live preview frame as the pointer moves. */
+  function onDragMove(event: PointerEvent): void {
+    if (!dragStart) return
+    const dx = event.clientX - dragStart.startX
+    const dy = event.clientY - dragStart.startY
+    if (!dragStart.moved && Math.hypot(dx, dy) < DRAG_THRESHOLD_PX) return
+    dragStart.moved = true
+    const frame = applyDrag(dragStart.mode, dragStart.startFrame, dx * PX_TO_EMU, dy * PX_TO_EMU)
+    dragPreview = { shapeIndex: dragStart.shapeIndex, frame }
+  }
+
+  /** Ends the drag session, committing the transform if the pointer moved. */
+  function onDragUp(): void {
+    window.removeEventListener('pointermove', onDragMove)
+    window.removeEventListener('pointerup', onDragUp)
+    const start = dragStart
+    const preview = dragPreview
+    dragStart = null
+    dragPreview = null
+    if (!start || !start.moved || !preview) return
+    onUpdateShapeTransform?.({
+      shapeIndex: start.shapeIndex,
+      transform: { frame: preview.frame, rotation: start.rotation },
+    })
+  }
+
+  /** Pointer-down on a shape body: selects it and begins a move drag (unless
+   *  the shape is currently being text-edited). */
+  function onShapePointerDown(event: PointerEvent, shapeIndex: number): void {
+    if (readonly) return
+    onSelectShape?.({ shapeIndex })
+    if (shapeIndex === editingShapeIndex) return
+    beginDrag(event, shapeIndex, 'move')
+  }
+
+  /** Double-click on a text box: enters text-edit mode. */
+  function onTextBoxDblClick(shapeIndex: number): void {
+    if (readonly) return
+    if (shapeIndex !== editingShapeIndex) onEditShape?.({ shapeIndex })
+  }
+
+  /** Click on the empty canvas background clears the selection. */
+  function onCanvasClick(event: MouseEvent): void {
+    if (readonly) return
+    if (event.target === canvasEl) onSelectShape?.({ shapeIndex: null })
+  }
+
+  /** Escape while editing exits text-edit mode but keeps the shape selected. */
+  function onEditKeydown(event: KeyboardEvent): void {
+    if (event.key !== 'Escape') return
+    event.preventDefault()
+    const target = event.currentTarget as HTMLTextAreaElement
+    onEditShape?.({ shapeIndex: null })
+    target.blur()
+  }
+
+  /** Reference to the textarea of the text box currently being edited. */
+  let editBoxTextarea = $state<HTMLTextAreaElement | null>(null)
+
+  // Focus the edited text box's textarea as soon as it mounts.
+  $effect(() => {
+    if (editingShapeIndex !== null && editBoxTextarea) {
+      editBoxTextarea.focus()
+    }
+  })
+
   /** Builds a stable cache key for a chart shape. */
   function chartKey(shapeIndex: number, chart: ChartShapeSnapshot): string {
     return `${slide.id}:${shapeIndex}:${chart.chartType}:${chart.title ?? ''}:${JSON.stringify(chart.data)}`
@@ -998,6 +1215,7 @@
   }
 </script>
 
+<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
 <div
   class="canvas"
   class:high-contrast={highContrast}
@@ -1007,6 +1225,7 @@
   style:background-color={toRgba(effectiveBackground)}
   role="application"
   aria-label="Slide canvas"
+  onclick={onCanvasClick}
 >
   {#if !readonly && placeholderGuides && placeholderGuides.length > 0}
     {#each placeholderGuides as guide}
@@ -1025,42 +1244,42 @@
   {#each slide.shapes as shape, shapeIndex}
     {#if shape.kind === 'text_box'}
       {@const textBox = shape.value as TextBoxSnapshot}
+      {@const frame = liveFrame(shapeIndex, textBox.frame) ?? textBox.frame}
+      {@const isEditing = !readonly && shapeIndex === editingShapeIndex}
+      {@const interactive = isInteractiveShape(shapeIndex)}
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div
         class="text-box-container"
         class:build-shape={buildStateFor(shapeIndex) !== undefined}
         class:selected={shapeIndex === selectedShapeIndex}
+        class:draggable={interactive}
         data-shape-id={textBox.id}
-        style:left={toPx(textBox.frame.x)}
-        style:top={toPx(textBox.frame.y)}
-        style:width={toPx(textBox.frame.width)}
-        style:height={toPx(textBox.frame.height)}
+        style:left={toPx(frame.x)}
+        style:top={toPx(frame.y)}
+        style:width={toPx(frame.width)}
+        style:height={toPx(frame.height)}
         style:opacity={buildStateFor(shapeIndex)?.opacity}
         style:visibility={buildStateFor(shapeIndex)?.visibility}
         style:transform={buildStateFor(shapeIndex)?.transform}
         style:transition={buildStateFor(shapeIndex)?.transition}
+        onpointerdown={(event) => onShapePointerDown(event, shapeIndex)}
+        ondblclick={() => onTextBoxDblClick(shapeIndex)}
+        oncontextmenu={(event) => handleShapeContextMenu(event, textBox.id, shapeIndex)}
       >
-        {#if readonly}
-          <div class="text-box-readonly">
-            {#each textBox.paragraphs as paragraph, pIndex}
-              <p class={readonlyParagraphClass(paragraph.style, pIndex)}>
-                {#each paragraph.runs as run}
-                  <span class={runClass(run)}>{run.text}</span>
-                {/each}
-              </p>
-            {/each}
-          </div>
-        {:else}
+        {#if isEditing}
           <div class="text-box-editor">
             <div class="text-box-overlay" aria-hidden="true">
               {@html textBoxOverlay(shapeIndex, textBox.paragraphs)}
             </div>
             <textarea
               class="text-box"
+              bind:this={editBoxTextarea}
               data-slide-id={slide.id}
               data-shape-index={shapeIndex}
               value={textFromParagraphs(textBox.paragraphs)}
               oninput={(event) => handleInput(event, shapeIndex)}
               onscroll={syncScroll}
+              onkeydown={onEditKeydown}
               oncontextmenu={(event) => handleContextMenu(event, shapeIndex)}
               onblur={(event) => {
                 handleBlur(event, shapeIndex)
@@ -1071,23 +1290,36 @@
               aria-label="Editable text box"
             ></textarea>
           </div>
+        {:else}
+          <div class="text-box-readonly">
+            {#each textBox.paragraphs as paragraph, pIndex}
+              <p class={readonlyParagraphClass(paragraph.style, pIndex)}>
+                {#each paragraph.runs as run}
+                  <span class={runClass(run)}>{run.text}</span>
+                {/each}
+              </p>
+            {/each}
+          </div>
         {/if}
       </div>
     {:else if shape.kind === 'passthrough'}
       {@const obj = shape.value as PassthroughSnapshot}
       {@const passthroughIndex = slide.shapes.filter((s, i) => s.kind === 'passthrough' && i < shapeIndex).length}
+      {@const interactive = isInteractiveShape(shapeIndex)}
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div
         class="passthrough"
         class:build-shape={buildStateFor(shapeIndex) !== undefined}
         class:selected={shapeIndex === selectedShapeIndex}
+        class:draggable={interactive}
         data-shape-id={obj.id}
+        onpointerdown={(event) => onShapePointerDown(event, shapeIndex)}
         oncontextmenu={(event) => handleShapeContextMenu(event, obj.id, shapeIndex)}
-        style:left={obj.frame ? toPx(obj.frame.x) : undefined}
-        style:top={obj.frame ? toPx(obj.frame.y) : `${1 + passthroughIndex * 0.5}rem`}
+        style:left={obj.frame ? toPx(liveFrame(shapeIndex, obj.frame)?.x ?? obj.frame.x) : undefined}
+        style:top={obj.frame ? toPx(liveFrame(shapeIndex, obj.frame)?.y ?? obj.frame.y) : `${1 + passthroughIndex * 0.5}rem`}
         style:right={obj.frame ? undefined : '1rem'}
-        style:width={obj.frame ? toPx(obj.frame.width) : undefined}
-        style:height={obj.frame ? toPx(obj.frame.height) : undefined}
+        style:width={obj.frame ? toPx(liveFrame(shapeIndex, obj.frame)?.width ?? obj.frame.width) : undefined}
+        style:height={obj.frame ? toPx(liveFrame(shapeIndex, obj.frame)?.height ?? obj.frame.height) : undefined}
         style:opacity={buildStateFor(shapeIndex)?.opacity}
         style:visibility={buildStateFor(shapeIndex)?.visibility}
         style:transform={buildStateFor(shapeIndex)?.transform}
@@ -1098,14 +1330,17 @@
     {:else if shape.kind === 'image'}
       {@const image = shape.value as ImageShapeSnapshot}
       {@const entry = media?.[image.mediaRef]}
-      {@const frame = image.transform.frame}
+      {@const frame = liveFrame(shapeIndex, image.transform.frame) ?? image.transform.frame}
       {@const rotation = image.transform.rotation}
+      {@const interactive = isInteractiveShape(shapeIndex)}
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div
         class="image-container"
         class:build-shape={buildStateFor(shapeIndex) !== undefined}
         class:selected={shapeIndex === selectedShapeIndex}
+        class:draggable={interactive}
         data-shape-id={image.id}
+        onpointerdown={(event) => onShapePointerDown(event, shapeIndex)}
         oncontextmenu={(event) => handleShapeContextMenu(event, image.id, shapeIndex)}
         style:left={toPx(frame.x)}
         style:top={toPx(frame.y)}
@@ -1130,13 +1365,16 @@
       </div>
     {:else if shape.kind === 'geometric'}
       {@const geometric = shape.value as GeometricShapeSnapshot}
-      {@const frame = geometric.transform.frame}
+      {@const frame = liveFrame(shapeIndex, geometric.transform.frame) ?? geometric.transform.frame}
+      {@const interactive = isInteractiveShape(shapeIndex)}
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div
         class="geometric-container"
         class:build-shape={buildStateFor(shapeIndex) !== undefined}
         class:selected={shapeIndex === selectedShapeIndex}
+        class:draggable={interactive}
         data-shape-id={geometric.id}
+        onpointerdown={(event) => onShapePointerDown(event, shapeIndex)}
         oncontextmenu={(event) => handleShapeContextMenu(event, geometric.id, shapeIndex)}
         style:left={toPx(frame.x)}
         style:top={toPx(frame.y)}
@@ -1151,16 +1389,19 @@
       </div>
     {:else if shape.kind === 'table'}
       {@const table = shape.value as TableShapeSnapshot}
-      {@const tframe = table.transform.frame}
+      {@const tframe = liveFrame(shapeIndex, table.transform.frame) ?? table.transform.frame}
       {@const trot = table.transform.rotation}
       {@const colX = columnOffsets(table.columnWidths)}
       {@const rowY = rowOffsets(table.rows)}
+      {@const interactive = isInteractiveShape(shapeIndex)}
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div
         class="table-container"
         class:build-shape={buildStateFor(shapeIndex) !== undefined}
         class:selected={shapeIndex === selectedShapeIndex}
+        class:draggable={interactive}
         data-shape-id={table.id}
+        onpointerdown={(event) => onShapePointerDown(event, shapeIndex)}
         oncontextmenu={(event) => handleShapeContextMenu(event, table.id, shapeIndex)}
         style:left={toPx(tframe.x)}
         style:top={toPx(tframe.y)}
@@ -1212,13 +1453,17 @@
       </div>
     {:else if shape.kind === 'chart'}
       {@const chart = shape.value as ChartShapeSnapshot}
-      {@const frame = chart.transform.frame}
+      {@const frame = liveFrame(shapeIndex, chart.transform.frame) ?? chart.transform.frame}
+      {@const interactive = isInteractiveShape(shapeIndex)}
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div
         class="chart-container"
         class:chart-readonly={readonly}
         class:build-shape={buildStateFor(shapeIndex) !== undefined}
         class:selected={shapeIndex === selectedShapeIndex}
+        class:draggable={interactive}
         data-shape-id={chart.id}
+        onpointerdown={(event) => onShapePointerDown(event, shapeIndex)}
         oncontextmenu={(event) => handleShapeContextMenu(event, chart.id, shapeIndex)}
         style:left={toPx(frame.x)}
         style:top={toPx(frame.y)}
@@ -1242,6 +1487,25 @@
       </div>
     {/if}
   {/each}
+
+  {#if selectionFrame}
+    <div
+      class="selection-overlay"
+      style:left={toPx(selectionFrame.x)}
+      style:top={toPx(selectionFrame.y)}
+      style:width={toPx(selectionFrame.width)}
+      style:height={toPx(selectionFrame.height)}
+    >
+      {#each HANDLE_DIRECTIONS as dir}
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div
+          class="resize-handle"
+          data-handle={dir}
+          onpointerdown={(event) => beginDrag(event, selectedShapeIndex!, dir)}
+        ></div>
+      {/each}
+    </div>
+  {/if}
 </div>
 
 {#if spellMenu}
@@ -1335,6 +1599,65 @@
     outline: 3px solid #0070c0;
     outline-offset: 2px;
     z-index: 5;
+  }
+  .draggable {
+    cursor: move;
+  }
+  .resize-handle {
+    position: absolute;
+    width: 9px;
+    height: 9px;
+    background: #fff;
+    border: 1px solid #0070c0;
+    border-radius: 1px;
+    box-sizing: border-box;
+    z-index: 6;
+    pointer-events: auto;
+  }
+  .selection-overlay {
+    position: absolute;
+    pointer-events: none;
+    z-index: 6;
+  }
+  .resize-handle[data-handle='nw'] {
+    left: -5px;
+    top: -5px;
+    cursor: nwse-resize;
+  }
+  .resize-handle[data-handle='n'] {
+    left: calc(50% - 4.5px);
+    top: -5px;
+    cursor: ns-resize;
+  }
+  .resize-handle[data-handle='ne'] {
+    right: -5px;
+    top: -5px;
+    cursor: nesw-resize;
+  }
+  .resize-handle[data-handle='e'] {
+    right: -5px;
+    top: calc(50% - 4.5px);
+    cursor: ew-resize;
+  }
+  .resize-handle[data-handle='se'] {
+    right: -5px;
+    bottom: -5px;
+    cursor: nwse-resize;
+  }
+  .resize-handle[data-handle='s'] {
+    left: calc(50% - 4.5px);
+    bottom: -5px;
+    cursor: ns-resize;
+  }
+  .resize-handle[data-handle='sw'] {
+    left: -5px;
+    bottom: -5px;
+    cursor: nesw-resize;
+  }
+  .resize-handle[data-handle='w'] {
+    left: -5px;
+    top: calc(50% - 4.5px);
+    cursor: ew-resize;
   }
   .placeholder-guide {
     position: absolute;
