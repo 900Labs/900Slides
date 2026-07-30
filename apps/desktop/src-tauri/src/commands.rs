@@ -424,6 +424,10 @@ pub struct SlideSnapshot {
     /// when any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layout_ref: Option<String>,
+    /// Per-slide reduce-motion override. `Some(true)` renders this slide's
+    /// build-ins instantly. `None` defers to the system preference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reduce_motion: Option<bool>,
 }
 
 /// A named placeholder frame, mirroring [`slides_core::PlaceholderDef`].
@@ -536,6 +540,18 @@ pub struct BuildStepDto {
     pub effect: BuildEffectDto,
     /// Duration of the effect in milliseconds.
     pub duration_ms: u32,
+    /// When this step fires. Defaults to `on_click` so old snapshots
+    /// deserialize unchanged.
+    #[serde(default)]
+    pub trigger: TriggerDto,
+    /// Delay before the effect starts, in milliseconds, after the trigger
+    /// fires. Defaults to `0` so old snapshots deserialize unchanged.
+    #[serde(default)]
+    pub delay_ms: u32,
+    /// Optional motion path (waypoints in EMU). Only meaningful when
+    /// [`effect`](Self::effect) is [`BuildEffectDto::MotionPath`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub motion_path: Option<Vec<RectDto>>,
 }
 
 /// The reveal or hide effect for a build step, mirroring [`slides_core::BuildEffect`].
@@ -556,6 +572,21 @@ pub enum BuildEffectDto {
     Appear,
     /// Hide a shape that was already visible (opacity 1 -> 0).
     Disappear,
+    /// Move the shape along the step's `motion_path` waypoints, in EMU.
+    MotionPath,
+}
+
+/// When a build step fires, mirroring [`slides_core::Trigger`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerDto {
+    /// The step fires on a presenter click (the default).
+    #[default]
+    OnClick,
+    /// The step fires simultaneously with the previous step.
+    WithPrevious,
+    /// The step fires immediately after the previous step completes.
+    AfterPrevious,
 }
 
 /// Snapshot of a shape for the frontend.
@@ -2295,6 +2326,97 @@ pub fn move_build_step(
     Ok(snapshot)
 }
 
+/// Sets the trigger of a single build step and returns the updated deck
+/// snapshot. The change is applied via the verified
+/// [`slides_core::SetBuildStepTrigger`] command so it is undoable.
+#[tauri::command]
+pub fn set_build_step_trigger(
+    slide_id: String,
+    step_index: usize,
+    trigger: TriggerDto,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let command = Box::new(slides_core::SetBuildStepTrigger::new(
+        slide_id,
+        step_index,
+        trigger_from_dto(trigger),
+    ));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Sets the delay (`delay_ms`) of a single build step and returns the updated
+/// deck snapshot. The change is applied via the verified
+/// [`slides_core::SetBuildStepDelay`] command so it is undoable.
+#[tauri::command]
+pub fn set_build_step_delay(
+    slide_id: String,
+    step_index: usize,
+    delay_ms: u32,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let command = Box::new(slides_core::SetBuildStepDelay::new(slide_id, step_index, delay_ms));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Sets or clears the motion path of a single build step and returns the
+/// updated deck snapshot. Waypoints are EMU rectangles relative to the shape's
+/// position. Pass `None` to clear. The change is applied via the verified
+/// [`slides_core::SetBuildStepMotionPath`] command so it is undoable.
+#[tauri::command]
+pub fn set_build_step_motion_path(
+    slide_id: String,
+    step_index: usize,
+    path: Option<Vec<RectDto>>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let core_path = path.map(|rects| rects.into_iter().map(rect_to_core).collect());
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let command =
+        Box::new(slides_core::SetBuildStepMotionPath::new(slide_id, step_index, core_path));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Sets or clears the per-slide reduce-motion override and returns the updated
+/// deck snapshot. When `Some(true)`, the presenter renders this slide's
+/// build-ins instantly. The change is applied via the verified
+/// [`slides_core::SetSlideReduceMotion`] command so it is undoable.
+#[tauri::command]
+pub fn set_slide_reduce_motion(
+    slide_id: String,
+    reduce_motion: Option<bool>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let command = Box::new(slides_core::SetSlideReduceMotion::new(slide_id, reduce_motion));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
 /// Renders a single slide to a deterministic SVG string.
 ///
 /// The slide's dimensions come from the deck's `slide_size` (aspect ratio),
@@ -3132,6 +3254,7 @@ fn slide_to_dto(slide: &slides_core::Slide) -> SlideSnapshot {
             .as_ref()
             .map(|paragraphs| paragraphs.iter().map(paragraph_to_dto).collect()),
         layout_ref: slide.layout_ref.clone(),
+        reduce_motion: slide.reduce_motion,
     }
 }
 
@@ -3675,6 +3798,28 @@ fn build_step_to_dto(step: &slides_core::BuildStep) -> BuildStepDto {
         shape_index: step.shape_index,
         effect: build_effect_to_dto(step.effect),
         duration_ms: step.duration_ms,
+        trigger: trigger_to_dto(step.trigger),
+        delay_ms: step.delay_ms,
+        motion_path: step
+            .motion_path
+            .as_ref()
+            .map(|rects| rects.iter().copied().map(rect_to_dto).collect()),
+    }
+}
+
+fn trigger_to_dto(trigger: slides_core::Trigger) -> TriggerDto {
+    match trigger {
+        slides_core::Trigger::OnClick => TriggerDto::OnClick,
+        slides_core::Trigger::WithPrevious => TriggerDto::WithPrevious,
+        slides_core::Trigger::AfterPrevious => TriggerDto::AfterPrevious,
+    }
+}
+
+fn trigger_from_dto(dto: TriggerDto) -> slides_core::Trigger {
+    match dto {
+        TriggerDto::OnClick => slides_core::Trigger::OnClick,
+        TriggerDto::WithPrevious => slides_core::Trigger::WithPrevious,
+        TriggerDto::AfterPrevious => slides_core::Trigger::AfterPrevious,
     }
 }
 
@@ -3687,15 +3832,22 @@ fn build_effect_to_dto(effect: slides_core::BuildEffect) -> BuildEffectDto {
         slides_core::BuildEffect::SlideInBottom => BuildEffectDto::SlideInBottom,
         slides_core::BuildEffect::Appear => BuildEffectDto::Appear,
         slides_core::BuildEffect::Disappear => BuildEffectDto::Disappear,
+        slides_core::BuildEffect::MotionPath => BuildEffectDto::MotionPath,
     }
 }
 
 fn build_step_from_dto(dto: BuildStepDto) -> slides_core::BuildStep {
-    slides_core::BuildStep::new(
+    let mut step = slides_core::BuildStep::new(
         dto.shape_index,
         build_effect_from_dto(dto.effect),
         dto.duration_ms,
-    )
+    );
+    step.trigger = trigger_from_dto(dto.trigger);
+    step.delay_ms = dto.delay_ms;
+    step.motion_path = dto
+        .motion_path
+        .map(|rects| rects.into_iter().map(rect_to_core).collect());
+    step
 }
 
 fn build_effect_from_dto(dto: BuildEffectDto) -> slides_core::BuildEffect {
@@ -3707,6 +3859,7 @@ fn build_effect_from_dto(dto: BuildEffectDto) -> slides_core::BuildEffect {
         BuildEffectDto::SlideInBottom => slides_core::BuildEffect::SlideInBottom,
         BuildEffectDto::Appear => slides_core::BuildEffect::Appear,
         BuildEffectDto::Disappear => slides_core::BuildEffect::Disappear,
+        BuildEffectDto::MotionPath => slides_core::BuildEffect::MotionPath,
     }
 }
 

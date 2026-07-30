@@ -283,12 +283,22 @@ export type BuildEffectDto =
   | 'slide_in_bottom'
   | 'appear'
   | 'disappear'
+  | 'motion_path'
+
+/** When a build step fires (mirrors slides-core Trigger). */
+export type TriggerDto = 'on_click' | 'with_previous' | 'after_previous'
 
 /** One build-in step targeting a shape by index. */
 export interface BuildStepDto {
   shapeIndex: number
   effect: BuildEffectDto
   durationMs: number
+  /** When this step fires. Defaults to 'on_click'. */
+  trigger: TriggerDto
+  /** Delay before the effect starts, in ms, after the trigger fires. */
+  delayMs: number
+  /** Optional motion path waypoints (EMU rects), for the 'motion_path' effect. */
+  motionPath?: RectDto[]
 }
 
 /** Ordered build-in animation sequence (mirrors slides-core Animation). */
@@ -307,6 +317,8 @@ export interface SlideSnapshot {
   richNotes?: ParagraphDto[]
   /** Name of the layout (from the deck's layouts) this slide uses, if any. */
   layoutRef?: string
+  /** Per-slide reduce-motion override. true = render build-ins instantly. */
+  reduceMotion?: boolean
 }
 
 /** A named placeholder frame, mirroring slides-core PlaceholderDef. */
