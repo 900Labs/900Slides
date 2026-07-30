@@ -564,6 +564,7 @@ fn parse_slide(
         transition,
         rich_notes: None,
         layout_ref: None,
+        reduce_motion: None,
     })
 }
 

@@ -75,6 +75,7 @@ pub fn css_class(effect: BuildEffect) -> &'static str {
         BuildEffect::SlideInBottom => "build-slide-in-bottom",
         BuildEffect::Appear => "build-appear",
         BuildEffect::Disappear => "build-disappear",
+        BuildEffect::MotionPath => "build-motion-path",
     }
 }
 
@@ -104,6 +105,12 @@ pub fn keyframes(effect: BuildEffect) -> &'static str {
         }
         BuildEffect::Disappear => {
             "@keyframes build-disappear { from { opacity: 1; } to { opacity: 0; } }"
+        }
+        BuildEffect::MotionPath => {
+            // Motion paths are interpolated along their waypoints by the
+            // trigger-aware timeline (Wave 19, component 2); this placeholder
+            // keeps the keyframes registry exhaustive for component 1.
+            "@keyframes build-motion-path { from { transform: translate(0, 0); } to { transform: translate(0, 0); } }"
         }
     }
 }

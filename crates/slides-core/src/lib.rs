@@ -395,6 +395,13 @@ pub struct Slide {
     /// unchanged — a non-breaking, additive change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layout_ref: Option<String>,
+    /// Per-slide reduce-motion override. When `Some(true)`, the presenter
+    /// renders this slide's build-ins instantly (no animation), overriding any
+    /// system-level preference for this slide only. When `None`, the system
+    /// preference is used. Defaults to `None` so old decks deserialize
+    /// unchanged — a non-breaking, additive change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reduce_motion: Option<bool>,
 }
 
 /// A shape or content object placed on a slide.
@@ -1798,6 +1805,23 @@ impl Animation {
     }
 }
 
+/// When a build step fires.
+///
+/// Additive with `#[serde(default)]`; old decks (which carry no `trigger`
+/// field) deserialize into [`Trigger::OnClick`], preserving the original
+/// one-click-per-step behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Trigger {
+    /// The step fires on a presenter click (the original, default behavior).
+    #[default]
+    OnClick,
+    /// The step fires simultaneously with the previous step.
+    WithPrevious,
+    /// The step fires immediately after the previous step completes.
+    AfterPrevious,
+}
+
 /// One build-in step targeting a single shape by index.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BuildStep {
@@ -1808,6 +1832,22 @@ pub struct BuildStep {
     /// Duration of the effect in milliseconds. Deterministic. Clamped to
     /// `0..=MAX_BUILD_STEP_MS`.
     pub duration_ms: u32,
+    /// When this step fires. Defaults to [`Trigger::OnClick`] so decks
+    /// serialized before this field existed deserialize unchanged — a
+    /// non-breaking, additive change.
+    #[serde(default)]
+    pub trigger: Trigger,
+    /// Delay before the effect starts, in milliseconds, after the trigger
+    /// fires. Defaults to `0` (`#[serde(default)]`) so old decks deserialize
+    /// unchanged.
+    #[serde(default)]
+    pub delay_ms: u32,
+    /// Optional motion path (waypoints in EMU). Only meaningful when
+    /// [`effect`](Self::effect) is [`BuildEffect::MotionPath`]. Defaults to
+    /// `None` and is skipped when `None` so old decks deserialize and
+    /// re-serialize unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub motion_path: Option<Vec<Rect>>,
 }
 
 impl BuildStep {
@@ -1817,6 +1857,9 @@ impl BuildStep {
             shape_index,
             effect,
             duration_ms: duration_ms.min(MAX_BUILD_STEP_MS),
+            trigger: Trigger::default(),
+            delay_ms: 0,
+            motion_path: None,
         }
     }
 }
@@ -1839,6 +1882,8 @@ pub enum BuildEffect {
     Appear,
     /// Hide a shape that was already visible (opacity 1 -> 0).
     Disappear,
+    /// Move the shape along the step's `motion_path` waypoints, in EMU.
+    MotionPath,
 }
 
 // ===== Local comments (Wave 17) ==============================================
@@ -4351,6 +4396,260 @@ impl Command for MoveBuildStep {
     }
 }
 
+/// Sets the [`Trigger`] of a single build step.
+///
+/// Inverse snapshots the step's prior `trigger`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetBuildStepTrigger {
+    slide_id: String,
+    step_index: usize,
+    trigger: Trigger,
+}
+
+impl SetBuildStepTrigger {
+    /// Creates a new set-build-step-trigger command.
+    pub fn new(slide_id: impl Into<String>, step_index: usize, trigger: Trigger) -> Self {
+        Self {
+            slide_id: slide_id.into(),
+            step_index,
+            trigger,
+        }
+    }
+}
+
+impl Command for SetBuildStepTrigger {
+    fn apply(&self, deck: &mut Deck) {
+        let Some(slide) = deck.slide_mut(&self.slide_id) else {
+            return;
+        };
+        let Some(animation) = slide.animation.as_mut() else {
+            return;
+        };
+        let Some(step) = animation.steps.get_mut(self.step_index) else {
+            return;
+        };
+        step.trigger = self.trigger;
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        let prior = deck
+            .slide(&self.slide_id)
+            .and_then(|slide| slide.animation.as_ref())
+            .and_then(|animation| animation.steps.get(self.step_index))
+            .map(|step| step.trigger)
+            .unwrap_or(self.trigger);
+        Box::new(Self {
+            slide_id: self.slide_id.clone(),
+            step_index: self.step_index,
+            trigger: prior,
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        let Some(slide) = deck.slide(&self.slide_id) else {
+            return false;
+        };
+        let Some(animation) = slide.animation.as_ref() else {
+            return false;
+        };
+        self.step_index < animation.steps.len()
+    }
+}
+
+/// Sets the delay (`delay_ms`) of a single build step.
+///
+/// Inverse snapshots the step's prior `delay_ms`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetBuildStepDelay {
+    slide_id: String,
+    step_index: usize,
+    delay_ms: u32,
+}
+
+impl SetBuildStepDelay {
+    /// Creates a new set-build-step-delay command.
+    pub fn new(slide_id: impl Into<String>, step_index: usize, delay_ms: u32) -> Self {
+        Self {
+            slide_id: slide_id.into(),
+            step_index,
+            delay_ms,
+        }
+    }
+}
+
+impl Command for SetBuildStepDelay {
+    fn apply(&self, deck: &mut Deck) {
+        let Some(slide) = deck.slide_mut(&self.slide_id) else {
+            return;
+        };
+        let Some(animation) = slide.animation.as_mut() else {
+            return;
+        };
+        let Some(step) = animation.steps.get_mut(self.step_index) else {
+            return;
+        };
+        step.delay_ms = self.delay_ms;
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        let prior = deck
+            .slide(&self.slide_id)
+            .and_then(|slide| slide.animation.as_ref())
+            .and_then(|animation| animation.steps.get(self.step_index))
+            .map(|step| step.delay_ms)
+            .unwrap_or(self.delay_ms);
+        Box::new(Self {
+            slide_id: self.slide_id.clone(),
+            step_index: self.step_index,
+            delay_ms: prior,
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        let Some(slide) = deck.slide(&self.slide_id) else {
+            return false;
+        };
+        let Some(animation) = slide.animation.as_ref() else {
+            return false;
+        };
+        self.step_index < animation.steps.len()
+    }
+}
+
+/// Sets or clears the motion path of a single build step.
+///
+/// Inverse snapshots the step's prior `Option<Vec<Rect>>`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetBuildStepMotionPath {
+    slide_id: String,
+    step_index: usize,
+    path: Option<Vec<Rect>>,
+}
+
+impl SetBuildStepMotionPath {
+    /// Creates a new set-build-step-motion-path command. Pass `None` to clear.
+    pub fn new(slide_id: impl Into<String>, step_index: usize, path: Option<Vec<Rect>>) -> Self {
+        Self {
+            slide_id: slide_id.into(),
+            step_index,
+            path,
+        }
+    }
+}
+
+impl Command for SetBuildStepMotionPath {
+    fn apply(&self, deck: &mut Deck) {
+        let Some(slide) = deck.slide_mut(&self.slide_id) else {
+            return;
+        };
+        let Some(animation) = slide.animation.as_mut() else {
+            return;
+        };
+        let Some(step) = animation.steps.get_mut(self.step_index) else {
+            return;
+        };
+        step.motion_path = self.path.clone();
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        let prior = deck
+            .slide(&self.slide_id)
+            .and_then(|slide| slide.animation.as_ref())
+            .and_then(|animation| animation.steps.get(self.step_index))
+            .and_then(|step| step.motion_path.clone());
+        Box::new(Self {
+            slide_id: self.slide_id.clone(),
+            step_index: self.step_index,
+            path: prior,
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        let Some(slide) = deck.slide(&self.slide_id) else {
+            return false;
+        };
+        let Some(animation) = slide.animation.as_ref() else {
+            return false;
+        };
+        self.step_index < animation.steps.len()
+    }
+}
+
+/// Sets or clears the per-slide reduce-motion override.
+///
+/// When `reduce_motion` is `Some(true)`, the presenter renders this slide's
+/// build-ins instantly. Inverse snapshots the slide's prior `Option<bool>`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetSlideReduceMotion {
+    slide_id: String,
+    reduce_motion: Option<bool>,
+}
+
+impl SetSlideReduceMotion {
+    /// Creates a new set-slide-reduce-motion command. Pass `None` to clear the
+    /// override (defer to the system preference).
+    pub fn new(slide_id: impl Into<String>, reduce_motion: Option<bool>) -> Self {
+        Self {
+            slide_id: slide_id.into(),
+            reduce_motion,
+        }
+    }
+}
+
+impl Command for SetSlideReduceMotion {
+    fn apply(&self, deck: &mut Deck) {
+        if let Some(slide) = deck.slide_mut(&self.slide_id) {
+            slide.reduce_motion = self.reduce_motion;
+        }
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        let prior = deck
+            .slide(&self.slide_id)
+            .and_then(|slide| slide.reduce_motion);
+        Box::new(Self {
+            slide_id: self.slide_id.clone(),
+            reduce_motion: prior,
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |s| s.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        deck.slide(&self.slide_id).is_some()
+    }
+}
+
 /// Sets or clears the deck's slide size (aspect ratio).
 ///
 /// This is a deck-level command: it affects the whole deck rather than a
@@ -5165,6 +5464,7 @@ mod tests {
             transition: None,
             rich_notes: None,
             layout_ref: None,
+            reduce_motion: None,
         });
 
         let json = serde_json::to_string(&deck).expect("serialize deck");
@@ -5191,6 +5491,7 @@ mod tests {
             transition: None,
             rich_notes: None,
             layout_ref: None,
+            reduce_motion: None,
         });
 
         let mut bus = CommandBus::default();
@@ -5230,6 +5531,7 @@ mod tests {
             transition: None,
             rich_notes: None,
             layout_ref: None,
+            reduce_motion: None,
         });
 
         let mut bus = CommandBus::default();
@@ -5266,6 +5568,7 @@ mod tests {
             transition: None,
             rich_notes: None,
             layout_ref: None,
+            reduce_motion: None,
         });
 
         let mut bus = CommandBus::default();
@@ -5306,6 +5609,7 @@ mod tests {
             transition: None,
             rich_notes: None,
             layout_ref: None,
+            reduce_motion: None,
         });
 
         let mut bus = CommandBus::default();
@@ -5358,6 +5662,7 @@ mod tests {
             transition: None,
             rich_notes: None,
             layout_ref: None,
+            reduce_motion: None,
         }
     }
 
@@ -5947,6 +6252,7 @@ mod tests {
             transition: None,
             rich_notes: None,
             layout_ref: None,
+            reduce_motion: None,
         });
 
         let mut value = serde_json::to_value(&deck).expect("serialize to value");
@@ -6069,6 +6375,7 @@ mod tests {
             transition: None,
             rich_notes: None,
             layout_ref: None,
+            reduce_motion: None,
         });
         let original = deck.clone();
 
@@ -6122,6 +6429,7 @@ mod tests {
             transition: None,
             rich_notes: None,
             layout_ref: None,
+            reduce_motion: None,
         });
 
         let mut bus = CommandBus::default();
@@ -6166,6 +6474,7 @@ mod tests {
             transition: None,
             rich_notes: None,
             layout_ref: None,
+            reduce_motion: None,
         });
 
         let mut bus = CommandBus::default();
@@ -8790,6 +9099,7 @@ mod tests {
             transition: Some(Transition::new(TransitionKind::Morph, 800)),
             rich_notes: None,
             layout_ref: None,
+            reduce_motion: None,
         };
         let json = serde_json::to_string(&slide).expect("serialize slide");
         let restored: Slide = serde_json::from_str(&json).expect("deserialize slide");
@@ -8829,6 +9139,7 @@ mod tests {
             transition: None,
             rich_notes: None,
             layout_ref: None,
+            reduce_motion: None,
         };
         let mut deck = Deck::new();
         deck.slides.push(slide);
@@ -9313,5 +9624,317 @@ mod tests {
         empty.comments.clear();
         let empty_json = serde_json::to_string(&empty).expect("serialize empty");
         assert!(!empty_json.contains("\"comments\""));
+    }
+
+    fn slide_with_animation(id: &str, shapes: Vec<Shape>, steps: Vec<BuildStep>) -> Slide {
+        let mut slide = slide_with(id, shapes);
+        slide.animation = Some(Animation::new(steps));
+        slide
+    }
+
+    #[test]
+    fn trigger_default_is_on_click() {
+        let step = BuildStep::new(0, BuildEffect::Fade, 100);
+        assert_eq!(Trigger::default(), Trigger::OnClick);
+        assert_eq!(step.trigger, Trigger::OnClick);
+        assert_eq!(step.delay_ms, 0);
+        assert_eq!(step.motion_path, None);
+    }
+
+    #[test]
+    fn trigger_enum_serializes_all_variants() {
+        assert_eq!(
+            serde_json::to_string(&Trigger::OnClick).unwrap(),
+            "\"on_click\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Trigger::WithPrevious).unwrap(),
+            "\"with_previous\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Trigger::AfterPrevious).unwrap(),
+            "\"after_previous\""
+        );
+
+        for (text, expected) in [
+            ("\"on_click\"", Trigger::OnClick),
+            ("\"with_previous\"", Trigger::WithPrevious),
+            ("\"after_previous\"", Trigger::AfterPrevious),
+        ] {
+            let parsed: Trigger = serde_json::from_str(text).expect("parse trigger");
+            assert_eq!(parsed, expected);
+        }
+    }
+
+    #[test]
+    fn old_deck_without_trigger_fields_deserializes() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with_animation(
+            "s1",
+            vec![geo_rectangle()],
+            vec![BuildStep::new(0, BuildEffect::Fade, 200)],
+        ));
+
+        let mut value = serde_json::to_value(&deck).expect("serialize to value");
+        // Strip the new BuildStep fields (trigger, delay_ms, motion_path) and
+        // the new Slide field (reduce_motion), simulating a pre-Wave-19 deck.
+        let slide = value.get_mut("slides").unwrap().get_mut(0).unwrap();
+        slide.as_object_mut().unwrap().remove("reduce_motion");
+        let step = slide
+            .get_mut("animation")
+            .unwrap()
+            .get_mut("steps")
+            .unwrap()
+            .get_mut(0)
+            .unwrap();
+        let step_obj = step.as_object_mut().unwrap();
+        step_obj.remove("trigger");
+        step_obj.remove("delay_ms");
+        step_obj.remove("motion_path");
+
+        let old_json = serde_json::to_string(&value).expect("reserialize old deck");
+        let restored: Deck = serde_json::from_str(&old_json).expect("old deck must load");
+
+        let step = &restored.slides[0]
+            .animation
+            .as_ref()
+            .expect("animation")
+            .steps[0];
+        assert_eq!(step.trigger, Trigger::OnClick);
+        assert_eq!(step.delay_ms, 0);
+        assert_eq!(step.motion_path, None);
+        assert_eq!(restored.slides[0].reduce_motion, None);
+    }
+
+    #[test]
+    fn build_step_with_motion_path_serializes() {
+        let mut step = BuildStep::new(0, BuildEffect::MotionPath, 500);
+        step.motion_path = Some(vec![
+            Rect::new(0.0, 0.0, 100.0, 100.0),
+            Rect::new(1_000_000.0, 0.0, 100.0, 100.0),
+        ]);
+        let json = serde_json::to_string(&step).expect("serialize step");
+        assert!(
+            json.contains("\"motion_path\""),
+            "motion_path must serialize"
+        );
+        assert!(json.contains("\"motion_path\""));
+        let restored: BuildStep = serde_json::from_str(&json).expect("deserialize step");
+        assert_eq!(step, restored);
+        assert_eq!(restored.effect, BuildEffect::MotionPath);
+        assert_eq!(restored.motion_path.expect("path").len(), 2);
+
+        // A step without a motion path omits the field entirely.
+        let plain = BuildStep::new(0, BuildEffect::Fade, 100);
+        let plain_json = serde_json::to_string(&plain).expect("serialize plain");
+        assert!(!plain_json.contains("\"motion_path\""));
+    }
+
+    #[test]
+    fn set_build_step_trigger_applies_and_undoes() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with_animation(
+            "s1",
+            vec![geo_rectangle(), geo_rectangle()],
+            vec![
+                BuildStep::new(0, BuildEffect::Fade, 200),
+                BuildStep::new(1, BuildEffect::Appear, 100),
+            ],
+        ));
+        let original = deck.clone();
+
+        let mut bus = CommandBus::default();
+        bus.apply(
+            Box::new(SetBuildStepTrigger::new("s1", 1, Trigger::WithPrevious)),
+            &mut deck,
+        )
+        .expect("set with_previous");
+        assert_eq!(
+            deck.slides[0].animation.as_ref().expect("animation").steps[1].trigger,
+            Trigger::WithPrevious
+        );
+        assert_eq!(
+            deck.slides[0].animation.as_ref().expect("animation").steps[0].trigger,
+            Trigger::OnClick,
+            "untouched step keeps its default"
+        );
+
+        bus.apply(
+            Box::new(SetBuildStepTrigger::new("s1", 1, Trigger::AfterPrevious)),
+            &mut deck,
+        )
+        .expect("set after_previous");
+        assert_eq!(
+            deck.slides[0].animation.as_ref().expect("animation").steps[1].trigger,
+            Trigger::AfterPrevious
+        );
+
+        // Undo restores the prior value at each step.
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(
+            deck.slides[0].animation.as_ref().expect("animation").steps[1].trigger,
+            Trigger::WithPrevious
+        );
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn set_build_step_trigger_rejects_bad_index_and_missing_slide() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with_animation(
+            "s1",
+            vec![geo_rectangle()],
+            vec![BuildStep::new(0, BuildEffect::Fade, 100)],
+        ));
+        let mut bus = CommandBus::default();
+        assert_eq!(
+            bus.apply(
+                Box::new(SetBuildStepTrigger::new("s1", 9, Trigger::WithPrevious)),
+                &mut deck
+            ),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(
+            bus.apply(
+                Box::new(SetBuildStepTrigger::new(
+                    "missing",
+                    0,
+                    Trigger::WithPrevious
+                )),
+                &mut deck
+            ),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(bus.undo_len(), 0);
+        assert_eq!(
+            deck.slides[0].animation.as_ref().expect("animation").steps[0].trigger,
+            Trigger::OnClick
+        );
+    }
+
+    #[test]
+    fn set_build_step_delay_applies_and_undoes() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with_animation(
+            "s1",
+            vec![geo_rectangle()],
+            vec![BuildStep::new(0, BuildEffect::Fade, 200)],
+        ));
+        let original = deck.clone();
+
+        let mut bus = CommandBus::default();
+        bus.apply(Box::new(SetBuildStepDelay::new("s1", 0, 350)), &mut deck)
+            .expect("set delay");
+        assert_eq!(
+            deck.slides[0].animation.as_ref().expect("animation").steps[0].delay_ms,
+            350
+        );
+        // A second set changes it; undo restores each prior value.
+        bus.apply(Box::new(SetBuildStepDelay::new("s1", 0, 0)), &mut deck)
+            .expect("reset delay");
+        assert_eq!(
+            deck.slides[0].animation.as_ref().expect("animation").steps[0].delay_ms,
+            0
+        );
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(
+            deck.slides[0].animation.as_ref().expect("animation").steps[0].delay_ms,
+            350
+        );
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn set_build_step_motion_path_applies_and_undoes() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with_animation(
+            "s1",
+            vec![geo_rectangle()],
+            vec![BuildStep::new(0, BuildEffect::MotionPath, 500)],
+        ));
+        let original = deck.clone();
+
+        let path = Some(vec![
+            Rect::new(0.0, 0.0, 100.0, 100.0),
+            Rect::new(500.0, 0.0, 100.0, 100.0),
+        ]);
+        let mut bus = CommandBus::default();
+        bus.apply(
+            Box::new(SetBuildStepMotionPath::new("s1", 0, path.clone())),
+            &mut deck,
+        )
+        .expect("set path");
+        assert_eq!(
+            deck.slides[0].animation.as_ref().expect("animation").steps[0].motion_path,
+            path
+        );
+
+        // Clearing is reversible.
+        bus.apply(
+            Box::new(SetBuildStepMotionPath::new("s1", 0, None)),
+            &mut deck,
+        )
+        .expect("clear path");
+        assert_eq!(
+            deck.slides[0].animation.as_ref().expect("animation").steps[0].motion_path,
+            None
+        );
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(
+            deck.slides[0].animation.as_ref().expect("animation").steps[0].motion_path,
+            path
+        );
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn set_slide_reduce_motion_applies_and_undoes() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with("s1", vec![geo_rectangle()]));
+        let original = deck.clone();
+
+        let mut bus = CommandBus::default();
+        bus.apply(
+            Box::new(SetSlideReduceMotion::new("s1", Some(true))),
+            &mut deck,
+        )
+        .expect("enable reduce motion");
+        assert_eq!(deck.slides[0].reduce_motion, Some(true));
+        bus.apply(
+            Box::new(SetSlideReduceMotion::new("s1", Some(false))),
+            &mut deck,
+        )
+        .expect("explicitly disable reduce motion");
+        assert_eq!(deck.slides[0].reduce_motion, Some(false));
+        bus.apply(Box::new(SetSlideReduceMotion::new("s1", None)), &mut deck)
+            .expect("clear reduce motion");
+        assert_eq!(deck.slides[0].reduce_motion, None);
+
+        // Undo walks back through each prior value.
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck.slides[0].reduce_motion, Some(false));
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck.slides[0].reduce_motion, Some(true));
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(deck, original);
+    }
+
+    #[test]
+    fn set_slide_reduce_motion_rejects_missing_slide() {
+        let mut deck = Deck::new();
+        deck.slides.push(slide_with("s1", vec![geo_rectangle()]));
+        let mut bus = CommandBus::default();
+        assert_eq!(
+            bus.apply(
+                Box::new(SetSlideReduceMotion::new("missing", Some(true))),
+                &mut deck
+            ),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(bus.undo_len(), 0);
+        assert_eq!(deck.slides[0].reduce_motion, None);
     }
 }
