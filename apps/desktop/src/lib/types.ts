@@ -319,6 +319,8 @@ export interface SlideSnapshot {
   layoutRef?: string
   /** Per-slide reduce-motion override. true = render build-ins instantly. */
   reduceMotion?: boolean
+  /** Per-slide rehearsed duration in ms, for auto-advance. Absent = none. */
+  rehearsedDurationMs?: number
 }
 
 /** A named placeholder frame, mirroring slides-core PlaceholderDef. */

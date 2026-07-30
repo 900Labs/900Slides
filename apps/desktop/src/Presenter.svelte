@@ -38,6 +38,19 @@
   /** Current code-step index (0-based) for stepped code highlighting. */
   let activeCodeStep = $state<number>(0)
 
+  /** Whether rehearse (per-slide timing) mode is active. While on, each slide
+   *  advance records how long the slide was shown. */
+  let rehearsing = $state(false)
+  /** Whether auto-advance playback is enabled (uses rehearsed durations). */
+  let useTimings = $state(false)
+  /** Per-slide recorded durations during the current rehearsal (slideId -> ms). */
+  let rehearseTimings = $state<Map<string, number>>(new Map())
+  /** Wall-clock timestamp (ms) the current slide was entered; drives the live
+   *  per-slide timer and the auto-advance countdown. Non-reactive by design. */
+  let slideEnteredMs = Date.now()
+  /** Periodically-refreshed clock (ms) so countdowns/timers update smoothly. */
+  let now = $state(Date.now())
+
   /** Bound main slide stage element, used for coordinate mapping and overlays. */
   let stageEl = $state<HTMLElement | null>(null)
   /** Rendered main slide box in stage-local pixels. */
@@ -84,6 +97,35 @@
       if (timer) clearInterval(timer)
       window.removeEventListener('keydown', keyHandler)
     }
+  })
+
+  // High-frequency clock for the live per-slide timer and the auto-advance
+  // countdown. Only ticks while a timing feature is active.
+  $effect(() => {
+    if (!rehearsing && !useTimings) return
+    const id = window.setInterval(() => {
+      now = Date.now()
+    }, 100)
+    return () => window.clearInterval(id)
+  })
+
+  // Auto-advance: when "Use timings" is on (and not recording a rehearsal),
+  // advance to the next slide once the current slide's rehearsed duration has
+  // elapsed. Re-arms whenever the slide, the toggle, or rehearsal state changes.
+  $effect(() => {
+    if (!useTimings || rehearsing) return
+    const slide = presenterState?.currentSlide
+    const duration = slide?.rehearsedDurationMs
+    if (!slide || !duration) return
+    const remaining = slideEnteredMs + duration - Date.now()
+    if (remaining <= 0) {
+      void next()
+      return
+    }
+    const handle = window.setTimeout(() => {
+      void next()
+    }, remaining)
+    return () => window.clearTimeout(handle)
   })
 
   // Create the throttled emitters once. They broadcast to all windows; the
@@ -152,6 +194,7 @@
       activeCodeStep = 0
       laserOn = presenterState.presenterSettings.laserPointer
       highlighterOn = presenterState.presenterSettings.highlighter
+      slideEnteredMs = Date.now()
     }
   }
 
@@ -194,6 +237,75 @@
     emitHighlighter?.([])
   }
 
+  /**
+   * Called whenever the current slide actually changes. While rehearsing, it
+   * records how long the just-left slide (`prevSlideId`) was shown, then resets
+   * the per-slide timer for the slide now entering.
+   */
+  function onSlideChanged(prevSlideId: string): void {
+    if (rehearsing) {
+      const duration = Date.now() - slideEnteredMs
+      const nextMap = new Map(rehearseTimings)
+      nextMap.set(prevSlideId, duration)
+      rehearseTimings = nextMap
+    }
+    slideEnteredMs = Date.now()
+  }
+
+  /** Begins rehearse mode: clears any prior timings and starts timing the
+   *  current slide. Auto-advance is suspended while recording. */
+  function startRehearse(): void {
+    if (rehearsing) return
+    rehearseTimings = new Map()
+    useTimings = false
+    rehearsing = true
+    slideEnteredMs = Date.now()
+  }
+
+  /** Ends rehearse mode and commits every recorded per-slide duration to the
+   *  deck via `set_slide_rehearsed_duration` (one invoke per slide), then
+   *  refreshes so the committed timings are reflected. */
+  async function endRehearse(): Promise<void> {
+    if (!rehearsing || !presenterState) return
+    const finalTimings = new Map(rehearseTimings)
+    finalTimings.set(presenterState.currentSlide.id, Date.now() - slideEnteredMs)
+    rehearsing = false
+    rehearseTimings = finalTimings
+    for (const [slideId, durationMs] of finalTimings) {
+      try {
+        await invoke('set_slide_rehearsed_duration', {
+          slide_id: slideId,
+          duration_ms: Math.round(durationMs),
+        })
+      } catch {
+        // A failed commit for one slide should not abort the rest.
+      }
+    }
+    await refresh()
+  }
+
+  /** Live per-slide duration in ms while rehearsing, else null. */
+  function currentSlideLiveMs(): number | null {
+    if (!rehearsing) return null
+    return Math.max(0, now - slideEnteredMs)
+  }
+
+  /** Per-slide time to display: the live rehearsal timer while recording, the
+   *  committed rehearsed duration otherwise. Null when there is nothing to show. */
+  function slideTimeMs(): number | null {
+    if (rehearsing) return currentSlideLiveMs()
+    return presenterState?.currentSlide.rehearsedDurationMs ?? null
+  }
+
+  /** Remaining ms until auto-advance fires, or null when auto-advance is off or
+   *  the current slide has no rehearsed duration. */
+  function autoAdvanceRemainingMs(): number | null {
+    if (!useTimings || rehearsing) return null
+    const duration = presenterState?.currentSlide.rehearsedDurationMs
+    if (!duration) return null
+    return Math.max(0, slideEnteredMs + duration - now)
+  }
+
   /** Advances the build timeline or moves to the next slide. */
   async function next(): Promise<void> {
     if (!presenterState) return
@@ -232,6 +344,7 @@
     }
     const result = await invoke<PresenterState>('presenter_next')
     if (result.slideNumber === presenterState.slideNumber) return
+    const prevSlideId = presenterState.currentSlide.id
     presenterState = result
     clearStrokes()
     if (isMorph && frames.length > 0 && result.currentSlide) {
@@ -252,6 +365,7 @@
       activeCodeStep = 0
       broadcastState()
     }
+    onSlideChanged(prevSlideId)
   }
 
   /** Goes to the previous slide, showing it fully built. */
@@ -259,41 +373,53 @@
     if (!presenterState) return
     const result = await invoke<PresenterState>('presenter_previous')
     if (result.slideNumber !== presenterState.slideNumber) {
+      const prevSlideId = presenterState.currentSlide.id
       presenterState = result
       activeBuildStep = Infinity
       activeCodeStep = 0
       clearStrokes()
       broadcastState()
+      onSlideChanged(prevSlideId)
     }
   }
 
   /** Jumps to the first slide. */
   async function first(): Promise<void> {
+    if (!presenterState) return
+    const startSlideId = presenterState.currentSlide.id
+    let moved = false
     while (presenterState && presenterState.slideNumber > 1) {
       const result = await invoke<PresenterState>('presenter_previous')
       if (result.slideNumber === presenterState.slideNumber) break
       presenterState = result
+      moved = true
     }
-    if (presenterState) {
+    if (moved && presenterState) {
       activeBuildStep = Infinity
       activeCodeStep = 0
       clearStrokes()
       broadcastState()
+      onSlideChanged(startSlideId)
     }
   }
 
   /** Jumps to the last slide. */
   async function last(): Promise<void> {
+    if (!presenterState) return
+    const startSlideId = presenterState.currentSlide.id
+    let moved = false
     while (presenterState && presenterState.slideNumber < presenterState.total) {
       const result = await invoke<PresenterState>('presenter_next')
       if (result.slideNumber === presenterState.slideNumber) break
       presenterState = result
+      moved = true
     }
-    if (presenterState) {
+    if (moved && presenterState) {
       activeBuildStep = Infinity
       activeCodeStep = 0
       clearStrokes()
       broadcastState()
+      onSlideChanged(startSlideId)
     }
   }
 
@@ -463,7 +589,11 @@
       toggleHighlighter()
     } else if (event.key === 'Escape') {
       event.preventDefault()
-      close()
+      if (rehearsing) {
+        void endRehearse()
+      } else {
+        close()
+      }
     }
   }
 
@@ -474,6 +604,11 @@
       .padStart(2, '0')
     const s = (seconds % 60).toString().padStart(2, '0')
     return `${m}:${s}`
+  }
+
+  /** Formats a millisecond duration as mm:ss. */
+  function formatMs(ms: number): string {
+    return formatTime(Math.floor(ms / 1000))
   }
 
   /** Returns a readable background color for a slide, or white. */
@@ -501,6 +636,11 @@
 <svelte:window onclick={onWindowClick} onpointerup={onWindowPointerUp} />
 
 <div class="presenter" role="application" aria-label="Presenter view" tabindex="-1">
+  {#if rehearsing}
+    <div class="rehearse-banner" role="status" aria-live="polite">
+      Rehearsing&hellip; press <kbd>Esc</kbd> or click <strong>Done</strong> to save timings.
+    </div>
+  {/if}
   {#if presenterState}
     <div
       class="stage"
@@ -609,6 +749,35 @@
               persistSettings({ ...settings(), highlighterColor: e.currentTarget.value })}
           />
         </label>
+        <button
+          class="tool"
+          class:on={rehearsing}
+          onclick={(e) => {
+            e.stopPropagation()
+            if (rehearsing) {
+              void endRehearse()
+            } else {
+              startRehearse()
+            }
+          }}
+          type="button"
+          title={rehearsing ? 'Finish rehearsing and save timings (Esc)' : 'Rehearse timings'}
+        >
+          {rehearsing ? 'Done' : 'Rehearse'}
+        </button>
+        <button
+          class="tool"
+          class:on={useTimings}
+          disabled={rehearsing}
+          onclick={(e) => {
+            e.stopPropagation()
+            useTimings = !useTimings
+          }}
+          type="button"
+          title="Auto-advance using rehearsed timings"
+        >
+          Use timings
+        </button>
         <span class="filter-tool">
           <button
             class="tool"
@@ -728,6 +897,18 @@
         <span class="counter">{presenterState.slideNumber} / {presenterState.total}</span>
         <span class="timer">{formatTime(elapsed)}</span>
       </div>
+
+      {#if slideTimeMs() !== null}
+        <div class="slide-time" aria-label="Per-slide time">
+          Slide {formatMs(slideTimeMs() ?? 0)}
+        </div>
+      {/if}
+
+      {#if autoAdvanceRemainingMs() !== null}
+        <div class="auto-advance" aria-label="Time to auto-advance">
+          &#9654; Auto {formatMs(autoAdvanceRemainingMs() ?? 0)}
+        </div>
+      {/if}
 
       {#if currentCodeStepCount() > 0}
         <div class="code-step-indicator" aria-label="Active code step">
@@ -895,6 +1076,48 @@
     color: #ffd95e;
     font-size: 0.85rem;
     font-variant-numeric: tabular-nums;
+  }
+  .slide-time,
+  .auto-advance {
+    align-self: flex-start;
+    padding: 0.2rem 0.5rem;
+    border-radius: 4px;
+    font-size: 0.85rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .slide-time {
+    background: #10243a;
+    border: 1px solid #1f6feb;
+    color: #9bc1ff;
+  }
+  .auto-advance {
+    background: #15301a;
+    border: 1px solid #2ea043;
+    color: #7ee787;
+  }
+  .rehearse-banner {
+    position: fixed;
+    top: 0.75rem;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 60;
+    padding: 0.4rem 0.9rem;
+    background: #5c2d00;
+    border: 1px solid #d29922;
+    border-radius: 6px;
+    color: #ffd95e;
+    font-size: 0.9rem;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+  }
+  .rehearse-banner kbd {
+    font-family: ui-monospace, monospace;
+    background: rgba(0, 0, 0, 0.35);
+    border-radius: 3px;
+    padding: 0 0.25rem;
+  }
+  .tool:disabled {
+    opacity: 0.4;
+    cursor: default;
   }
   .notes {
     flex: 1;

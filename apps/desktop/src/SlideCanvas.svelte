@@ -19,6 +19,7 @@
     ParagraphDto,
     ParagraphStyleDto,
     PassthroughSnapshot,
+    PlaceholderDefDto,
     RunDto,
     SlideSizeDto,
     SlideSnapshot,
@@ -86,6 +87,9 @@
     /** Index of a shape to highlight as selected (e.g. from the accessibility
      *  panel). `null` (or omitted) draws no selection ring. */
     selectedShapeIndex?: number | null
+    /** Placeholder frames for the slide's active layout, drawn as non-editable
+     *  guide outlines in the editor. Omitted or empty draws no guides. */
+    placeholderGuides?: PlaceholderDefDto[]
   }
 
   let {
@@ -105,6 +109,7 @@
     slideSize,
     highContrast = false,
     selectedShapeIndex = null,
+    placeholderGuides,
   }: Props = $props()
 
   /** Canvas width in pixels, derived from the deck slide size or 16:9 default. */
@@ -1003,6 +1008,20 @@
   role="application"
   aria-label="Slide canvas"
 >
+  {#if !readonly && placeholderGuides && placeholderGuides.length > 0}
+    {#each placeholderGuides as guide}
+      <div
+        class="placeholder-guide"
+        style:left={toPx(guide.frame.x)}
+        style:top={toPx(guide.frame.y)}
+        style:width={toPx(guide.frame.width)}
+        style:height={toPx(guide.frame.height)}
+        aria-hidden="true"
+      >
+        <span class="placeholder-guide-label">{guide.name}</span>
+      </div>
+    {/each}
+  {/if}
   {#each slide.shapes as shape, shapeIndex}
     {#if shape.kind === 'text_box'}
       {@const textBox = shape.value as TextBoxSnapshot}
@@ -1316,6 +1335,23 @@
     outline: 3px solid #0070c0;
     outline-offset: 2px;
     z-index: 5;
+  }
+  .placeholder-guide {
+    position: absolute;
+    box-sizing: border-box;
+    border: 1.5px dashed rgba(0, 112, 192, 0.55);
+    background: rgba(0, 112, 192, 0.04);
+    pointer-events: none;
+    z-index: 0;
+  }
+  .placeholder-guide-label {
+    position: absolute;
+    top: 2px;
+    left: 4px;
+    font-size: 0.7rem;
+    color: rgba(0, 112, 192, 0.85);
+    text-transform: capitalize;
+    font-family: system-ui, sans-serif;
   }
   .text-box-editor {
     position: relative;
