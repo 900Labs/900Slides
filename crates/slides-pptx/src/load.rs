@@ -1915,7 +1915,12 @@ pub(crate) fn rel_attribute(e: &BytesStart<'_>, name: &str) -> Option<String> {
 }
 
 pub(crate) fn parse_attr_f64(e: &BytesStart<'_>, name: &str) -> Option<f64> {
-    attr_by_local_name(e, name)?.parse().ok()
+    let v: f64 = attr_by_local_name(e, name)?.parse().ok()?;
+    if v.is_finite() {
+        Some(v)
+    } else {
+        None
+    }
 }
 
 fn parse_bool_attr(e: &BytesStart<'_>, name: &str) -> Option<bool> {

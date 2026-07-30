@@ -188,13 +188,20 @@ pub fn write_content_types(types: &ContentTypes) -> Result<Vec<u8>> {
         ));
         writer.write_event(Event::Start(types_start))?;
 
-        for (ext, ct) in &types.defaults {
+        // Sort keys for deterministic output (HashMap iteration order is
+        // randomized per process, which would violate the byte-for-byte
+        // preservation guarantee for [Content_Types].xml).
+        let mut defaults: Vec<_> = types.defaults.iter().collect();
+        defaults.sort_by(|a, b| a.0.cmp(b.0));
+        for (ext, ct) in &defaults {
             let mut elem = BytesStart::new("Default");
             elem.push_attribute(("Extension", ext.as_str()));
             elem.push_attribute(("ContentType", ct.as_str()));
             writer.write_event(Event::Empty(elem))?;
         }
-        for (part, ct) in &types.overrides {
+        let mut overrides: Vec<_> = types.overrides.iter().collect();
+        overrides.sort_by(|a, b| a.0.cmp(b.0));
+        for (part, ct) in &overrides {
             let mut elem = BytesStart::new("Override");
             elem.push_attribute(("PartName", part.as_str()));
             elem.push_attribute(("ContentType", ct.as_str()));

@@ -272,12 +272,30 @@ pub fn render_slide(
     RenderedSlide { svg, hash }
 }
 
+use std::sync::OnceLock;
+
+/// Cached base64-encoded font data, computed once and reused across all
+/// renders and aliases (avoids re-encoding ~2.3MB of fonts per export).
+fn font_base64(data: &'static [u8]) -> &'static str {
+    static INTER_B64: OnceLock<String> = OnceLock::new();
+    static SERIF_B64: OnceLock<String> = OnceLock::new();
+    static MONO_B64: OnceLock<String> = OnceLock::new();
+    let cell = if std::ptr::eq(data, INTER_REGULAR) {
+        &INTER_B64
+    } else if std::ptr::eq(data, SOURCE_SERIF_REGULAR) {
+        &SERIF_B64
+    } else {
+        &MONO_B64
+    };
+    cell.get_or_init(|| base64::engine::general_purpose::STANDARD.encode(data))
+}
+
 /// Builds a single `@font-face` rule binding the CSS font-family `name` to the
 /// base64-encoded font `data`. The same font data can be bound under several
 /// names (aliases) so the theme's existing `font-family` attributes resolve to
 /// the bundled fonts without changing the render logic.
-fn font_face_css(name: &str, data: &[u8]) -> String {
-    let b64 = base64::engine::general_purpose::STANDARD.encode(data);
+fn font_face_css(name: &str, data: &'static [u8]) -> String {
+    let b64 = font_base64(data);
     format!(
         "@font-face {{ font-family: '{name}'; src: url(data:{mime};base64,{b64}) format('truetype'); }}",
         mime = FONT_TTF_MIME
