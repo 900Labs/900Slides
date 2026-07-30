@@ -20,6 +20,15 @@ pub enum Error {
     /// The package has an unsupported structure.
     #[error("odp unsupported format: {0}")]
     UnsupportedFormat(String),
+    /// A ZIP entry exceeds the maximum allowed size.
+    #[error("odp entry too large")]
+    EntryTooLarge,
+    /// The total uncompressed archive exceeds the maximum allowed size.
+    #[error("odp archive too large")]
+    ArchiveTooLarge,
+    /// A ZIP entry has an unsafe path (path traversal).
+    #[error("odp unsafe path: {0}")]
+    UnsafePath(String),
 }
 
 impl From<quick_xml::Error> for Error {

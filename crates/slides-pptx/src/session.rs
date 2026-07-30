@@ -178,24 +178,34 @@ impl Session {
 
         self.command_bus.apply(command, &mut self.deck)?;
 
-        for id in affected {
-            self.mark_slide_dirty(&id);
-            // Mark chart parts dirty when chart data, title, or type changed.
-            if let Some(before_shapes) = before.get(&id) {
-                if let Some(after_slide) = self.deck.slides.iter().find(|s| s.id == id) {
-                    for (index, before_chart) in before_shapes.iter().enumerate() {
-                        let after_chart = after_slide.shapes.get(index).and_then(|s| match s {
-                            slides_core::Shape::Chart(c) => Some(c),
-                            _ => None,
-                        });
-                        if let (Some(before), Some(after)) = (before_chart, after_chart) {
-                            if before.chart_type != after.chart_type
-                                || before.data != after.data
-                                || before.title != after.title
-                            {
-                                if let Some(parts) = self.chart_source_parts.get(&id) {
-                                    if let Some(part) = parts.get(&index) {
-                                        self.dirty_charts.insert(part.clone());
+        if affected.is_empty() {
+            // Deck-level commands (SetTemplate, SetHighContrast, etc.) return
+            // empty affected_slide_ids because they mutate deck-wide state, not
+            // a specific slide. Mark ALL slides dirty so the saver regenerates
+            // every slide on the next save.
+            for slide in &self.deck.slides {
+                self.dirty_slides.insert(slide.id.clone());
+            }
+        } else {
+            for id in affected {
+                self.mark_slide_dirty(&id);
+                // Mark chart parts dirty when chart data, title, or type changed.
+                if let Some(before_shapes) = before.get(&id) {
+                    if let Some(after_slide) = self.deck.slides.iter().find(|s| s.id == id) {
+                        for (index, before_chart) in before_shapes.iter().enumerate() {
+                            let after_chart = after_slide.shapes.get(index).and_then(|s| match s {
+                                slides_core::Shape::Chart(c) => Some(c),
+                                _ => None,
+                            });
+                            if let (Some(before), Some(after)) = (before_chart, after_chart) {
+                                if before.chart_type != after.chart_type
+                                    || before.data != after.data
+                                    || before.title != after.title
+                                {
+                                    if let Some(parts) = self.chart_source_parts.get(&id) {
+                                        if let Some(part) = parts.get(&index) {
+                                            self.dirty_charts.insert(part.clone());
+                                        }
                                     }
                                 }
                             }
@@ -212,13 +222,42 @@ impl Session {
     /// Returns `true` if a command was undone.
     pub fn undo(&mut self) -> bool {
         if let Some(affected) = self.command_bus.undo(&mut self.deck) {
-            for id in affected {
-                self.mark_slide_dirty(&id);
+            if affected.is_empty() {
+                for slide in &self.deck.slides {
+                    self.dirty_slides.insert(slide.id.clone());
+                }
+            } else {
+                for id in affected {
+                    self.mark_slide_dirty(&id);
+                }
             }
             true
         } else {
             false
         }
+    }
+
+    /// Re-applies the most recently undone command.
+    pub fn redo(&mut self) -> bool {
+        if let Some(affected) = self.command_bus.redo(&mut self.deck) {
+            if affected.is_empty() {
+                for slide in &self.deck.slides {
+                    self.dirty_slides.insert(slide.id.clone());
+                }
+            } else {
+                for id in affected {
+                    self.mark_slide_dirty(&id);
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns the number of transactions available to redo.
+    pub fn redo_len(&self) -> usize {
+        self.command_bus.redo_len()
     }
 
     /// Commits a successful save by replacing the original bytes and clearing

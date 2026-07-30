@@ -1497,6 +1497,15 @@ impl slides_core::Command for RestoreDeck {
     fn serialized_size(&self) -> usize {
         serde_json::to_string(self.replacement.as_ref()).map_or(0, |s| s.len())
     }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        // Return ALL slide ids from the replacement deck so that undo (which
+        // wraps the prior deck in another RestoreDeck) correctly re-marks
+        // slides as dirty. Without this, undo-after-save would leave the
+        // model and file desynced (the file would contain the restored deck
+        // while the editor shows the prior one).
+        self.replacement.slides.iter().map(|s| s.id.clone()).collect()
+    }
 }
 
 /// Lists every saved version for the current deck, newest first. Reads only
@@ -2686,6 +2695,20 @@ pub fn undo(app: AppHandle, state: State<'_, AppState>) -> Result<DeckSnapshot, 
     Ok(snapshot)
 }
 
+/// Re-applies the most recently undone edit.
+#[tauri::command]
+pub fn redo(app: AppHandle, state: State<'_, AppState>) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    if !session.redo() {
+        return Err("nothing to redo".to_string());
+    }
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
 /// Returns the current loss ledger warnings, if any.
 #[tauri::command]
 pub fn get_loss_ledger(state: State<'_, AppState>) -> Option<Vec<WarningDto>> {
@@ -3135,7 +3158,10 @@ fn write_recovery_snapshot(dir: &Path, deck_id: &str, bytes: &[u8]) -> Result<()
         .map_err(|e| e.to_string())?
         .as_millis() as u64;
     let path = dir.join(format!("{deck_id}_{timestamp}.pptx"));
-    fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    // Write atomically (temp file + fsync + rename) so a crash or power loss
+    // during the write cannot truncate the snapshot. Only delete older
+    // snapshots after the rename succeeds.
+    crate::versions::atomic_write(&path, bytes)?;
     for entry in fs::read_dir(dir).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         let other = entry.path();
@@ -3954,7 +3980,7 @@ fn run_from_dto(run: &RunDto) -> slides_core::Run {
         link: run
             .link
             .as_ref()
-            .map(|link| slides_core::Link::new_unchecked(link.url.clone())),
+            .and_then(|link| slides_core::Link::new(link.url.clone()).ok()),
         code: run.code,
         font_family: run.font_family.clone(),
         color: None,

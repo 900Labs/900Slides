@@ -1544,12 +1544,13 @@ impl Link {
     /// Validates `url` against the link allowlist and constructs a Link.
     ///
     /// Rejects:
-    /// - `javascript:`, `vbscript:`, `mocha:`, `livescript:`, `http:`,
-    ///   `https:`, `file:`, and `data:` schemes (case-insensitive prefix),
+    /// - `javascript:`, `vbscript:`, `mocha:`, `livescript:`, `file:`,
+    ///   and `data:` schemes (case-insensitive prefix),
     /// - any value with a colon before the first slash (i.e. an unknown scheme),
     /// - any control character (U+0000..=U+001F or U+007F).
     ///
-    /// Allowed: `mailto:`, `tel:`, `#fragment`, and schemeless relative paths.
+    /// Allowed: `http`, `https`, `mailto:`, `tel:`, `#fragment`, and
+    /// schemeless relative paths.
     pub fn new(url: impl Into<String>) -> std::result::Result<Self, LinkError> {
         let url = url.into();
         if url.chars().any(|c| {
@@ -1570,8 +1571,6 @@ impl Link {
             "vbscript:",
             "mocha:",
             "livescript:",
-            "http:",
-            "https:",
             "file:",
             "data:",
         ];
@@ -1581,7 +1580,7 @@ impl Link {
             ));
         }
 
-        const ALLOWED_SCHEMES: &[&str] = &["mailto:", "tel:"];
+        const ALLOWED_SCHEMES: &[&str] = &["https:", "http:", "mailto:", "tel:"];
         if ALLOWED_SCHEMES.iter().any(|s| lowered.starts_with(s)) {
             return Ok(Self { url, display: None });
         }
@@ -2046,13 +2045,14 @@ pub enum CommandError {
     InvalidCommand,
 }
 
-/// Transactional command bus with bounded undo history.
+/// Transactional command bus with bounded undo/redo history.
 ///
 /// The bus does not own the [`Deck`]; it is passed in on each call so the same
 /// model can be shared with other layers.
 #[derive(Debug, Default)]
 pub struct CommandBus {
     undo_stack: Vec<Box<dyn Command>>,
+    redo_stack: Vec<Box<dyn Command>>,
     total_size: usize,
 }
 
@@ -2065,7 +2065,8 @@ impl CommandBus {
     pub const MAX_PER_TRANSACTION: usize = 32 * 1024 * 1024;
 
     /// Applies a command transactionally, producing an inverse and pushing it
-    /// onto the undo stack.
+    /// onto the undo stack. Clears the redo stack (standard semantics — a new
+    /// action invalidates redo history).
     ///
     /// If a bound is exceeded, the deck is left unchanged and an error is
     /// returned. If the command fails validation, it is rejected without
@@ -2096,10 +2097,12 @@ impl CommandBus {
         command.apply(deck);
         self.undo_stack.push(inverse);
         self.total_size += inv_size;
+        self.redo_stack.clear();
         Ok(())
     }
 
-    /// Pops the most recent transaction and applies its inverse.
+    /// Pops the most recent transaction and applies its inverse, pushing the
+    /// forward command onto the redo stack.
     ///
     /// Returns the affected slide ids if a command was undone, or `None` if the
     /// history was empty.
@@ -2107,7 +2110,26 @@ impl CommandBus {
         let inverse = self.undo_stack.pop()?;
         let affected = inverse.affected_slide_ids();
         self.total_size = self.total_size.saturating_sub(inverse.serialized_size());
+        // Recover the forward command for redo BEFORE applying the inverse.
+        let redo_cmd = inverse.inverse(deck);
         inverse.apply(deck);
+        self.redo_stack.push(redo_cmd);
+        Some(affected)
+    }
+
+    /// Re-applies the most recently undone command and pushes its inverse back
+    /// onto the undo stack.
+    ///
+    /// Returns the affected slide ids if a command was redone, or `None` if the
+    /// redo stack was empty.
+    pub fn redo(&mut self, deck: &mut Deck) -> Option<Vec<String>> {
+        let forward = self.redo_stack.pop()?;
+        let affected = forward.affected_slide_ids();
+        let undo_inv = forward.inverse(deck);
+        let inv_size = undo_inv.serialized_size();
+        forward.apply(deck);
+        self.undo_stack.push(undo_inv);
+        self.total_size += inv_size;
         Some(affected)
     }
 
@@ -2116,7 +2138,12 @@ impl CommandBus {
         self.undo_stack.len()
     }
 
-    /// Returns the total serialized size of the stored inverse transactions.
+    /// Returns the number of transactions that can currently be redone.
+    pub fn redo_len(&self) -> usize {
+        self.redo_stack.len()
+    }
+
+    /// Returns the total serialized size of all stored transactions.
     pub fn total_size(&self) -> usize {
         self.total_size
     }
@@ -5566,6 +5593,62 @@ mod tests {
     }
 
     #[test]
+    fn command_bus_undo_then_redo_restores() {
+        let mut deck = Deck::new();
+        deck.slides.push(Slide {
+            id: "s1".to_string(),
+            notes: String::new(),
+            shapes: vec![Shape::TextBox(TextBox {
+                id: String::new(),
+                frame: Rect::new(0.0, 0.0, 100.0, 100.0),
+                paragraphs: vec![Paragraph {
+                    runs: vec![Run::new("before")],
+                    list_style: ListStyle::None,
+                    ..Default::default()
+                }],
+            })],
+            animation: None,
+            transition: None,
+            rich_notes: None,
+            layout_ref: None,
+            reduce_motion: None,
+            rehearsed_duration_ms: None,
+        });
+        let original = deck.clone();
+
+        let mut bus = CommandBus::default();
+        bus.apply(
+            Box::new(EditText::new("s1", 0, 0, vec![Run::new("changed")])),
+            &mut deck,
+        )
+        .expect("apply");
+
+        // Undo: deck reverts to original.
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(bus.undo_len(), 0);
+        assert_eq!(bus.redo_len(), 1);
+        assert_eq!(deck, original);
+
+        // Redo: deck goes back to changed state.
+        assert!(bus.redo(&mut deck).is_some());
+        assert_eq!(bus.undo_len(), 1);
+        assert_eq!(bus.redo_len(), 0);
+        if let Shape::TextBox(tb) = &deck.slides[0].shapes[0] {
+            assert_eq!(tb.paragraphs[0].runs[0].text, "changed");
+        }
+
+        // Undo again, then apply a new command → redo stack clears.
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(bus.redo_len(), 1);
+        bus.apply(
+            Box::new(EditText::new("s1", 0, 0, vec![Run::new("new")])),
+            &mut deck,
+        )
+        .expect("apply");
+        assert_eq!(bus.redo_len(), 0);
+    }
+
+    #[test]
     fn command_bus_rejects_oversized_transaction() {
         let mut deck = Deck::new();
         deck.slides.push(Slide {
@@ -6362,15 +6445,9 @@ mod tests {
         assert!(Link::new("#fragment").is_ok());
         assert!(Link::new("relative.html").is_ok());
         assert!(Link::new("./x").is_ok());
+        assert!(Link::new("http://example.com").is_ok());
+        assert!(Link::new("https://example.com").is_ok());
 
-        assert_eq!(
-            Link::new("http://example.com"),
-            Err(LinkError::DisallowedScheme("http".to_string()))
-        );
-        assert_eq!(
-            Link::new("https://example.com"),
-            Err(LinkError::DisallowedScheme("https".to_string()))
-        );
         assert_eq!(
             Link::new("javascript:alert(1)"),
             Err(LinkError::DisallowedScheme("javascript".to_string()))

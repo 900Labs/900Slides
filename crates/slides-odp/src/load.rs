@@ -85,8 +85,47 @@ pub fn load(odp_bytes: &[u8]) -> Result<Deck> {
 // ---------------------------------------------------------------------------
 
 fn open_archive(bytes: &[u8]) -> Result<zip::ZipArchive<std::io::Cursor<&[u8]>>> {
-    let archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
+
+    const MAX_ENTRY: u64 = 50 * 1024 * 1024;
+    const MAX_TOTAL: u64 = 500 * 1024 * 1024;
+    const MAX_ENTRIES: usize = 65_536;
+
+    if archive.len() > MAX_ENTRIES {
+        return Err(Error::ArchiveTooLarge);
+    }
+
+    let mut total: u64 = 0;
+    for i in 0..archive.len() {
+        let file = archive.by_index(i)?;
+        let name = file.name();
+        if !is_safe_zip_path(name) {
+            return Err(Error::UnsafePath(name.to_string()));
+        }
+        if file.size() > MAX_ENTRY {
+            return Err(Error::EntryTooLarge);
+        }
+        total += file.size();
+        if total > MAX_TOTAL {
+            return Err(Error::ArchiveTooLarge);
+        }
+    }
     Ok(archive)
+}
+
+fn is_safe_zip_path(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    use std::path::Component;
+    let path = std::path::Path::new(name);
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn read_entry_to_string(

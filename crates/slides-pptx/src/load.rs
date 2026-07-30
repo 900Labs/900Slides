@@ -1974,11 +1974,12 @@ fn is_code_font(typeface: &str) -> bool {
 
 fn parse_hex_color(hex: &str) -> Option<Color> {
     let hex = hex.trim_start_matches('#');
-    if hex.len() == 6 {
-        let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-        let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-        let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-        Some(Color::rgb(r, g, b))
+    let b = hex.as_bytes();
+    if b.len() == 6 && b.iter().all(|c| c.is_ascii_hexdigit()) {
+        let r = u8::from_str_radix(std::str::from_utf8(&b[0..2]).ok()?, 16).ok()?;
+        let g = u8::from_str_radix(std::str::from_utf8(&b[2..4]).ok()?, 16).ok()?;
+        let blue = u8::from_str_radix(std::str::from_utf8(&b[4..6]).ok()?, 16).ok()?;
+        Some(Color::rgb(r, g, blue))
     } else {
         None
     }

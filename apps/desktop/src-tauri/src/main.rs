@@ -66,6 +66,7 @@ fn main() {
             commands::export_pdf,
             commands::compute_morph,
             commands::undo,
+            commands::redo,
             commands::get_loss_ledger,
             commands::start_presenter,
             commands::get_presenter_state,

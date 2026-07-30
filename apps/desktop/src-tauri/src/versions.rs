@@ -303,7 +303,7 @@ fn sort_index(index: &mut VersionIndex) {
 }
 
 /// Writes bytes to a path via a temp file + atomic rename.
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let dir = path
         .parent()
         .ok_or_else(|| "snapshot path has no parent".to_string())?;
