@@ -3954,7 +3954,7 @@ fn run_from_dto(run: &RunDto) -> slides_core::Run {
         link: run
             .link
             .as_ref()
-            .map(|link| slides_core::Link::new_unchecked(link.url.clone())),
+            .and_then(|link| slides_core::Link::new(link.url.clone()).ok()),
         code: run.code,
         font_family: run.font_family.clone(),
         color: None,

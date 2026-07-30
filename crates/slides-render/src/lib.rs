@@ -368,6 +368,33 @@ fn escape_xml(input: &str) -> String {
     out
 }
 
+/// Checks whether a URL is safe to emit as an SVG `href` attribute. Only
+/// `http(s)`, `mailto`, `tel`, and fragment (`#`) links are emitted as
+/// clickable; dangerous schemes (`javascript:`, `data:`, `vbscript:`,
+/// protocol-relative `//`) are neutralized (the `<a>` is emitted without
+/// an href so the link is visually present but not clickable).
+fn is_safe_href(url: &str) -> bool {
+    let trimmed = url.trim();
+    if trimmed.starts_with('#') {
+        return true;
+    }
+    let lowered = trimmed.to_ascii_lowercase();
+    const SAFE_SCHEMES: &[&str] = &["https:", "http:", "mailto:", "tel:"];
+    if SAFE_SCHEMES.iter().any(|s| lowered.starts_with(s)) {
+        return true;
+    }
+    if trimmed.starts_with("//") {
+        return false;
+    }
+    if let Some(colon) = lowered.find(':') {
+        let before = &lowered[..colon];
+        if !before.contains('/') {
+            return false;
+        }
+    }
+    true
+}
+
 /// Pushes a drop-shadow `<filter>` definition with the given stable id.
 fn push_shadow_filter(id: usize, shadow: &Shadow, out: &mut String) {
     let sid = format!("sh{id}");
@@ -671,7 +698,11 @@ fn push_list_marker(paragraph: &Paragraph, index: usize, out: &mut String) {
 fn push_run(run: &Run, out: &mut String) {
     if let Some(link) = &run.link {
         let href = escape_xml(&link.url);
-        out.push_str(&format!("<a href=\"{href}\">"));
+        if is_safe_href(&link.url) {
+            out.push_str(&format!("<a href=\"{href}\">"));
+        } else {
+            out.push_str("<a>");
+        }
     }
 
     out.push_str("<tspan");
@@ -1863,6 +1894,47 @@ mod tests {
         let out = render(&slide);
         assert!(out.svg.contains("href=\"mailto:a@b.com?subject=1&amp;2\""));
         assert!(!out.svg.contains("subject=1&2\""));
+    }
+
+    #[test]
+    fn javascript_link_is_neutralized() {
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::TextBox(TextBox {
+            id: String::new(),
+            frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
+            paragraphs: vec![Paragraph {
+                runs: vec![Run {
+                    text: "x".to_string(),
+                    link: Some(slides_core::Link::new_unchecked("javascript:alert(1)")),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }));
+        let out = render(&slide);
+        assert!(
+            !out.svg.contains("javascript:"),
+            "javascript: scheme must not appear in href"
+        );
+        assert!(
+            !out.svg.contains("href="),
+            "dangerous link must emit <a> without href"
+        );
+    }
+
+    #[test]
+    fn https_link_is_clickable() {
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::TextBox(TextBox {
+            id: String::new(),
+            frame: rect(0.0, 0.0, 1_000_000.0, 500_000.0),
+            paragraphs: vec![Paragraph {
+                runs: vec![Run::new("link").link("https://example.com").unwrap()],
+                ..Default::default()
+            }],
+        }));
+        let out = render(&slide);
+        assert!(out.svg.contains("href=\"https://example.com\""));
     }
 
     #[test]

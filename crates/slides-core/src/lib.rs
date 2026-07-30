@@ -1544,12 +1544,13 @@ impl Link {
     /// Validates `url` against the link allowlist and constructs a Link.
     ///
     /// Rejects:
-    /// - `javascript:`, `vbscript:`, `mocha:`, `livescript:`, `http:`,
-    ///   `https:`, `file:`, and `data:` schemes (case-insensitive prefix),
+    /// - `javascript:`, `vbscript:`, `mocha:`, `livescript:`, `file:`,
+    ///   and `data:` schemes (case-insensitive prefix),
     /// - any value with a colon before the first slash (i.e. an unknown scheme),
     /// - any control character (U+0000..=U+001F or U+007F).
     ///
-    /// Allowed: `mailto:`, `tel:`, `#fragment`, and schemeless relative paths.
+    /// Allowed: `http`, `https`, `mailto:`, `tel:`, `#fragment`, and
+    /// schemeless relative paths.
     pub fn new(url: impl Into<String>) -> std::result::Result<Self, LinkError> {
         let url = url.into();
         if url.chars().any(|c| {
@@ -1570,8 +1571,6 @@ impl Link {
             "vbscript:",
             "mocha:",
             "livescript:",
-            "http:",
-            "https:",
             "file:",
             "data:",
         ];
@@ -1581,7 +1580,7 @@ impl Link {
             ));
         }
 
-        const ALLOWED_SCHEMES: &[&str] = &["mailto:", "tel:"];
+        const ALLOWED_SCHEMES: &[&str] = &["https:", "http:", "mailto:", "tel:"];
         if ALLOWED_SCHEMES.iter().any(|s| lowered.starts_with(s)) {
             return Ok(Self { url, display: None });
         }
@@ -6362,15 +6361,9 @@ mod tests {
         assert!(Link::new("#fragment").is_ok());
         assert!(Link::new("relative.html").is_ok());
         assert!(Link::new("./x").is_ok());
+        assert!(Link::new("http://example.com").is_ok());
+        assert!(Link::new("https://example.com").is_ok());
 
-        assert_eq!(
-            Link::new("http://example.com"),
-            Err(LinkError::DisallowedScheme("http".to_string()))
-        );
-        assert_eq!(
-            Link::new("https://example.com"),
-            Err(LinkError::DisallowedScheme("https".to_string()))
-        );
         assert_eq!(
             Link::new("javascript:alert(1)"),
             Err(LinkError::DisallowedScheme("javascript".to_string()))

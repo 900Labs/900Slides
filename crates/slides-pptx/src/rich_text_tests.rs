@@ -247,13 +247,13 @@ fn load_records_hyperlink_allowlist_warning() {
     let original = build_rich_text_pptx();
     let session = load(&original).expect("load should succeed");
 
-    assert!(session
+    // https://example.com is now an allowed scheme (http/https are safe for
+    // presentation links), so no warning should be generated for it.
+    assert!(!session
         .loss_ledger()
         .warnings()
         .iter()
-        .any(|w| w.slide_id == "ppt/slides/slide1.xml"
-            && w.message.contains("https://example.com")
-            && w.message.contains("allowlist")));
+        .any(|w| w.message.contains("https://example.com")));
 }
 
 #[test]
