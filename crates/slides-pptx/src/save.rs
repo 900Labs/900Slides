@@ -738,6 +738,10 @@ fn filter_for_effect(effect: BuildEffect) -> &'static str {
         BuildEffect::SlideInBottom => "wipe(down)",
         BuildEffect::Appear => "appear",
         BuildEffect::Disappear => "disappear",
+        // The PPTX writer has no animEffect for motion paths yet; fall back to
+        // fade so the timing XML stays well-formed. Motion-path export is out
+        // of scope for the Wave 19 model component.
+        BuildEffect::MotionPath => "fade",
     }
 }
 

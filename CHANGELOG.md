@@ -26,6 +26,27 @@ This section tracks work toward v0.2.0 (editor completeness). See
 
 ## [v0.4.0 — in progress]
 
+### Added — Wave 19 (animation enhancements)
+
+- **Trigger model**: build steps now fire on click, with the previous step,
+  or after the previous step completes (`OnClick`, `WithPrevious`,
+  `AfterPrevious`). The animation crate's timeline computes click groups
+  and offsets accordingly.
+- **Delays**: each step has a `delay_ms` that offsets its start time after
+  the trigger fires.
+- **Motion paths**: a new `MotionPath` build effect with editable waypoints
+  (EMU coordinates). The timeline interpolates linearly between waypoints.
+  A visual motion-path editor in the desktop UI lets users draw paths.
+- **Per-slide reduce-motion override**: slides can force all build-ins to
+  render instantly, overriding the system preference for accessibility
+  audits.
+- **Animation Pane**: a dedicated desktop panel showing all build steps
+  with trigger dropdown, duration/delay sliders, drag-to-reorder, and
+  reduce-motion toggle per slide.
+- Four reversible commands: `SetBuildStepTrigger`, `SetBuildStepDelay`,
+  `SetBuildStepMotionPath`, `SetSlideReduceMotion`.
+- `docs/sprint-records/wave-19.md` documenting the wave scope.
+
 ### Added — Wave 18 (accessibility checker + WCAG 2.2 AA)
 
 - An **accessibility checker** audits decks for common issues: missing alt

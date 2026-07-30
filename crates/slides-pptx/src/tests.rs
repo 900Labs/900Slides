@@ -349,6 +349,7 @@ fn deck_round_trip_serialization() {
         transition: None,
         rich_notes: None,
         layout_ref: None,
+        reduce_motion: None,
     });
 
     let json = serde_json::to_string(&deck).expect("serialize");
@@ -1445,6 +1446,7 @@ fn save_no_edit_keeps_byte_identical() {
         transition: Some(Transition::new(TransitionKind::Fade, 500)),
         rich_notes: None,
         layout_ref: None,
+        reduce_motion: None,
     };
     let session = session_from_slide_xml(&slide_xml, slide);
     let saved = save(&session).expect("save should succeed");
@@ -1479,6 +1481,7 @@ fn save_edits_transition_preserves_other_parts() {
         transition: Some(Transition::new(TransitionKind::Push, 750)),
         rich_notes: None,
         layout_ref: None,
+        reduce_motion: None,
     };
     let mut session = session_from_slide_xml(&slide_xml, slide);
     session.mark_slide_dirty("ppt/slides/slide1.xml");
@@ -1537,6 +1540,7 @@ fn save_edits_animation_patches_timing() {
         transition: None,
         rich_notes: None,
         layout_ref: None,
+        reduce_motion: None,
     };
     let mut session = session_from_slide_xml(&slide_xml, slide);
     session.mark_slide_dirty("ppt/slides/slide1.xml");
@@ -1571,6 +1575,7 @@ fn clear_transition_then_save() {
         transition: None,
         rich_notes: None,
         layout_ref: None,
+        reduce_motion: None,
     };
     let mut session = session_from_slide_xml(&slide_xml, slide);
     session.mark_slide_dirty("ppt/slides/slide1.xml");
@@ -1599,6 +1604,7 @@ fn save_morph_transition_round_trips() {
         transition: Some(Transition::new(TransitionKind::Morph, 800)),
         rich_notes: None,
         layout_ref: None,
+        reduce_motion: None,
     };
     let mut session = session_from_slide_xml(&slide_xml, slide);
     session.mark_slide_dirty("ppt/slides/slide1.xml");
@@ -1631,6 +1637,7 @@ fn save_morph_preserves_other_parts() {
         transition: Some(Transition::new(TransitionKind::Morph, 750)),
         rich_notes: None,
         layout_ref: None,
+        reduce_motion: None,
     };
     let mut session = session_from_slide_xml(&slide_xml, slide);
     session.mark_slide_dirty("ppt/slides/slide1.xml");
