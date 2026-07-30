@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use slides_core::{Animation, BuildEffect, BuildStep, Rect, Shape, Slide, Transform};
+use slides_core::{Animation, BuildEffect, BuildStep, Rect, Shape, Slide, Transform, Trigger};
 
 /// Returns the crate version.
 pub fn version() -> &'static str {
@@ -22,43 +22,219 @@ pub fn version() -> &'static str {
 }
 
 /// A single keyframe moment in a build sequence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `start_ms`/`end_ms` are expressed relative to the start of the step's
+/// [`click_group`](Self::click_group) (i.e. relative to the presenter click
+/// that triggers that group), so a [`Trigger::WithPrevious`] or
+/// [`Trigger::AfterPrevious`] step can carry a non-zero `start_ms` while still
+/// sharing the previous step's click group.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BuildFrame {
     /// Index of the [`Animation::steps`] entry this frame was derived from.
     pub step_index: usize,
     /// Index into `slide.shapes` of the shape this frame animates.
     pub shape_index: usize,
-    /// Start of the effect, in milliseconds, relative to the step's own click.
+    /// Which presenter click triggers this step: `0` for the first click
+    /// group, `1` for the second, and so on. [`Trigger::WithPrevious`] and
+    /// [`Trigger::AfterPrevious`] steps inherit the previous step's group.
+    pub click_group: usize,
+    /// Start of the effect, in milliseconds, relative to the group's click.
     pub start_ms: u32,
-    /// End of the effect, in milliseconds, relative to the step's own click.
+    /// End of the effect, in milliseconds, relative to the group's click.
     pub end_ms: u32,
+    /// Delay (in ms) this step introduces after its trigger reference point
+    /// (the click for [`Trigger::OnClick`], the previous start for
+    /// [`Trigger::WithPrevious`], the previous end for
+    /// [`Trigger::AfterPrevious`]). Stored separately from `start_ms` so the
+    /// renderer can report per-step delay.
+    pub offset_ms: u32,
     /// The reveal or hide effect applied to the shape.
     pub effect: slides_core::BuildEffect,
+    /// For a [`BuildEffect::MotionPath`] segment, the `(from, to)` waypoint
+    /// pair this frame linearly interpolates between (in EMU). `None` for
+    /// non-motion frames.
+    pub motion_path: Option<(Rect, Rect)>,
 }
 
-/// Computes the deterministic frame sequence for a slide's build animation.
+/// Computes the deterministic, trigger-aware frame sequence for a slide's
+/// build animation.
 ///
-/// Steps are emitted in their declared order, one frame per step. Each frame's
-/// `start_ms` is `0` and its `end_ms` is the step's `duration_ms` (each step
-/// fires on its own presenter click, so times are local to the step). Same
-/// input always yields identical output: no `HashMap` iteration is involved.
+/// Walks `animation.steps` in declared order, honoring each step's `trigger`:
+/// - [`Trigger::OnClick`] begins a new click group; the step starts at
+///   `delay_ms` within that group.
+/// - [`Trigger::WithPrevious`] joins the previous step's click group and starts
+///   at `previous.start_ms + delay_ms`.
+/// - [`Trigger::AfterPrevious`] joins the previous step's click group and
+///   starts at `previous.end_ms + delay_ms`.
+///
+/// The very first step always behaves as [`Trigger::OnClick`] (there is no
+/// previous step to fire with or after), so old decks — which carry no
+/// `trigger` field and deserialize every step as `OnClick` with no delay —
+/// produce the same one-frame-per-step, start-at-zero timeline as before.
+///
+/// A [`BuildEffect::MotionPath`] step carrying at least two waypoints expands
+/// into one [`BuildFrame`] per segment (linear interpolation between
+/// consecutive waypoint pairs), the step's duration split evenly across
+/// segments. Every other step emits a single frame.
+///
+/// Deterministic: no `HashMap`, no sorting, no randomness — identical inputs
+/// always yield byte-identical output.
 pub fn build_timeline(animation: &Animation) -> Vec<BuildFrame> {
-    animation
-        .steps
-        .iter()
-        .enumerate()
-        .map(|(step_index, step)| build_frame(step_index, step))
-        .collect()
+    let mut frames = Vec::new();
+    let mut prev_group: usize = 0;
+    let mut prev_start: u32 = 0;
+    let mut prev_end: u32 = 0;
+
+    for (step_index, step) in animation.steps.iter().enumerate() {
+        let (click_group, start_ms) =
+            step_start(step_index, step, prev_group, prev_start, prev_end);
+        let end_ms = start_ms.saturating_add(step.duration_ms);
+
+        push_step_frames(&mut frames, step_index, step, click_group, start_ms, end_ms);
+
+        prev_group = click_group;
+        prev_start = start_ms;
+        prev_end = end_ms;
+    }
+
+    frames
 }
 
-/// Builds a single [`BuildFrame`] from an indexed build step.
-fn build_frame(step_index: usize, step: &BuildStep) -> BuildFrame {
-    BuildFrame {
+/// Computes an instant (reduce-motion) frame sequence.
+///
+/// Used when the per-slide `reduce_motion` override (or a system-level
+/// reduce-motion preference) is active: every step resolves to a
+/// zero-duration, zero-offset frame so the presenter reveals shapes
+/// immediately with no animation. Click grouping still honors `trigger`
+/// (a [`Trigger::WithPrevious`]/[`Trigger::AfterPrevious`] step stays in the
+/// previous step's group), but all timing collapses to zero. Motion-path steps
+/// emit a single instant frame rather than per-segment interpolation.
+pub fn build_timeline_reduced(animation: &Animation) -> Vec<BuildFrame> {
+    let mut frames = Vec::with_capacity(animation.steps.len());
+    let mut prev_group: usize = 0;
+    for (step_index, step) in animation.steps.iter().enumerate() {
+        let click_group = if step_index == 0 {
+            0
+        } else {
+            match step.trigger {
+                Trigger::OnClick => prev_group + 1,
+                _ => prev_group,
+            }
+        };
+        frames.push(BuildFrame {
+            step_index,
+            shape_index: step.shape_index,
+            click_group,
+            start_ms: 0,
+            end_ms: 0,
+            offset_ms: 0,
+            effect: step.effect,
+            motion_path: None,
+        });
+        prev_group = click_group;
+    }
+    frames
+}
+
+/// Resolves the click group and start time (ms, relative to the group's click)
+/// for `step`, given the previously emitted step's group/timing.
+fn step_start(
+    step_index: usize,
+    step: &BuildStep,
+    prev_group: usize,
+    prev_start: u32,
+    prev_end: u32,
+) -> (usize, u32) {
+    // The first step always fires on the opening click: there is no previous
+    // step to chain off, so WithPrevious/AfterPrevious degrade to OnClick.
+    if step_index == 0 {
+        return (0, step.delay_ms);
+    }
+    match step.trigger {
+        Trigger::OnClick => (prev_group + 1, step.delay_ms),
+        Trigger::WithPrevious => (prev_group, prev_start.saturating_add(step.delay_ms)),
+        Trigger::AfterPrevious => (prev_group, prev_end.saturating_add(step.delay_ms)),
+    }
+}
+
+/// Emits the [`BuildFrame`]s for a single step — one per motion-path segment
+/// when applicable, otherwise a single frame — into `frames`.
+fn push_step_frames(
+    frames: &mut Vec<BuildFrame>,
+    step_index: usize,
+    step: &BuildStep,
+    click_group: usize,
+    start_ms: u32,
+    end_ms: u32,
+) {
+    if step.effect == BuildEffect::MotionPath {
+        if let Some(waypoints) = step.motion_path.as_ref().filter(|w| w.len() >= 2) {
+            push_motion_segments(
+                frames,
+                step_index,
+                step,
+                click_group,
+                start_ms,
+                end_ms,
+                waypoints,
+            );
+            return;
+        }
+    }
+
+    frames.push(BuildFrame {
         step_index,
         shape_index: step.shape_index,
-        start_ms: 0,
-        end_ms: step.duration_ms,
+        click_group,
+        start_ms,
+        end_ms,
+        offset_ms: step.delay_ms,
         effect: step.effect,
+        motion_path: None,
+    });
+}
+
+/// Splits a [`BuildEffect::MotionPath`] step into one [`BuildFrame`] per
+/// segment, linearly interpolating between consecutive `waypoints` and
+/// dividing the step's duration evenly across segments (any remainder from the
+/// integer split is folded into the final segment so the full duration is
+/// preserved).
+fn push_motion_segments(
+    frames: &mut Vec<BuildFrame>,
+    step_index: usize,
+    step: &BuildStep,
+    click_group: usize,
+    start_ms: u32,
+    end_ms: u32,
+    waypoints: &[Rect],
+) {
+    let segments = waypoints.len() - 1;
+    let total = end_ms.saturating_sub(start_ms);
+    let per = total / segments as u32;
+    let last_extra = total - per * segments as u32;
+
+    for i in 0..segments {
+        let seg_start = if i == 0 {
+            start_ms
+        } else {
+            start_ms.saturating_add(per * i as u32)
+        };
+        let mut seg_end = start_ms.saturating_add(per * (i + 1) as u32);
+        if i == segments - 1 {
+            seg_end = seg_end.saturating_add(last_extra);
+        }
+        frames.push(BuildFrame {
+            step_index,
+            shape_index: step.shape_index,
+            click_group,
+            start_ms: seg_start,
+            end_ms: seg_end,
+            // Only the first segment carries the step's delay; subsequent
+            // segments chain off the previous segment with no extra offset.
+            offset_ms: if i == 0 { step.delay_ms } else { 0 },
+            effect: BuildEffect::MotionPath,
+            motion_path: Some((waypoints[i], waypoints[i + 1])),
+        });
     }
 }
 
@@ -107,12 +283,42 @@ pub fn keyframes(effect: BuildEffect) -> &'static str {
             "@keyframes build-disappear { from { opacity: 1; } to { opacity: 0; } }"
         }
         BuildEffect::MotionPath => {
-            // Motion paths are interpolated along their waypoints by the
-            // trigger-aware timeline (Wave 19, component 2); this placeholder
-            // keeps the keyframes registry exhaustive for component 1.
+            // The actual motion-path keyframes are generated per-step by
+            // [`motion_path_keyframes`], which translates along the step's
+            // waypoints. This static placeholder keeps the registry exhaustive
+            // (and is returned when a motion-path step has no waypoints).
             "@keyframes build-motion-path { from { transform: translate(0, 0); } to { transform: translate(0, 0); } }"
         }
     }
+}
+
+/// Generates a deterministic `@keyframes` definition that translates a shape
+/// along `waypoints` (EMU offsets relative to the shape's resting position).
+///
+/// The keyframe name matches the class returned by [`css_class`] for
+/// [`BuildEffect::MotionPath`] (`"build-motion-path"`). Stops are evenly
+/// spaced — `waypoints.len()` stops at `0%`, `100/(n-1)%`, ..., `100%` — each
+/// translating to its waypoint's `(x, y)` offset, so consecutive stops perform
+/// linear interpolation between waypoint pairs. With fewer than two waypoints
+/// a no-op keyframe is returned. Deterministic for a given input.
+pub fn motion_path_keyframes(waypoints: &[Rect]) -> String {
+    const NAME: &str = "build-motion-path";
+    if waypoints.len() < 2 {
+        return format!(
+            "@keyframes {NAME} {{ from {{ transform: translate(0px, 0px); }} to {{ transform: translate(0px, 0px); }} }}"
+        );
+    }
+
+    let segments = waypoints.len() - 1;
+    let mut stops = String::new();
+    for (i, point) in waypoints.iter().enumerate() {
+        let pct = i as f64 / segments as f64 * 100.0;
+        stops.push_str(&format!(
+            "{pct:.2}% {{ transform: translate({}px, {}px); }} ",
+            point.x, point.y
+        ));
+    }
+    format!("@keyframes {NAME} {{ {stops}}}")
 }
 
 /// The CSS class name for an individual build step, e.g. `"build-0"` for
@@ -243,7 +449,7 @@ mod tests {
     use super::*;
     use slides_core::{
         Animation, BuildEffect, BuildStep, GeometricShape, Geometry, PassthroughObject, Rect,
-        Shape, Style, TextBox, Transform,
+        Shape, Style, TextBox, Transform, Trigger,
     };
 
     /// Builds a slide carrying `shapes`, with all other fields defaulted.
@@ -296,6 +502,184 @@ mod tests {
         let animation = Animation::new(vec![]);
         let timeline = build_timeline(&animation);
         assert!(timeline.is_empty());
+    }
+
+    #[test]
+    fn build_timeline_on_click_separate_groups() {
+        let animation = Animation::new(vec![
+            BuildStep::new(0, BuildEffect::Fade, 200),
+            BuildStep::new(1, BuildEffect::Appear, 300),
+            BuildStep::new(2, BuildEffect::SlideInLeft, 400),
+        ]);
+        let timeline = build_timeline(&animation);
+
+        assert_eq!(timeline.len(), 3);
+        let groups: Vec<usize> = timeline.iter().map(|f| f.click_group).collect();
+        assert_eq!(
+            groups,
+            vec![0, 1, 2],
+            "each OnClick step is its own click group"
+        );
+        // No delays -> every step starts at the moment of its click.
+        for frame in &timeline {
+            assert_eq!(frame.start_ms, 0);
+        }
+    }
+
+    #[test]
+    fn build_timeline_with_previous_same_group() {
+        let first = BuildStep::new(0, BuildEffect::Fade, 200);
+        let mut second = BuildStep::new(1, BuildEffect::Appear, 200);
+        second.trigger = Trigger::WithPrevious;
+        let animation = Animation::new(vec![first, second]);
+        let timeline = build_timeline(&animation);
+
+        assert_eq!(timeline.len(), 2);
+        assert_eq!(timeline[0].click_group, 0);
+        assert_eq!(
+            timeline[1].click_group, 0,
+            "WithPrevious joins the previous step's group"
+        );
+        // Fires simultaneously with the previous step (both delay 0).
+        assert_eq!(timeline[1].start_ms, timeline[0].start_ms);
+    }
+
+    #[test]
+    fn build_timeline_after_previous_chains() {
+        let first = BuildStep::new(0, BuildEffect::Fade, 200);
+        let mut second = BuildStep::new(1, BuildEffect::Appear, 150);
+        second.trigger = Trigger::AfterPrevious;
+        let animation = Animation::new(vec![first, second]);
+        let timeline = build_timeline(&animation);
+
+        assert_eq!(timeline[0].click_group, 0);
+        assert_eq!(
+            timeline[1].click_group, 0,
+            "AfterPrevious stays in the previous step's group"
+        );
+        assert_eq!(
+            timeline[1].start_ms, timeline[0].end_ms,
+            "starts when the previous step completes"
+        );
+        assert_eq!(timeline[1].start_ms, 200);
+        assert_eq!(timeline[1].end_ms, 350);
+    }
+
+    #[test]
+    fn build_timeline_delay_offsets_start() {
+        let mut step = BuildStep::new(0, BuildEffect::Fade, 200);
+        step.delay_ms = 100;
+        let animation = Animation::new(vec![step]);
+        let timeline = build_timeline(&animation);
+
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline[0].start_ms, 100, "delay shifts the start");
+        assert_eq!(timeline[0].offset_ms, 100);
+        assert_eq!(timeline[0].end_ms, 300);
+    }
+
+    #[test]
+    fn build_timeline_motion_path_generates_segments() {
+        let mut step = BuildStep::new(0, BuildEffect::MotionPath, 1000);
+        step.motion_path = Some(vec![
+            Rect::new(0.0, 0.0, 10.0, 10.0),
+            Rect::new(100.0, 0.0, 10.0, 10.0),
+            Rect::new(100.0, 100.0, 10.0, 10.0),
+        ]);
+        let animation = Animation::new(vec![step]);
+        let timeline = build_timeline(&animation);
+
+        // 3 waypoints -> 2 interpolation segments.
+        assert_eq!(timeline.len(), 2);
+        // Duration split evenly: 1000ms / 2 segments = 500ms each.
+        assert_eq!(timeline[0].start_ms, 0);
+        assert_eq!(timeline[0].end_ms, 500);
+        assert_eq!(timeline[1].start_ms, 500);
+        assert_eq!(timeline[1].end_ms, 1000);
+        // Each segment carries its waypoint pair for linear interpolation.
+        assert_eq!(
+            timeline[0].motion_path,
+            Some((
+                Rect::new(0.0, 0.0, 10.0, 10.0),
+                Rect::new(100.0, 0.0, 10.0, 10.0)
+            ))
+        );
+        assert_eq!(
+            timeline[1].motion_path,
+            Some((
+                Rect::new(100.0, 0.0, 10.0, 10.0),
+                Rect::new(100.0, 100.0, 10.0, 10.0)
+            ))
+        );
+        for frame in &timeline {
+            assert_eq!(frame.effect, BuildEffect::MotionPath);
+            assert_eq!(frame.click_group, 0);
+        }
+    }
+
+    #[test]
+    fn build_timeline_motion_path_without_waypoints_falls_back() {
+        // A MotionPath step with no waypoints degrades to a single frame.
+        let step = BuildStep::new(0, BuildEffect::MotionPath, 500);
+        let timeline = build_timeline(&Animation::new(vec![step]));
+        assert_eq!(timeline.len(), 1);
+        assert!(timeline[0].motion_path.is_none());
+        assert_eq!(timeline[0].start_ms, 0);
+        assert_eq!(timeline[0].end_ms, 500);
+    }
+
+    #[test]
+    fn build_timeline_reduced_returns_instant() {
+        let first = BuildStep::new(0, BuildEffect::Fade, 200);
+        let mut second = BuildStep::new(1, BuildEffect::MotionPath, 300);
+        second.trigger = Trigger::AfterPrevious;
+        second.motion_path = Some(vec![
+            Rect::new(0.0, 0.0, 1.0, 1.0),
+            Rect::new(10.0, 10.0, 1.0, 1.0),
+        ]);
+        let animation = Animation::new(vec![first, second]);
+        let timeline = build_timeline_reduced(&animation);
+
+        assert_eq!(timeline.len(), 2);
+        for frame in &timeline {
+            assert_eq!(frame.start_ms, 0, "reduce-motion: instant start");
+            assert_eq!(frame.end_ms, 0, "reduce-motion: zero duration");
+            assert_eq!(frame.offset_ms, 0);
+            assert!(frame.motion_path.is_none(), "no motion-path interpolation");
+        }
+        // Grouping still reflects triggers (second stays in first's group).
+        assert_eq!(timeline[0].click_group, 0);
+        assert_eq!(timeline[1].click_group, 0);
+    }
+
+    #[test]
+    fn motion_path_keyframes_emits_waypoint_stops() {
+        let waypoints = vec![
+            Rect::new(0.0, 0.0, 10.0, 10.0),
+            Rect::new(100.0, 0.0, 10.0, 10.0),
+            Rect::new(100.0, 100.0, 10.0, 10.0),
+        ];
+        let css = motion_path_keyframes(&waypoints);
+
+        assert!(
+            css.contains("@keyframes build-motion-path"),
+            "named keyframes"
+        );
+        assert!(css.contains("0.00%"), "starts at 0%");
+        assert!(css.contains("50.00%"), "midway stop");
+        assert!(css.contains("100.00%"), "ends at 100%");
+        assert!(
+            css.contains("translate(0px, 0px)"),
+            "translates from the origin"
+        );
+        assert!(css.contains("translate(100px"), "translates to a waypoint");
+    }
+
+    #[test]
+    fn motion_path_keyframes_single_point_is_noop() {
+        let css = motion_path_keyframes(&[Rect::new(5.0, 5.0, 1.0, 1.0)]);
+        assert!(css.contains("@keyframes build-motion-path"));
+        assert!(css.contains("translate(0px, 0px)"));
     }
 
     #[test]
