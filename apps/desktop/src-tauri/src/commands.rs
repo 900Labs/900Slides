@@ -3158,7 +3158,10 @@ fn write_recovery_snapshot(dir: &Path, deck_id: &str, bytes: &[u8]) -> Result<()
         .map_err(|e| e.to_string())?
         .as_millis() as u64;
     let path = dir.join(format!("{deck_id}_{timestamp}.pptx"));
-    fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    // Write atomically (temp file + fsync + rename) so a crash or power loss
+    // during the write cannot truncate the snapshot. Only delete older
+    // snapshots after the rename succeeds.
+    crate::versions::atomic_write(&path, bytes)?;
     for entry in fs::read_dir(dir).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         let other = entry.path();
