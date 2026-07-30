@@ -3806,21 +3806,21 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slides-animation"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "slides-core",
 ]
 
 [[package]]
 name = "slides-chart"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "slides-core",
 ]
 
 [[package]]
 name = "slides-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3830,7 +3830,7 @@ dependencies = [
 
 [[package]]
 name = "slides-desktop"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "dirs 5.0.1",
@@ -3852,7 +3852,7 @@ dependencies = [
 
 [[package]]
 name = "slides-media"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "image",
  "quick-xml 0.36.2",
@@ -3861,7 +3861,7 @@ dependencies = [
 
 [[package]]
 name = "slides-pdf"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "image",
  "printpdf",
@@ -3874,7 +3874,7 @@ dependencies = [
 
 [[package]]
 name = "slides-pptx"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "quick-xml 0.36.2",
  "serde",
@@ -3888,7 +3888,7 @@ dependencies = [
 
 [[package]]
 name = "slides-render"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "slides-animation",
@@ -3899,7 +3899,7 @@ dependencies = [
 
 [[package]]
 name = "slides-spell"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "slotmap"

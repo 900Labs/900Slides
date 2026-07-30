@@ -24,7 +24,7 @@ This section tracks work toward v0.2.0 (editor completeness). See
 [`docs/sprint-records/wave-13.md`](docs/sprint-records/wave-13.md), and
 [`docs/sprint-records/wave-14.md`](docs/sprint-records/wave-14.md).
 
-## [v0.4.0 — in progress]
+## [0.4.0] — 2026-07-30
 
 ### Added — Wave 20 (custom layouts + rehearse timings)
 
