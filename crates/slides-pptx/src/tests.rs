@@ -712,6 +712,29 @@ fn pic_xml(id: i64, name: &str, embed: &str) -> String {
     )
 }
 
+/// Like [`pic_xml`] but emits a `<p:cNvPr descr="...">` accessibility attribute.
+fn pic_xml_with_descr(id: i64, name: &str, embed: &str, descr: &str) -> String {
+    format!(
+        r#"<p:pic>
+  <p:nvPicPr>
+    <p:cNvPr id="{id}" name="{name}" descr="{descr}"/>
+    <p:cNvPicPr><a:picLocks noChangeAspect="1"/></p:cNvPicPr>
+    <p:nvPr/>
+  </p:nvPicPr>
+  <p:blipFill>
+    <a:blip r:embed="{embed}"/>
+  </p:blipFill>
+  <p:spPr>
+    <a:xfrm>
+      <a:off x="1000000" y="500000"/>
+      <a:ext cx="2000000" cy="1500000"/>
+    </a:xfrm>
+    <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+  </p:spPr>
+</p:pic>"#
+    )
+}
+
 fn slide_wrapper(body: &str) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -887,6 +910,38 @@ fn load_extracts_image_shape() {
     assert_eq!(entry.width, 4);
     assert_eq!(entry.height, 4);
     assert!(entry.bytes.starts_with(&[0x89, 0x50, 0x4e, 0x47]));
+}
+
+#[test]
+fn load_reads_image_alt_text_from_descr() {
+    let png = real_png(4, 4);
+    let body = pic_xml_with_descr(3, "Picture 1", "rId3", "A diagram of the pipeline");
+    let original = build_pptx(
+        &slide_wrapper(&body),
+        Some(&image_slide_rels_xml()),
+        &[("ppt/media/image1.png", png.as_slice())],
+    );
+    let session = load(&original).expect("load should succeed");
+    let img = match &session.deck().slides[0].shapes[0] {
+        Shape::Image(i) => i,
+        _ => panic!("expected an image shape"),
+    };
+    assert_eq!(
+        img.alt_text.as_deref(),
+        Some("A diagram of the pipeline"),
+        "loader must carry <p:cNvPr descr> into alt_text"
+    );
+}
+
+#[test]
+fn load_image_without_descr_has_no_alt_text() {
+    let original = build_pptx_with_image();
+    let session = load(&original).expect("load should succeed");
+    let img = match &session.deck().slides[0].shapes[0] {
+        Shape::Image(i) => i,
+        _ => panic!("expected an image shape"),
+    };
+    assert!(img.alt_text.is_none(), "no descr means no alt text");
 }
 
 #[test]

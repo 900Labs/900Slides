@@ -512,6 +512,40 @@ export interface MisspellingDto {
   byteEnd: number
 }
 
+/** Severity of an accessibility issue (mirrors slides-core IssueSeverity). */
+export type IssueSeverityDto = 'error' | 'warning' | 'suggestion'
+
+/** Category of an accessibility issue (mirrors slides-core IssueCategory). */
+export type IssueCategoryDto =
+  | 'missing_alt_text'
+  | 'low_contrast'
+  | 'missing_title'
+  | 'reading_order'
+  | 'small_text'
+  | 'empty_slide'
+
+/** One accessibility issue found by the WCAG 2.2 AA checker. */
+export interface AccessibilityIssueDto {
+  severity: IssueSeverityDto
+  category: IssueCategoryDto
+  /** Id of the slide the issue was found on, when applicable. */
+  slideId?: string
+  /** Index of the offending shape within the slide, when applicable. */
+  shapeIndex?: number
+  message: string
+  /** Optional suggested remediation. */
+  fixHint?: string
+}
+
+/** Result of checking a deck for accessibility, with a WCAG 2.2 AA score. */
+export interface AccessibilityReportDto {
+  issues: AccessibilityIssueDto[]
+  /** WCAG 2.2 AA conformance score (0–100). 100 = no issues. */
+  score: number
+  totalSlides: number
+  slidesWithIssues: number
+}
+
 /** Interpolatable transform state for a morph (mirrors slides-animation MorphTransform). */
 export interface MorphTransformDto {
   x: number

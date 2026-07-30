@@ -83,6 +83,9 @@
     slideSize?: SlideSizeDto
     /** Whether the deck is rendered in high-contrast mode. */
     highContrast?: boolean
+    /** Index of a shape to highlight as selected (e.g. from the accessibility
+     *  panel). `null` (or omitted) draws no selection ring. */
+    selectedShapeIndex?: number | null
   }
 
   let {
@@ -101,6 +104,7 @@
     codeActiveStep = 0,
     slideSize,
     highContrast = false,
+    selectedShapeIndex = null,
   }: Props = $props()
 
   /** Canvas width in pixels, derived from the deck slide size or 16:9 default. */
@@ -1005,6 +1009,7 @@
       <div
         class="text-box-container"
         class:build-shape={buildStateFor(shapeIndex) !== undefined}
+        class:selected={shapeIndex === selectedShapeIndex}
         data-shape-id={textBox.id}
         style:left={toPx(textBox.frame.x)}
         style:top={toPx(textBox.frame.y)}
@@ -1056,6 +1061,7 @@
       <div
         class="passthrough"
         class:build-shape={buildStateFor(shapeIndex) !== undefined}
+        class:selected={shapeIndex === selectedShapeIndex}
         data-shape-id={obj.id}
         oncontextmenu={(event) => handleShapeContextMenu(event, obj.id, shapeIndex)}
         style:left={obj.frame ? toPx(obj.frame.x) : undefined}
@@ -1079,6 +1085,7 @@
       <div
         class="image-container"
         class:build-shape={buildStateFor(shapeIndex) !== undefined}
+        class:selected={shapeIndex === selectedShapeIndex}
         data-shape-id={image.id}
         oncontextmenu={(event) => handleShapeContextMenu(event, image.id, shapeIndex)}
         style:left={toPx(frame.x)}
@@ -1109,6 +1116,7 @@
       <div
         class="geometric-container"
         class:build-shape={buildStateFor(shapeIndex) !== undefined}
+        class:selected={shapeIndex === selectedShapeIndex}
         data-shape-id={geometric.id}
         oncontextmenu={(event) => handleShapeContextMenu(event, geometric.id, shapeIndex)}
         style:left={toPx(frame.x)}
@@ -1132,6 +1140,7 @@
       <div
         class="table-container"
         class:build-shape={buildStateFor(shapeIndex) !== undefined}
+        class:selected={shapeIndex === selectedShapeIndex}
         data-shape-id={table.id}
         oncontextmenu={(event) => handleShapeContextMenu(event, table.id, shapeIndex)}
         style:left={toPx(tframe.x)}
@@ -1189,6 +1198,7 @@
         class="chart-container"
         class:chart-readonly={readonly}
         class:build-shape={buildStateFor(shapeIndex) !== undefined}
+        class:selected={shapeIndex === selectedShapeIndex}
         data-shape-id={chart.id}
         oncontextmenu={(event) => handleShapeContextMenu(event, chart.id, shapeIndex)}
         style:left={toPx(frame.x)}
@@ -1301,6 +1311,11 @@
   }
   .text-box-container {
     position: absolute;
+  }
+  .selected {
+    outline: 3px solid #0070c0;
+    outline-offset: 2px;
+    z-index: 5;
   }
   .text-box-editor {
     position: relative;

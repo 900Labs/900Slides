@@ -26,6 +26,22 @@ This section tracks work toward v0.2.0 (editor completeness). See
 
 ## [v0.4.0 — in progress]
 
+### Added — Wave 18 (accessibility checker + WCAG 2.2 AA)
+
+- An **accessibility checker** audits decks for common issues: missing alt
+  text, low-contrast text, missing slide titles, reading-order problems,
+  small text, and empty slides. Runs offline against the deck model.
+- **WCAG 2.2 AA conformance score** (0-100): computed from issue count and
+  severity (errors -10, warnings -3, suggestions -1, floored at 0).
+- Contrast ratios computed using the WCAG relative luminance formula with
+  correct sRGB gamma correction. Large-text threshold (3:1) applies to
+  ≥18pt text or ≥14pt bold; normal threshold (4.5:1) otherwise.
+- `ImageShape.alt_text: Option<String>` (additive). The PPTX loader reads
+  the `<p:cNvPr descr>` attribute.
+- Desktop **accessibility panel** with score badge (green/yellow/red),
+  grouped issue list with click-to-navigate, and re-check button.
+- `docs/sprint-records/wave-18.md` documenting the wave scope.
+
 ### Added — Wave 17 (local comments)
 
 - **Local comments**: threaded annotations anchored to slides, specific

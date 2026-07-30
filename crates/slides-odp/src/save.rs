@@ -25,7 +25,7 @@ use slides_core::{
 };
 use thiserror::Error;
 use zip::write::FileOptions;
-use zip::CompressionMethod;
+use zip::{CompressionMethod, DateTime};
 
 /// ODP presentation MIME type, written uncompressed as the first entry.
 const ODP_MIMETYPE: &str = "application/vnd.oasis.opendocument.presentation";
@@ -88,11 +88,18 @@ pub fn save(deck: &Deck) -> Result<Vec<u8>> {
         let mut writer = zip::ZipWriter::new(&mut out);
 
         // 1. `mimetype` — uncompressed, stored, first entry (ODF requirement).
-        let stored = FileOptions::<()>::default().compression_method(CompressionMethod::Stored);
+        //    All entries use a fixed timestamp (1980-01-01) so the archive is
+        //    deterministic across runs and platforms.
+        let zero_time = DateTime::default();
+        let stored = FileOptions::<()>::default()
+            .compression_method(CompressionMethod::Stored)
+            .last_modified_time(zero_time);
         writer.start_file("mimetype", stored)?;
         writer.write_all(ODP_MIMETYPE.as_bytes())?;
 
-        let deflated = FileOptions::<()>::default().compression_method(CompressionMethod::Deflated);
+        let deflated = FileOptions::<()>::default()
+            .compression_method(CompressionMethod::Deflated)
+            .last_modified_time(zero_time);
 
         // 2. `content.xml` — the deck body.
         let content = build_content_xml(deck);

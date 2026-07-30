@@ -1359,6 +1359,7 @@ mod tests {
             },
             media_ref: "present".to_string(),
             crop: None,
+            alt_text: None,
         }));
         slide.shapes.push(Shape::Image(ImageShape {
             id: String::new(),
@@ -1368,6 +1369,7 @@ mod tests {
             },
             media_ref: "absent".to_string(),
             crop: None,
+            alt_text: None,
         }));
 
         let out = render_slide(&slide, &Theme::default(), &media, &RenderOptions::default());
