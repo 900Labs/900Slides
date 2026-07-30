@@ -25,6 +25,7 @@
     HeadingLevelDto,
     ParagraphDto,
     ParagraphStyleDto,
+    PlaceholderDefDto,
     RecoverySnapshot,
     RunDto,
     SlideSectionDto,
@@ -140,6 +141,21 @@
   const deckLayouts = $derived(deck?.layouts ?? [])
   /** Name of the layout the active slide uses, or '' when none. */
   const activeLayoutRef = $derived<string>(activeSlide?.layoutRef ?? '')
+
+  /** Effective placeholder frames for the active slide's layout: the deck
+   *  master's placeholders overridden by the selected layout's overrides
+   *  (matched by name). Empty when no layout is selected, so no guides render. */
+  const activeLayoutPlaceholders = $derived.by<PlaceholderDefDto[]>(() => {
+    const layoutName = activeSlide?.layoutRef
+    if (!layoutName) return []
+    const masterPlaceholders = deck?.master.placeholders ?? []
+    const layout = (deck?.layouts ?? []).find((l) => l.name === layoutName)
+    if (!layout) return masterPlaceholders
+    const byName = new Map<string, PlaceholderDefDto>()
+    for (const p of masterPlaceholders) byName.set(p.name, p)
+    for (const p of layout.placeholders) byName.set(p.name, p)
+    return Array.from(byName.values())
+  })
 
   /** Preset aspect-ratio slide sizes, in EMU, matching the Rust constructors. */
   const ASPECT_PRESETS: Record<'16:9' | '4:3' | '16:10', SlideSizeDto> = {
@@ -1311,6 +1327,7 @@
             slideSize={slideSize}
             highContrast={highContrast}
             selectedShapeIndex={a11ySelectedShapeIndex}
+            placeholderGuides={activeLayoutPlaceholders}
             onEditTextBox={handleTextEdit}
             onSetCellText={handleSetCellText}
             onCellFocus={handleCellFocus}

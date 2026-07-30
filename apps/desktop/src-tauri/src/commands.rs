@@ -428,6 +428,10 @@ pub struct SlideSnapshot {
     /// build-ins instantly. `None` defers to the system preference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reduce_motion: Option<bool>,
+    /// Per-slide rehearsed duration in milliseconds, for auto-advance. `None`
+    /// means no timing has been recorded yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rehearsed_duration_ms: Option<u32>,
 }
 
 /// A named placeholder frame, mirroring [`slides_core::PlaceholderDef`].
@@ -1396,6 +1400,27 @@ pub fn set_slide_layout(
     let mut guard = state.session.lock().map_err(|e| e.to_string())?;
     let session = guard.as_mut().ok_or("no deck is open")?;
     let command = Box::new(slides_core::SetSlideLayout::new(slide_id, layout_name));
+    session.execute(command).map_err(|e| e.to_string())?;
+    let snapshot = state.snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Sets or clears a slide's rehearsed duration (for auto-advance) and returns
+/// the updated deck snapshot. Pass `None` (or omit `duration_ms`) to clear the
+/// timing. The change is applied via the verified
+/// [`slides_core::SetSlideRehearsedDuration`] command so it is undoable.
+#[tauri::command]
+pub fn set_slide_rehearsed_duration(
+    slide_id: String,
+    duration_ms: Option<u32>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    let command = Box::new(slides_core::SetSlideRehearsedDuration::new(slide_id, duration_ms));
     session.execute(command).map_err(|e| e.to_string())?;
     let snapshot = state.snapshot(session.deck());
     drop(guard);
@@ -3255,6 +3280,7 @@ fn slide_to_dto(slide: &slides_core::Slide) -> SlideSnapshot {
             .map(|paragraphs| paragraphs.iter().map(paragraph_to_dto).collect()),
         layout_ref: slide.layout_ref.clone(),
         reduce_motion: slide.reduce_motion,
+        rehearsed_duration_ms: slide.rehearsed_duration_ms,
     }
 }
 

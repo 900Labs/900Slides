@@ -58,6 +58,7 @@ fn main() {
             commands::set_presenter_settings,
             commands::set_template,
             commands::set_slide_layout,
+            commands::set_slide_rehearsed_duration,
             commands::list_templates,
             commands::render_slide_svg,
             commands::export_svg,
