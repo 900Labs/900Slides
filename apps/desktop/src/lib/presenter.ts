@@ -1,4 +1,5 @@
 import type { MorphFrameDto, ProjectorFiltersDto, SlideSnapshot } from './types'
+import { renderedRectRelativeTo } from './slideRect.js'
 
 /**
  * Shared contract for the dual-display presenter.
@@ -99,19 +100,15 @@ export interface SlideRect {
 
 /**
  * Reads the rendered `.canvas` element's box relative to its stage container.
- * Returns `null` until the slide has rendered. The stage must be
- * `position: relative` (or otherwise be the canvas's offset parent).
+ * Returns `null` until the slide has rendered. Bounding rects are used rather
+ * than layout offsets so CSS transforms applied for fit-to-window scaling are
+ * included in the overlay position and dimensions.
  */
 export function slideRectFromStage(stage: HTMLElement | null): SlideRect | null {
   if (!stage) return null
   const canvas = stage.querySelector<HTMLElement>('.canvas')
   if (!canvas) return null
-  return {
-    x: canvas.offsetLeft,
-    y: canvas.offsetTop,
-    w: canvas.offsetWidth,
-    h: canvas.offsetHeight,
-  }
+  return renderedRectRelativeTo(stage.getBoundingClientRect(), canvas.getBoundingClientRect())
 }
 
 /** Clamps a number into `0..1`. */

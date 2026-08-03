@@ -274,8 +274,8 @@
     for (const [slideId, durationMs] of finalTimings) {
       try {
         await invoke('set_slide_rehearsed_duration', {
-          slide_id: slideId,
-          duration_ms: Math.round(durationMs),
+          slideId: slideId,
+          durationMs: Math.round(durationMs),
         })
       } catch {
         // A failed commit for one slide should not abort the rest.
@@ -886,6 +886,7 @@
             media={presenterState.media}
             slideSize={presenterState.slideSize}
             highContrast={presenterState.highContrast}
+            scale={0.25}
             readonly
           />
         {:else}
@@ -1126,10 +1127,6 @@
     padding: 0.75rem;
     overflow-y: auto;
     white-space: pre-wrap;
-  }
-  :global(.hud .canvas) {
-    width: 320px !important;
-    height: 180px !important;
   }
   .stage-content {
     width: 100%;

@@ -1451,13 +1451,15 @@ pub fn save_deck(path: String, state: State<'_, AppState>) -> Result<(), String>
     let mut guard = state.session.lock().map_err(|e| e.to_string())?;
     let session = guard.as_mut().ok_or("no deck is open")?;
     let bytes = slides_pptx::save(session).map_err(|e| e.to_string())?;
-    session.commit_save(bytes.clone());
+    // Do not commit before the selected file is durable. A failed disk write
+    // must leave the session dirty so recovery and a retry still contain edits.
+    fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+    session.commit_save(bytes.clone()).map_err(|e| e.to_string())?;
     let deck_id = session.deck().id.clone();
     // Record a content-addressed version snapshot (deduplicated by hash).
     // Errors here never block the PPTX save itself.
     let _ = crate::versions::save_snapshot(&state.version_dir, &deck_id, session.deck());
     drop(guard);
-    fs::write(&path, bytes).map_err(|e| e.to_string())?;
     retire_recovery(&state, &deck_id);
     Ok(())
 }
@@ -1829,7 +1831,8 @@ pub fn insert_image(
 pub fn add_shape(
     slide_id: String,
     geometry_kind: String,
-    style: Option<StyleDto>,
+    frame: Option<RectDto>,
+    rotation: Option<f64>,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<DeckSnapshot, String> {
@@ -1837,12 +1840,10 @@ pub fn add_shape(
 
     let mut guard = state.session.lock().map_err(|e| e.to_string())?;
     let session = guard.as_mut().ok_or("no deck is open")?;
-    let core_style = style
-        .map(style_to_core)
-        .unwrap_or_else(|| default_shape_style(&session.deck().theme));
+    let core_style = default_shape_style(&session.deck().theme);
     let shape = slides_core::Shape::Geometric(slides_core::GeometricShape {
         id: slides_core::Shape::generate_id(),
-        transform: centered_transform(0, 0),
+        transform: shape_transform_from_frame(frame, geometry, rotation)?,
         geometry,
         style: core_style,
     });
@@ -1852,6 +1853,48 @@ pub fn add_shape(
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
+}
+
+/// Uses an explicit canvas placement when supplied, with a safe default for
+/// menu-initiated shape creation. The frontend sends EMU bounds from a click or
+/// drag; validating here keeps command clients from creating invalid geometry.
+fn shape_transform_from_frame(
+    frame: Option<RectDto>,
+    geometry: slides_core::Geometry,
+    rotation: Option<f64>,
+) -> Result<slides_core::Transform, String> {
+    let rotation = rotation.unwrap_or(0.0);
+    if !rotation.is_finite() {
+        return Err("shape rotation must be finite".into());
+    }
+    let Some(frame) = frame else {
+        if matches!(geometry, slides_core::Geometry::Line) {
+            return Ok(centered_line_transform());
+        }
+        return Ok(centered_transform(0, 0));
+    };
+    const MIN_SIDE_EMU: f64 = 76_200.0;
+    let is_line = matches!(geometry, slides_core::Geometry::Line);
+    if !frame.x.is_finite()
+        || !frame.y.is_finite()
+        || !frame.width.is_finite()
+        || !frame.height.is_finite()
+        || if is_line {
+            frame.width <= 0.0 || frame.height <= 0.0
+        } else {
+            frame.width < MIN_SIDE_EMU || frame.height < MIN_SIDE_EMU
+        }
+    {
+        return Err(if is_line {
+            "line frame must have finite coordinates and nonzero dimensions".into()
+        } else {
+            "shape frame must have finite coordinates and at least 8px dimensions".into()
+        });
+    }
+    Ok(slides_core::Transform {
+        frame: rect_to_core(frame),
+        rotation,
+    })
 }
 
 /// Appends a new, empty editable text box at the given EMU frame to a slide and
@@ -1902,7 +1945,9 @@ pub fn new_slide(
     let insert_at = after_index
         .map(|i| (i + 1).min(session.deck().slides.len()))
         .unwrap_or_else(|| session.deck().slides.len());
-    session.deck_mut().slides.insert(insert_at, slide);
+    session
+        .execute(Box::new(slides_core::InsertSlide::new(insert_at, slide)))
+        .map_err(|e| e.to_string())?;
     let snapshot = state.snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
@@ -3590,6 +3635,22 @@ fn centered_transform(native_w: u32, native_h: u32) -> slides_core::Transform {
     }
 }
 
+/// Returns a centered, horizontal default line. Unlike filled shapes, a line
+/// needs only a thin frame so a plain click does not create a large 4:3 box.
+fn centered_line_transform() -> slides_core::Transform {
+    const LINE_LENGTH_EMU: f64 = SLIDE_WIDTH_EMU * 0.45;
+    const LINE_THICKNESS_EMU: f64 = 76_200.0;
+    slides_core::Transform {
+        frame: slides_core::Rect::new(
+            (SLIDE_WIDTH_EMU - LINE_LENGTH_EMU) / 2.0,
+            (SLIDE_HEIGHT_EMU - LINE_THICKNESS_EMU) / 2.0,
+            LINE_LENGTH_EMU,
+            LINE_THICKNESS_EMU,
+        ),
+        rotation: 0.0,
+    }
+}
+
 /// Returns a centered frame for a new table, sized to ~70% of the slide width
 /// and ~60% of the slide height.
 fn centered_table_frame() -> slides_core::Rect {
@@ -4201,8 +4262,8 @@ pub fn check_accessibility(state: State<'_, AppState>) -> Result<AccessibilityRe
 #[cfg(test)]
 mod tests {
     use super::{
-        average_column_width, sanitize_recovery_id, table_grid_metrics, table_to_dto, AppState,
-        CellAlignDto,
+        average_column_width, sanitize_recovery_id, shape_transform_from_frame, table_grid_metrics,
+        table_to_dto, AppState, CellAlignDto, RectDto,
     };
     use std::fs;
 
@@ -4221,6 +4282,80 @@ mod tests {
 
         let ok = sanitize_recovery_id(&canonical_dir, "deck_123.pptx").unwrap();
         assert_eq!(ok, canonical_dir.join("deck_123.pptx"));
+    }
+
+    #[test]
+    fn shape_creation_uses_explicit_drag_frame() {
+        let transform = shape_transform_from_frame(
+            Some(RectDto {
+                x: 190_500.0,
+                y: 285_750.0,
+                width: 1_905_000.0,
+                height: 952_500.0,
+            }),
+            slides_core::Geometry::Rectangle,
+            None,
+        )
+        .expect("valid canvas frame");
+        assert_eq!(transform.frame.x, 190_500.0);
+        assert_eq!(transform.frame.y, 285_750.0);
+        assert_eq!(transform.frame.width, 1_905_000.0);
+        assert_eq!(transform.frame.height, 952_500.0);
+        assert!(shape_transform_from_frame(
+            Some(RectDto {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            }),
+            slides_core::Geometry::Rectangle,
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn line_creation_accepts_thin_horizontal_and_vertical_frames() {
+        let horizontal = shape_transform_from_frame(
+            Some(RectDto {
+                x: 190_500.0,
+                y: 247_650.0,
+                width: 1_905_000.0,
+                height: 76_200.0,
+            }),
+            slides_core::Geometry::Line,
+            Some(0.0),
+        )
+        .expect("horizontal line frame");
+        assert_eq!(horizontal.frame.width, 1_905_000.0);
+        assert_eq!(horizontal.frame.height, 76_200.0);
+
+        let vertical = shape_transform_from_frame(
+            Some(RectDto {
+                x: -762_000.0,
+                y: 1_104_150.0,
+                width: 1_905_000.0,
+                height: 76_200.0,
+            }),
+            slides_core::Geometry::Line,
+            Some(90.0),
+        )
+        .expect("vertical line frame");
+        assert_eq!(vertical.frame.width, 1_905_000.0);
+        assert_eq!(vertical.frame.height, 76_200.0);
+        assert_eq!(vertical.rotation, 90.0);
+
+        assert!(shape_transform_from_frame(
+            Some(RectDto {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 76_200.0,
+            }),
+            slides_core::Geometry::Line,
+            None,
+        )
+        .is_err());
     }
 
     #[test]

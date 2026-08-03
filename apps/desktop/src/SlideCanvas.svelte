@@ -34,6 +34,13 @@
     VerticalAlignDto,
   } from './lib/types'
   import { codeLineState } from './lib/codeSteps'
+  import {
+    alignParagraphs,
+    preserveEditedRuns as preserveEditedRunsImpl,
+  } from './lib/preserveTextRuns.js'
+  import { slideSurfaceDimensions } from './lib/canvasScale.js'
+  import { linePlacementFromPoints } from './lib/shapePlacement.js'
+  import { composeShapeTransform, supportsDirectResize } from './lib/shapeTransform.js'
 
   /** Props for the slide canvas. */
   interface Props {
@@ -91,6 +98,8 @@
     codeActiveStep?: number
     /** Deck slide size (aspect ratio). Defaults to 16:9 when unset. */
     slideSize?: SlideSizeDto
+    /** Display scale chosen by the editor's fit-to-window calculation. */
+    scale?: number
     /** Whether the deck is rendered in high-contrast mode. */
     highContrast?: boolean
     /** Index of a shape to highlight as selected (e.g. from the accessibility
@@ -102,6 +111,17 @@
     /** Placeholder frames for the slide's active layout, drawn as non-editable
      *  guide outlines in the editor. Omitted or empty draws no guides. */
     placeholderGuides?: PlaceholderDefDto[]
+    /** When true, clicks on the canvas background place a text box instead of
+     *  deselecting. */
+    creatingTextBox?: boolean
+    /** Called when the user clicks the canvas background while
+     *  `creatingTextBox` is true. The host creates the text box at the click
+     *  coordinates. */
+    onPlaceTextBox?: (event: MouseEvent) => void
+    /** A geometric primitive currently awaiting click-or-drag placement. */
+    creatingShapeKind?: string | null
+    /** Receives a geometric placement in EMU, or null for click fallback. */
+    onPlaceShape?: (placement: { frame: RectDto; rotation?: number } | null) => void
   }
 
   let {
@@ -121,18 +141,34 @@
     activeBuildStep = Infinity,
     codeActiveStep = 0,
     slideSize,
+    scale = 1,
     highContrast = false,
     selectedShapeIndex = null,
     editingShapeIndex = null,
     placeholderGuides,
+    creatingTextBox = false,
+    onPlaceTextBox,
+    creatingShapeKind = null,
+    onPlaceShape,
   }: Props = $props()
 
-  /** Canvas width in pixels, derived from the deck slide size or 16:9 default. */
-  const canvasWidthPx = $derived(
-    toPx(slideSize?.widthEmu ?? 12_192_000),
+  /** Logical and layout dimensions for one uniformly scaled slide surface. */
+  const slideSurface = $derived(
+    slideSurfaceDimensions(
+      slideSize?.widthEmu ?? 12_192_000,
+      slideSize?.heightEmu ?? 6_858_000,
+      scale,
+    ),
   )
-  /** Canvas height in pixels, derived from the deck slide size or 16:9 default. */
-  const canvasHeightPx = $derived(toPx(slideSize?.heightEmu ?? 6_858_000))
+  /** Native, unscaled canvas size. Typography is laid out at this size before
+   *  the whole surface is transformed, preserving its relationship to EMU
+   *  geometry. */
+  const canvasWidthPx = $derived(`${slideSurface.logicalWidthPx}px`)
+  const canvasHeightPx = $derived(`${slideSurface.logicalHeightPx}px`)
+  /** Scaled footprint keeps flex layout and scroll bounds aligned with the
+   *  transformed canvas rather than its native dimensions. */
+  const canvasFootprintWidthPx = $derived(`${slideSurface.footprintWidthPx}px`)
+  const canvasFootprintHeightPx = $derived(`${slideSurface.footprintHeightPx}px`)
   /** Background color, forced to black when high-contrast is on. */
   const effectiveBackground = $derived<ColorDto>(
     highContrast ? { r: 0, g: 0, b: 0, a: 255 } : background,
@@ -173,10 +209,33 @@
     return parts.length > 0 ? parts.join(' ') : undefined
   }
 
+  /** Applies geometric line rotation at the DOM boundary so the visible line,
+   *  its hit box, and its selection affordance share one transformed surface.
+   *  Other geometric primitives keep their existing local-SVG rotation. */
+  function geometricContainerTransform(
+    geometry: GeometryDto,
+    rotation: number,
+    shapeIndex: number,
+  ): string | undefined {
+    const buildTransform = buildStateFor(shapeIndex)?.transform
+    return geometry === 'line'
+      ? composeShapeTransform(rotation, buildTransform)
+      : buildTransform && buildTransform !== 'none'
+        ? buildTransform
+        : undefined
+  }
+
+  /** Charts use the same transform model as images and tables. */
+  function chartTransform(rotation: number, shapeIndex: number): string | undefined {
+    return composeShapeTransform(rotation, buildStateFor(shapeIndex)?.transform)
+  }
+
   /** EMU to CSS pixels for a 1280x720 (16:9) canvas. */
   const EMU_TO_PX = 1.0 / 9525.0
 
-  /** Converts EMU to a pixel CSS string. */
+  /** Converts EMU to native (unscaled) slide CSS pixels. The canvas root is
+   *  transformed as a single surface, which scales geometry and typography
+   *  together. */
   function toPx(emu: number): string {
     return `${emu * EMU_TO_PX}px`
   }
@@ -350,7 +409,12 @@
     return classes.join(' ')
   }
 
-  /** Builds a paragraph DTO, preserving original runs and style when the text is unchanged. */
+  /** Preserves formatting in untouched portions of a textarea edit. */
+  function preserveEditedRuns(text: string, original: ParagraphDto): RunDto[] {
+    return preserveEditedRunsImpl(text, original) as RunDto[]
+  }
+
+  /** Builds a paragraph DTO, preserving its styles and runs during plain-text edits. */
   function buildParagraph(
     text: string,
     original: ParagraphDto | undefined,
@@ -360,17 +424,19 @@
     }
     return {
       runs: text
-        ? [
-            {
-              text,
-              bold: false,
-              italic: false,
-              underline: false,
-              strikethrough: false,
-              verticalAlign: 'baseline' as VerticalAlignDto,
-              code: false,
-            },
-          ]
+        ? original
+          ? preserveEditedRuns(text, original)
+          : [
+              {
+                text,
+                bold: false,
+                italic: false,
+                underline: false,
+                strikethrough: false,
+                verticalAlign: 'baseline' as VerticalAlignDto,
+                code: false,
+              },
+            ]
         : [],
       listStyle: original?.listStyle ?? 'none',
       style: original?.style ?? {
@@ -388,8 +454,11 @@
     const originalParagraphs = textBox.paragraphs
     const lines = textarea.value.split('\n')
 
+    const alignedOriginals = alignParagraphs(lines, originalParagraphs) as Array<
+      ParagraphDto | undefined
+    >
     const newParagraphs: ParagraphDto[] = lines.map((line, index) =>
-      buildParagraph(line, originalParagraphs[index]),
+      buildParagraph(line, alignedOriginals[index]),
     )
 
     const changed =
@@ -447,6 +516,7 @@
     const fill = style.fill as FillDto | undefined
     if (fill && fill.solid) {
       attrs += ` fill="${toHex(fill.solid)}"`
+      if (fill.solid.a < 255) attrs += ` fill-opacity="${fill.solid.a / 255}"`
     } else {
       attrs += ' fill="none"'
     }
@@ -534,14 +604,14 @@
   }
 
   /** Builds a complete `<svg>` document for a geometric shape. */
-  function geometricSvg(shape: GeometricShapeSnapshot): string {
+  function geometricSvg(shape: GeometricShapeSnapshot, rotation = shape.transform.rotation): string {
     const { frame } = shape.transform
     const inner = geometryMarkup(
       shape.geometry,
       shape.style,
       frame.width,
       frame.height,
-      shape.transform.rotation,
+      rotation,
     )
     let filterOpen = ''
     let filterClose = ''
@@ -1051,6 +1121,7 @@
   } | null = null
   /** Live preview frame during a drag, driving optimistic re-rendering. */
   let dragPreview = $state<{ shapeIndex: number; frame: RectDto } | null>(null)
+  let shapeCreateStart: { x: number; y: number } | null = null
 
   /** Frame of the currently selected, non-edited shape, used to position the
    *  resize-handle overlay (follows the live drag preview). Null when no shape
@@ -1062,6 +1133,26 @@
     const shape = slide.shapes[selectedShapeIndex]
     if (!shape) return null
     return liveFrame(selectedShapeIndex, shapeFrameOf(shape)) ?? shapeFrameOf(shape) ?? null
+  })
+
+  /** Rotation of the selected shape's rendered surface. The overlay uses it so
+   *  handles stay on rotated images, tables, charts, and geometric shapes. */
+  const selectionRotation = $derived.by<number>(() => {
+    if (selectionFrame === null || selectedShapeIndex === null) return 0
+    const shape = slide.shapes[selectedShapeIndex]
+    return shape ? shapeRotationOf(shape) : 0
+  })
+
+  /** Rotated line geometry can be selected and moved, but not resized until
+   *  resize deltas are transformed into the line's local axis space. */
+  const selectionSupportsResize = $derived.by<boolean>(() => {
+    if (selectionFrame === null || selectedShapeIndex === null) return false
+    const shape = slide.shapes[selectedShapeIndex]
+    if (!shape) return false
+    return supportsDirectResize(
+      shape.kind,
+      shape.kind === 'geometric' ? (shape.value as GeometricShapeSnapshot).geometry : undefined,
+    )
   })
 
   /** Computes a moved/resized frame for the given mode and EMU deltas. */
@@ -1115,7 +1206,12 @@
     const dy = event.clientY - dragStart.startY
     if (!dragStart.moved && Math.hypot(dx, dy) < DRAG_THRESHOLD_PX) return
     dragStart.moved = true
-    const frame = applyDrag(dragStart.mode, dragStart.startFrame, dx * PX_TO_EMU, dy * PX_TO_EMU)
+    const frame = applyDrag(
+      dragStart.mode,
+      dragStart.startFrame,
+      (dx * PX_TO_EMU) / slideSurface.surfaceScale,
+      (dy * PX_TO_EMU) / slideSurface.surfaceScale,
+    )
     dragPreview = { shapeIndex: dragStart.shapeIndex, frame }
   }
 
@@ -1143,16 +1239,87 @@
     beginDrag(event, shapeIndex, 'move')
   }
 
+  /** Selects a shape from the keyboard; Enter starts text editing when relevant. */
+  function onShapeKeydown(event: KeyboardEvent, shapeIndex: number, isTextBox = false): void {
+    if (readonly) return
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      onEditShape?.({ shapeIndex: null })
+      return
+    }
+    if (event.key !== 'Enter' && event.key !== ' ') return
+    event.preventDefault()
+    onSelectShape?.({ shapeIndex })
+    if (event.key === 'Enter' && isTextBox) onEditShape?.({ shapeIndex })
+  }
+
+  /** Converts a pointer coordinate into clamped slide EMUs. */
+  function pointerToSlideEmu(event: PointerEvent): { x: number; y: number } | null {
+    if (!canvasEl) return null
+    const bounds = canvasEl.getBoundingClientRect()
+    if (!bounds.width || !bounds.height) return null
+    const widthEmu = slideSize?.widthEmu ?? 12_192_000
+    const heightEmu = slideSize?.heightEmu ?? 6_858_000
+    return {
+      x: Math.min(Math.max(((event.clientX - bounds.left) / bounds.width) * widthEmu, 0), widthEmu),
+      y: Math.min(Math.max(((event.clientY - bounds.top) / bounds.height) * heightEmu, 0), heightEmu),
+    }
+  }
+
+  /** Starts a geometric creation drag on an empty region of the slide. */
+  function onCanvasPointerDown(event: PointerEvent): void {
+    if (readonly || !creatingShapeKind || event.button !== 0 || event.target !== canvasEl) return
+    const point = pointerToSlideEmu(event)
+    if (!point) return
+    event.preventDefault()
+    shapeCreateStart = point
+    window.addEventListener('pointerup', onShapeCreatePointerUp, { once: true })
+  }
+
+  /** Completes a geometric click or drag creation. */
+  function onShapeCreatePointerUp(event: PointerEvent): void {
+    const start = shapeCreateStart
+    shapeCreateStart = null
+    if (!start || !creatingShapeKind) return
+    const end = pointerToSlideEmu(event)
+    if (!end) return
+    if (creatingShapeKind === 'line') {
+      onPlaceShape?.(linePlacementFromPoints(start, end))
+      return
+    }
+    const width = Math.abs(end.x - start.x)
+    const height = Math.abs(end.y - start.y)
+    if (width < MIN_SIDE_EMU || height < MIN_SIDE_EMU) {
+      onPlaceShape?.(null)
+      return
+    }
+    onPlaceShape?.({
+      frame: {
+        x: Math.min(start.x, end.x),
+        y: Math.min(start.y, end.y),
+        width,
+        height,
+      },
+    })
+  }
+
   /** Double-click on a text box: enters text-edit mode. */
   function onTextBoxDblClick(shapeIndex: number): void {
     if (readonly) return
     if (shapeIndex !== editingShapeIndex) onEditShape?.({ shapeIndex })
   }
 
-  /** Click on the empty canvas background clears the selection. */
+  /** Click on the empty canvas background: clears selection, or places a
+   *  text box if text-box creation mode is armed. */
   function onCanvasClick(event: MouseEvent): void {
     if (readonly) return
-    if (event.target === canvasEl) onSelectShape?.({ shapeIndex: null })
+    if (event.target !== canvasEl) return
+    if (creatingTextBox && onPlaceTextBox) {
+      onPlaceTextBox(event)
+      return
+    }
+    if (creatingShapeKind) return
+    onSelectShape?.({ shapeIndex: null })
   }
 
   /** Escape while editing exits text-edit mode but keeps the shape selected. */
@@ -1190,8 +1357,8 @@
     if (cached !== undefined) return cached
 
     const svg = await invoke<string>('render_slide_svg', {
-      slide_id: slide.id,
-      code_active_step: codeActiveStep,
+      slideId: slide.id,
+      codeActiveStep,
     })
     const parsed = new DOMParser().parseFromString(svg, 'image/svg+xml')
     const svgs = Array.from(parsed.querySelectorAll('svg'))
@@ -1217,16 +1384,23 @@
 
 <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
 <div
-  class="canvas"
-  class:high-contrast={highContrast}
-  bind:this={canvasEl}
-  style:width={canvasWidthPx}
-  style:height={canvasHeightPx}
-  style:background-color={toRgba(effectiveBackground)}
-  role="application"
-  aria-label="Slide canvas"
-  onclick={onCanvasClick}
+  class="canvas-footprint"
+  style:width={canvasFootprintWidthPx}
+  style:height={canvasFootprintHeightPx}
 >
+  <div
+    class="canvas"
+    class:high-contrast={highContrast}
+    bind:this={canvasEl}
+    style:width={canvasWidthPx}
+    style:height={canvasHeightPx}
+    style:background-color={toRgba(effectiveBackground)}
+    style:transform={`scale(${slideSurface.surfaceScale})`}
+    role="application"
+    aria-label="Slide canvas"
+    onpointerdown={onCanvasPointerDown}
+    onclick={onCanvasClick}
+  >
   {#if !readonly && placeholderGuides && placeholderGuides.length > 0}
     {#each placeholderGuides as guide}
       <div
@@ -1263,8 +1437,12 @@
         style:transform={buildStateFor(shapeIndex)?.transform}
         style:transition={buildStateFor(shapeIndex)?.transition}
         onpointerdown={(event) => onShapePointerDown(event, shapeIndex)}
+        onkeydown={(event) => onShapeKeydown(event, shapeIndex, true)}
         ondblclick={() => onTextBoxDblClick(shapeIndex)}
         oncontextmenu={(event) => handleShapeContextMenu(event, textBox.id, shapeIndex)}
+        tabindex={readonly ? -1 : 0}
+        role="button"
+        aria-label="Text box"
       >
         {#if isEditing}
           <div class="text-box-editor">
@@ -1314,7 +1492,11 @@
         class:draggable={interactive}
         data-shape-id={obj.id}
         onpointerdown={(event) => onShapePointerDown(event, shapeIndex)}
+        onkeydown={(event) => onShapeKeydown(event, shapeIndex)}
         oncontextmenu={(event) => handleShapeContextMenu(event, obj.id, shapeIndex)}
+        tabindex={readonly ? -1 : 0}
+        role="button"
+        aria-label="Preserved object"
         style:left={obj.frame ? toPx(liveFrame(shapeIndex, obj.frame)?.x ?? obj.frame.x) : undefined}
         style:top={obj.frame ? toPx(liveFrame(shapeIndex, obj.frame)?.y ?? obj.frame.y) : `${1 + passthroughIndex * 0.5}rem`}
         style:right={obj.frame ? undefined : '1rem'}
@@ -1341,7 +1523,11 @@
         class:draggable={interactive}
         data-shape-id={image.id}
         onpointerdown={(event) => onShapePointerDown(event, shapeIndex)}
+        onkeydown={(event) => onShapeKeydown(event, shapeIndex)}
         oncontextmenu={(event) => handleShapeContextMenu(event, image.id, shapeIndex)}
+        tabindex={readonly ? -1 : 0}
+        role="button"
+        aria-label="Image"
         style:left={toPx(frame.x)}
         style:top={toPx(frame.y)}
         style:width={toPx(frame.width)}
@@ -1366,6 +1552,7 @@
     {:else if shape.kind === 'geometric'}
       {@const geometric = shape.value as GeometricShapeSnapshot}
       {@const frame = liveFrame(shapeIndex, geometric.transform.frame) ?? geometric.transform.frame}
+      {@const rotation = geometric.transform.rotation}
       {@const interactive = isInteractiveShape(shapeIndex)}
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div
@@ -1375,17 +1562,21 @@
         class:draggable={interactive}
         data-shape-id={geometric.id}
         onpointerdown={(event) => onShapePointerDown(event, shapeIndex)}
+        onkeydown={(event) => onShapeKeydown(event, shapeIndex)}
         oncontextmenu={(event) => handleShapeContextMenu(event, geometric.id, shapeIndex)}
+        tabindex={readonly ? -1 : 0}
+        role="button"
+        aria-label="Shape"
         style:left={toPx(frame.x)}
         style:top={toPx(frame.y)}
         style:width={toPx(frame.width)}
         style:height={toPx(frame.height)}
         style:opacity={buildStateFor(shapeIndex)?.opacity}
         style:visibility={buildStateFor(shapeIndex)?.visibility}
-        style:transform={buildStateFor(shapeIndex)?.transform}
+        style:transform={geometricContainerTransform(geometric.geometry, rotation, shapeIndex)}
         style:transition={buildStateFor(shapeIndex)?.transition}
       >
-        {@html geometricSvg(geometric)}
+        {@html geometricSvg(geometric, geometric.geometry === 'line' ? 0 : rotation)}
       </div>
     {:else if shape.kind === 'table'}
       {@const table = shape.value as TableShapeSnapshot}
@@ -1402,7 +1593,11 @@
         class:draggable={interactive}
         data-shape-id={table.id}
         onpointerdown={(event) => onShapePointerDown(event, shapeIndex)}
+        onkeydown={(event) => onShapeKeydown(event, shapeIndex)}
         oncontextmenu={(event) => handleShapeContextMenu(event, table.id, shapeIndex)}
+        tabindex={readonly ? -1 : 0}
+        role="button"
+        aria-label="Table"
         style:left={toPx(tframe.x)}
         style:top={toPx(tframe.y)}
         style:width={toPx(tframe.width)}
@@ -1454,6 +1649,7 @@
     {:else if shape.kind === 'chart'}
       {@const chart = shape.value as ChartShapeSnapshot}
       {@const frame = liveFrame(shapeIndex, chart.transform.frame) ?? chart.transform.frame}
+      {@const rotation = chart.transform.rotation}
       {@const interactive = isInteractiveShape(shapeIndex)}
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div
@@ -1464,17 +1660,19 @@
         class:draggable={interactive}
         data-shape-id={chart.id}
         onpointerdown={(event) => onShapePointerDown(event, shapeIndex)}
+        onkeydown={(event) => onShapeKeydown(event, shapeIndex)}
         oncontextmenu={(event) => handleShapeContextMenu(event, chart.id, shapeIndex)}
+        tabindex={readonly ? -1 : 0}
         style:left={toPx(frame.x)}
         style:top={toPx(frame.y)}
         style:width={toPx(frame.width)}
         style:height={toPx(frame.height)}
         style:opacity={buildStateFor(shapeIndex)?.opacity}
         style:visibility={buildStateFor(shapeIndex)?.visibility}
-        style:transform={buildStateFor(shapeIndex)?.transform}
+        style:transform={chartTransform(rotation, shapeIndex)}
         style:transition={buildStateFor(shapeIndex)?.transition}
         ondblclick={() => !readonly && onEditChart?.({ slideId: slide.id, shapeIndex })}
-        role="img"
+        role="button"
         aria-label={chart.title ? `Chart: ${chart.title}` : 'Chart'}
       >
         {#await chartSvg(shapeIndex, chart)}
@@ -1495,17 +1693,21 @@
       style:top={toPx(selectionFrame.y)}
       style:width={toPx(selectionFrame.width)}
       style:height={toPx(selectionFrame.height)}
+      style:transform={selectionRotation ? `rotate(${selectionRotation}deg)` : undefined}
     >
-      {#each HANDLE_DIRECTIONS as dir}
-        <!-- svelte-ignore a11y_no_static_element_interactions -->
-        <div
-          class="resize-handle"
-          data-handle={dir}
-          onpointerdown={(event) => beginDrag(event, selectedShapeIndex!, dir)}
-        ></div>
-      {/each}
+      {#if selectionSupportsResize}
+        {#each HANDLE_DIRECTIONS as dir}
+          <!-- svelte-ignore a11y_no_static_element_interactions -->
+          <div
+            class="resize-handle"
+            data-handle={dir}
+            onpointerdown={(event) => beginDrag(event, selectedShapeIndex!, dir)}
+          ></div>
+        {/each}
+      {/if}
     </div>
   {/if}
+  </div>
 </div>
 
 {#if spellMenu}
@@ -1573,10 +1775,16 @@
 
 <style>
   .canvas {
-    position: relative;
-    flex-shrink: 0;
+    position: absolute;
+    top: 0;
+    left: 0;
     box-shadow: 0 0 0 1px #ccc;
     overflow: hidden;
+    transform-origin: top left;
+  }
+  .canvas-footprint {
+    position: relative;
+    flex-shrink: 0;
   }
   .canvas.high-contrast .text-box,
   .canvas.high-contrast .table-cell-input,
@@ -1618,6 +1826,7 @@
     position: absolute;
     pointer-events: none;
     z-index: 6;
+    transform-origin: center;
   }
   .resize-handle[data-handle='nw'] {
     left: -5px;
@@ -1823,6 +2032,7 @@
   }
   .geometric-container {
     position: absolute;
+    transform-origin: center;
   }
   .geometric-container :global(svg) {
     width: 100%;

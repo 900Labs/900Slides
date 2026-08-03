@@ -18,11 +18,13 @@
   import Comments from './Comments.svelte'
   import AccessibilityPanel from './AccessibilityPanel.svelte'
   import AnimationPane from './AnimationPane.svelte'
+  import { fitCanvasScale } from './lib/canvasScale.js'
   import type {
     AccessibilityReportDto,
     ChartDataDto,
     ChartShapeSnapshot,
     ChartTypeDto,
+    ColorDto,
     CommentAnchorDto,
     DeckSnapshot,
     GeometricShapeSnapshot,
@@ -39,6 +41,7 @@
     SlideSectionDto,
     SlideSizeDto,
     SlideSnapshot,
+    StyleDto,
     TableShapeSnapshot,
     TemplateInfoDto,
     TextBoxSnapshot,
@@ -72,8 +75,8 @@
   let showChartDropdown = $state(false)
   /** Currently edited chart, if any. */
   let activeChart = $state<{ shapeIndex: number } | null>(null)
-  /** Active right-panel tab: 'notes' or 'animation'. */
-  let rightPanelTab = $state<'notes' | 'animation'>('notes')
+  /** Active right-panel tab. The inspector stays contextual to the selection. */
+  let rightPanelTab = $state<'style' | 'text' | 'arrange' | 'notes' | 'animation'>('style')
   /** Duration (ms) for the slide transition. */
   let transitionDuration = $state(500)
   /** Whether the find/replace dialog is open. */
@@ -119,6 +122,9 @@
   let exporting = $state<'' | 'svg' | 'png' | 'pdf'>('')
   /** Human-readable error from the last export, shown until dismissed. */
   let exportError = $state('')
+  /** Human-readable failure for editor actions. Never leave a command failure in
+   *  the developer console as the only feedback path. */
+  let actionError = $state('')
   /** Active text-box paragraph the cursor is in, so the toolbar can show and
    *  edit paragraph-level options (e.g. code-step ranges) for it. */
   let activeTextTarget = $state<{
@@ -132,8 +138,11 @@
   let showShapeFlyout = $state(false)
   /** Whether "Text Box" creation mode is armed (next canvas click places one). */
   let creatingTextBox = $state(false)
+  /** Selected geometric primitive awaiting a click or drag on the canvas. */
+  let creatingShapeKind = $state<string | null>(null)
   /** The editor canvas-area element, used to map clicks to slide coordinates. */
   let canvasAreaEl = $state<HTMLElement | null>(null)
+  let canvasViewport = $state({ width: 0, height: 0 })
 
   /** Maximum grid dimension offered by the table size picker. */
   const PICKER_MAX = 6
@@ -153,6 +162,15 @@
 
   /** Deck slide size (aspect ratio), when set. */
   const slideSize = $derived<SlideSizeDto | undefined>(deck?.slideSize)
+  /** Default zoom fits the whole slide between the fixed side panels. */
+  const canvasScale = $derived(
+    fitCanvasScale(
+      canvasViewport.width,
+      canvasViewport.height,
+      slideSize?.widthEmu ?? 12_192_000,
+      slideSize?.heightEmu ?? 6_858_000,
+    ),
+  )
   /** Whether the deck theme is in high-contrast mode. */
   const highContrast = $derived<boolean>(deck?.theme.highContrast ?? false)
   /** Shape index to render with the selection ring: the user's canvas
@@ -162,6 +180,18 @@
   )
   /** Rich-text notes for the active slide, when present. */
   const activeRichNotes = $derived<ParagraphDto[] | undefined>(activeSlide?.richNotes)
+  /** Selected geometric shape, if the current selection supports visual styling. */
+  const selectedGeometric = $derived.by<GeometricShapeSnapshot | null>(() => {
+    if (selectedShapeIndex === null || !activeSlide) return null
+    const shape = activeSlide.shapes[selectedShapeIndex]
+    return shape?.kind === 'geometric' ? (shape.value as GeometricShapeSnapshot) : null
+  })
+  /** Frame of any selected, placeable shape for the Arrange inspector. */
+  const selectedShapeFrame = $derived.by<RectDto | null>(() => {
+    if (selectedShapeIndex === null || !activeSlide) return null
+    const shape = activeSlide.shapes[selectedShapeIndex]
+    return shape ? shapeFrameOf(shape) ?? null : null
+  })
 
   /** Layouts available on the current deck (from its template). */
   const deckLayouts = $derived(deck?.layouts ?? [])
@@ -181,6 +211,20 @@
     for (const p of masterPlaceholders) byName.set(p.name, p)
     for (const p of layout.placeholders) byName.set(p.name, p)
     return Array.from(byName.values())
+  })
+
+  // Recompute the default fit scale when the available center pane changes
+  // (window resize, sidebar changes, or the first render).
+  $effect(() => {
+    const element = canvasAreaEl
+    if (!element) return
+    const update = () => {
+      canvasViewport = { width: element.clientWidth, height: element.clientHeight }
+    }
+    update()
+    const observer = new ResizeObserver(update)
+    observer.observe(element)
+    return () => observer.disconnect()
   })
 
   /** Preset aspect-ratio slide sizes, in EMU, matching the Rust constructors. */
@@ -256,12 +300,18 @@
 
   /** Creates a new blank deck from the Rust model, optionally applying a template. */
   async function newDeck(templateName?: string | null): Promise<void> {
-    const payload = templateName ? { template_name: templateName } : {}
-    deck = await invoke<DeckSnapshot>('new_deck', payload)
-    activeIndex = 0
-    warnings = deck?.warnings ?? []
-    showWarnings = true
-    showRecovery = false
+    const payload = templateName ? { templateName: templateName } : {}
+    try {
+      deck = await invoke<DeckSnapshot>('new_deck', payload)
+      activeIndex = 0
+      warnings = deck?.warnings ?? []
+      showWarnings = true
+      showRecovery = false
+      selectedShapeIndex = null
+      editingShapeIndex = null
+    } catch (error) {
+      reportActionError('Could not create a new presentation', error)
+    }
   }
 
   /** Loads built-in templates and opens the template picker. */
@@ -284,24 +334,34 @@
 
   /** Opens an existing .pptx file via the system dialog. */
   async function onOpen(): Promise<void> {
-    const path = await open({
-      multiple: false,
-      filters: [{ name: 'Presentation', extensions: ['pptx'] }],
-    })
-    if (typeof path !== 'string') return
-    deck = await invoke<DeckSnapshot>('open_deck', { path })
-    activeIndex = 0
-    warnings = deck?.warnings ?? []
-    showWarnings = true
+    try {
+      const path = await open({
+        multiple: false,
+        filters: [{ name: 'Presentation', extensions: ['pptx'] }],
+      })
+      if (typeof path !== 'string') return
+      deck = await invoke<DeckSnapshot>('open_deck', { path })
+      activeIndex = 0
+      warnings = deck?.warnings ?? []
+      showWarnings = true
+      selectedShapeIndex = null
+      editingShapeIndex = null
+    } catch (error) {
+      reportActionError('Could not open the presentation', error)
+    }
   }
 
   /** Saves the current deck to a .pptx file via the system dialog. */
   async function onSave(): Promise<void> {
-    const path = await save({
-      filters: [{ name: 'Presentation', extensions: ['pptx'] }],
-    })
-    if (typeof path !== 'string') return
-    await invoke('save_deck', { path })
+    try {
+      const path = await save({
+        filters: [{ name: 'Presentation', extensions: ['pptx'] }],
+      })
+      if (typeof path !== 'string') return
+      await invoke('save_deck', { path })
+    } catch (error) {
+      reportActionError('Could not save the presentation', error)
+    }
   }
 
   /** Filename stem used as the default for export save dialogs. */
@@ -473,11 +533,15 @@
     shapeIndex: number
     paragraphs: ParagraphDto[]
   }): Promise<void> {
-    deck = await invoke<DeckSnapshot>('edit_text_box', {
-      slide_id: detail.slideId,
-      shape_index: detail.shapeIndex,
-      paragraphs: detail.paragraphs,
-    })
+    try {
+      deck = await invoke<DeckSnapshot>('edit_text_box', {
+        slideId: detail.slideId,
+        shapeIndex: detail.shapeIndex,
+        paragraphs: detail.paragraphs,
+      })
+    } catch (error) {
+      reportActionError('Could not save the text edit', error)
+    }
   }
 
   /** Finds the run index in a paragraph that contains the given character position. */
@@ -604,10 +668,10 @@
     if (target) {
       const value = !target.run[flag]
       deck = await invoke<DeckSnapshot>('set_run_style', {
-        slide_id: target.slideId,
-        shape_index: target.shapeIndex,
-        paragraph_index: target.paragraphIndex,
-        run_index: target.runIndex,
+        slideId: target.slideId,
+        shapeIndex: target.shapeIndex,
+        paragraphIndex: target.paragraphIndex,
+        runIndex: target.runIndex,
         [flag]: value,
       })
       return
@@ -641,8 +705,8 @@
       runs: p.runs.map(transform),
     }))
     deck = await invoke<DeckSnapshot>('edit_text_box', {
-      slide_id: activeSlide.id,
-      shape_index: selectedShapeIndex,
+      slideId: activeSlide.id,
+      shapeIndex: selectedShapeIndex,
       paragraphs,
     })
   }
@@ -654,11 +718,11 @@
       const value: VerticalAlignDto =
         target.run.verticalAlign === 'superscript' ? 'baseline' : 'superscript'
       deck = await invoke<DeckSnapshot>('set_run_style', {
-        slide_id: target.slideId,
-        shape_index: target.shapeIndex,
-        paragraph_index: target.paragraphIndex,
-        run_index: target.runIndex,
-        vertical_align: value,
+        slideId: target.slideId,
+        shapeIndex: target.shapeIndex,
+        paragraphIndex: target.paragraphIndex,
+        runIndex: target.runIndex,
+        verticalAlign: value,
       })
       return
     }
@@ -672,11 +736,11 @@
       const value: VerticalAlignDto =
         target.run.verticalAlign === 'subscript' ? 'baseline' : 'subscript'
       deck = await invoke<DeckSnapshot>('set_run_style', {
-        slide_id: target.slideId,
-        shape_index: target.shapeIndex,
-        paragraph_index: target.paragraphIndex,
-        run_index: target.runIndex,
-        vertical_align: value,
+        slideId: target.slideId,
+        shapeIndex: target.shapeIndex,
+        paragraphIndex: target.paragraphIndex,
+        runIndex: target.runIndex,
+        verticalAlign: value,
       })
       return
     }
@@ -706,9 +770,9 @@
       heading: level ?? undefined,
     }
     deck = await invoke<DeckSnapshot>('set_paragraph_style', {
-      slide_id: target.slideId,
-      shape_index: target.shapeIndex,
-      paragraph_index: target.paragraphIndex,
+      slideId: target.slideId,
+      shapeIndex: target.shapeIndex,
+      paragraphIndex: target.paragraphIndex,
       style,
     })
   }
@@ -722,9 +786,9 @@
       [flag]: !target.paragraph.style[flag],
     }
     deck = await invoke<DeckSnapshot>('set_paragraph_style', {
-      slide_id: target.slideId,
-      shape_index: target.shapeIndex,
-      paragraph_index: target.paragraphIndex,
+      slideId: target.slideId,
+      shapeIndex: target.shapeIndex,
+      paragraphIndex: target.paragraphIndex,
       style,
     })
   }
@@ -739,9 +803,9 @@
       codeStepRanges: value.trim() === '' ? undefined : value,
     }
     deck = await invoke<DeckSnapshot>('set_paragraph_style', {
-      slide_id: activeSlide.id,
-      shape_index: activeTextTarget.shapeIndex,
-      paragraph_index: activeTextTarget.paragraphIndex,
+      slideId: activeSlide.id,
+      shapeIndex: activeTextTarget.shapeIndex,
+      paragraphIndex: activeTextTarget.paragraphIndex,
       style,
     })
     activeTextTarget = { ...activeTextTarget, style }
@@ -761,19 +825,35 @@
     const buffer = await file.arrayBuffer()
     const bytes = Array.from(new Uint8Array(buffer))
     deck = await invoke<DeckSnapshot>('insert_image', {
-      slide_id: activeSlide.id,
+      slideId: activeSlide.id,
       bytes,
     })
   }
 
-  /** Appends a geometric shape of the given kind to the active slide. */
+  /** Arms geometric creation mode; the next canvas click or drag places it. */
   async function onAddShape(geometryKind: string): Promise<void> {
     if (!activeSlide) return
     showShapeFlyout = false
-    deck = await invoke<DeckSnapshot>('add_shape', {
-      slide_id: activeSlide.id,
-      geometry_kind: geometryKind,
-    })
+    creatingTextBox = false
+    creatingShapeKind = geometryKind
+  }
+
+  /** Creates the armed geometric shape at the canvas frame, if one is armed. */
+  async function onPlaceShape(placement: { frame: RectDto; rotation?: number } | null): Promise<void> {
+    if (!activeSlide || !creatingShapeKind) return
+    const geometryKind = creatingShapeKind
+    creatingShapeKind = null
+    try {
+      deck = await invoke<DeckSnapshot>('add_shape', {
+        slideId: activeSlide.id,
+        geometryKind,
+        ...(placement ? { frame: placement.frame, rotation: placement.rotation } : {}),
+      })
+      const newIndex = (deck?.slides[activeIndex]?.shapes.length ?? 1) - 1
+      selectedShapeIndex = newIndex
+    } catch (e) {
+      reportActionError('Could not add the shape', e)
+    }
   }
 
   /** Returns the bounding frame (EMU) for any shape kind, or undefined. */
@@ -833,14 +913,79 @@
     transform: TransformDto
   }): Promise<void> {
     if (!activeSlide) return
-    deck = await invoke<DeckSnapshot>('update_shape_transform', {
-      slide_id: activeSlide.id,
-      shape_index: detail.shapeIndex,
-      transform: detail.transform,
+    try {
+      deck = await invoke<DeckSnapshot>('update_shape_transform', {
+        slideId: activeSlide.id,
+        shapeIndex: detail.shapeIndex,
+        transform: detail.transform,
+      })
+    } catch (error) {
+      reportActionError('Could not update the selected object', error)
+    }
+  }
+
+  /** Provides clear, local feedback for a desktop command failure. */
+  function reportActionError(action: string, error: unknown): void {
+    const detail = error instanceof Error ? error.message : String(error)
+    actionError = `${action}. ${detail}`
+  }
+
+  /** Converts a native colour-input value to the DTO used at the Rust boundary. */
+  function colorFromHex(value: string, alpha = 255): ColorDto {
+    const hex = value.replace('#', '')
+    const parsed = Number.parseInt(hex, 16)
+    return {
+      r: Number.isFinite(parsed) ? (parsed >> 16) & 0xff : 0,
+      g: Number.isFinite(parsed) ? (parsed >> 8) & 0xff : 0,
+      b: Number.isFinite(parsed) ? parsed & 0xff : 0,
+      a: alpha,
+    }
+  }
+
+  /** Formats a DTO colour for a native colour input. */
+  function colorToHex(color: ColorDto): string {
+    return `#${[color.r, color.g, color.b]
+      .map((channel) => channel.toString(16).padStart(2, '0'))
+      .join('')}`
+  }
+
+  /** Applies a style update only when a geometric shape is selected. */
+  async function updateSelectedGeometryStyle(
+    update: (style: StyleDto) => StyleDto,
+  ): Promise<void> {
+    if (selectedShapeIndex === null || !activeSlide || !selectedGeometric) return
+    try {
+      deck = await invoke<DeckSnapshot>('update_shape_style', {
+        slideId: activeSlide.id,
+        shapeIndex: selectedShapeIndex,
+        style: update(selectedGeometric.style),
+      })
+    } catch (error) {
+      reportActionError('Could not update the shape style', error)
+    }
+  }
+
+  /** Updates one position or size field through the existing transform command. */
+  function updateSelectedFrame(
+    field: 'x' | 'y' | 'width' | 'height',
+    value: number,
+  ): void {
+    if (!selectedShapeFrame || selectedShapeIndex === null || !activeSlide || !Number.isFinite(value)) {
+      return
+    }
+    const frame = { ...selectedShapeFrame, [field]: Math.max(0, value) }
+    if (field === 'width' || field === 'height') frame[field] = Math.max(76_200, value)
+    const shape = activeSlide.shapes[selectedShapeIndex]
+    if (!shape) return
+    void handleUpdateShapeTransform({
+      shapeIndex: selectedShapeIndex,
+      transform: { frame, rotation: shapeRotationOf(shape) },
     })
   }
 
   /** Nudges the selected shape by the given EMU delta. */
+  const EMU_PER_CSS_PIXEL = 9_525
+
   async function nudgeSelected(dxEmu: number, dyEmu: number): Promise<void> {
     if (selectedShapeIndex === null || !activeSlide) return
     const shape = activeSlide.shapes[selectedShapeIndex]
@@ -860,8 +1005,8 @@
   async function deleteSelectedShape(): Promise<void> {
     if (selectedShapeIndex === null || !activeSlide) return
     deck = await invoke<DeckSnapshot>('delete_shape', {
-      slide_id: activeSlide.id,
-      shape_index: selectedShapeIndex,
+      slideId: activeSlide.id,
+      shapeIndex: selectedShapeIndex,
     })
     selectedShapeIndex = null
     editingShapeIndex = null
@@ -876,13 +1021,20 @@
   /** Inserts a new blank slide after the active one and selects it. */
   async function onNewSlide(): Promise<void> {
     if (!deck) return
-    deck = await invoke<DeckSnapshot>('new_slide', { after_index: activeIndex })
-    activeIndex = Math.min(activeIndex + 1, (deck?.slides.length ?? 1) - 1)
-    a11ySelectedShapeIndex = null
+    try {
+      deck = await invoke<DeckSnapshot>('new_slide', { afterIndex: activeIndex })
+      activeIndex = Math.min(activeIndex + 1, (deck?.slides.length ?? 1) - 1)
+      a11ySelectedShapeIndex = null
+      selectedShapeIndex = null
+      editingShapeIndex = null
+    } catch (error) {
+      reportActionError('Could not create a new slide', error)
+    }
   }
 
   /** Arms text-box creation mode: the next click on the canvas places a box. */
   function enterCreateTextBox(): void {
+    creatingShapeKind = null
     creatingTextBox = true
   }
 
@@ -918,28 +1070,31 @@
     return { x, y, w, h }
   }
 
-  /** Places a new text box at the click position, selects it, and focuses its
-   *  editor so the user can start typing immediately. */
+  /** Places a new text box at the click position, selects it, and enters
+   *  edit mode so the user can start typing immediately. */
   async function onCanvasClickCreateTextBox(event: MouseEvent): Promise<void> {
     const frame = textBoxFrameFromClick(event)
     creatingTextBox = false
     if (!frame || !activeSlide) return
-    deck = await invoke<DeckSnapshot>('add_text_box', {
-      slide_id: activeSlide.id,
-      x: frame.x,
-      y: frame.y,
-      width: frame.w,
-      height: frame.h,
-    })
-    // The new box is the last shape on the active slide; focus its textarea.
-    const newIndex = (deck?.slides[activeIndex]?.shapes.length ?? 0) - 1
-    selectedShapeIndex = newIndex
-    editingShapeIndex = newIndex
-    await tick()
-    const ta = document.querySelector<HTMLTextAreaElement>(
-      `textarea.text-box[data-shape-index="${newIndex}"]`,
-    )
-    ta?.focus()
+    try {
+      deck = await invoke<DeckSnapshot>('add_text_box', {
+        slideId: activeSlide.id,
+        x: frame.x,
+        y: frame.y,
+        width: frame.w,
+        height: frame.h,
+      })
+      const newIndex = (deck?.slides[activeIndex]?.shapes.length ?? 0) - 1
+      selectedShapeIndex = newIndex
+      editingShapeIndex = newIndex
+      await tick()
+      const ta = document.querySelector<HTMLTextAreaElement>(
+        `textarea.text-box[data-shape-index="${newIndex}"]`,
+      )
+      ta?.focus()
+    } catch (e) {
+      reportActionError('Could not create the text box', e)
+    }
   }
 
   /** Dispatches a native menu-event id to the matching editor action. */
@@ -1039,7 +1194,7 @@
     if (!activeSlide) return
     showTablePicker = false
     deck = await invoke<DeckSnapshot>('add_table', {
-      slide_id: activeSlide.id,
+      slideId: activeSlide.id,
       rows,
       cols,
     })
@@ -1054,8 +1209,8 @@
     text: string
   }): Promise<void> {
     deck = await invoke<DeckSnapshot>('set_cell_text', {
-      slide_id: detail.slideId,
-      shape_index: detail.shapeIndex,
+      slideId: detail.slideId,
+      shapeIndex: detail.shapeIndex,
       row: detail.row,
       col: detail.col,
       text: detail.text,
@@ -1071,8 +1226,8 @@
   async function onInsertRow(): Promise<void> {
     if (!activeSlide || !activeCell) return
     deck = await invoke<DeckSnapshot>('insert_row', {
-      slide_id: activeSlide.id,
-      shape_index: activeCell.shapeIndex,
+      slideId: activeSlide.id,
+      shapeIndex: activeCell.shapeIndex,
       index: activeCell.row + 1,
     })
   }
@@ -1081,8 +1236,8 @@
   async function onInsertColumn(): Promise<void> {
     if (!activeSlide || !activeCell) return
     deck = await invoke<DeckSnapshot>('insert_column', {
-      slide_id: activeSlide.id,
-      shape_index: activeCell.shapeIndex,
+      slideId: activeSlide.id,
+      shapeIndex: activeCell.shapeIndex,
       index: activeCell.col + 1,
     })
   }
@@ -1091,8 +1246,8 @@
   async function onDeleteRow(): Promise<void> {
     if (!activeSlide || !activeCell) return
     deck = await invoke<DeckSnapshot>('delete_row', {
-      slide_id: activeSlide.id,
-      shape_index: activeCell.shapeIndex,
+      slideId: activeSlide.id,
+      shapeIndex: activeCell.shapeIndex,
       index: activeCell.row,
     })
   }
@@ -1101,8 +1256,8 @@
   async function onDeleteColumn(): Promise<void> {
     if (!activeSlide || !activeCell) return
     deck = await invoke<DeckSnapshot>('delete_column', {
-      slide_id: activeSlide.id,
-      shape_index: activeCell.shapeIndex,
+      slideId: activeSlide.id,
+      shapeIndex: activeCell.shapeIndex,
       index: activeCell.col,
     })
   }
@@ -1112,8 +1267,8 @@
     if (!activeSlide) return
     showChartDropdown = false
     deck = await invoke<DeckSnapshot>('add_chart', {
-      slide_id: activeSlide.id,
-      chart_type: chartType,
+      slideId: activeSlide.id,
+      chartType: chartType,
     })
   }
 
@@ -1137,8 +1292,8 @@
       // longer matches the chart's current type, the backend command also
       // switches the type to a sensible default, after which we can refine it.
       deck = await invoke<DeckSnapshot>('set_chart_data', {
-        slide_id: detail.slideId,
-        shape_index: detail.shapeIndex,
+        slideId: detail.slideId,
+        shapeIndex: detail.shapeIndex,
         data: detail.data,
       })
 
@@ -1147,15 +1302,15 @@
         updated && updated.kind === 'chart' ? (updated.value as ChartShapeSnapshot).chartType : null
       if (updatedType && updatedType !== detail.chartType) {
         deck = await invoke<DeckSnapshot>('set_chart_type', {
-          slide_id: detail.slideId,
-          shape_index: detail.shapeIndex,
-          chart_type: detail.chartType,
+          slideId: detail.slideId,
+          shapeIndex: detail.shapeIndex,
+          chartType: detail.chartType,
         })
       }
 
       deck = await invoke<DeckSnapshot>('set_chart_title', {
-        slide_id: detail.slideId,
-        shape_index: detail.shapeIndex,
+        slideId: detail.slideId,
+        shapeIndex: detail.shapeIndex,
         title: detail.title,
       })
     } catch (err) {
@@ -1168,9 +1323,9 @@
   async function onSetTransition(kind: TransitionKindDto, durationMs: number): Promise<void> {
     if (!activeSlide) return
     deck = await invoke<DeckSnapshot>('set_transition', {
-      slide_id: activeSlide.id,
+      slideId: activeSlide.id,
       kind: kind === 'none' ? null : kind,
-      duration_ms: durationMs,
+      durationMs,
     })
   }
 
@@ -1178,8 +1333,8 @@
   async function onSetSlideLayout(layoutName: string): Promise<void> {
     if (!activeSlide) return
     deck = await invoke<DeckSnapshot>('set_slide_layout', {
-      slide_id: activeSlide.id,
-      layout_name: layoutName === '' ? null : layoutName,
+      slideId: activeSlide.id,
+      layoutName: layoutName === '' ? null : layoutName,
     })
   }
 
@@ -1230,13 +1385,13 @@
   async function onSetAspectRatio(ratio: '16:9' | '4:3' | '16:10' | 'default'): Promise<void> {
     const slideSizePayload =
       ratio === 'default' ? null : { ...ASPECT_PRESETS[ratio] }
-    deck = await invoke<DeckSnapshot>('set_slide_size', { slide_size: slideSizePayload })
+    deck = await invoke<DeckSnapshot>('set_slide_size', { slideSize: slideSizePayload })
   }
 
   /** Toggles the deck's high-contrast accessibility theme. */
   async function toggleHighContrast(): Promise<void> {
     deck = await invoke<DeckSnapshot>('set_high_contrast', {
-      high_contrast: !highContrast,
+      highContrast: !highContrast,
     })
   }
 
@@ -1244,8 +1399,8 @@
   async function handleSetRichNotes(paragraphs: ParagraphDto[] | null): Promise<void> {
     if (!activeSlide) return
     deck = await invoke<DeckSnapshot>('set_rich_notes', {
-      slide_id: activeSlide.id,
-      rich_notes: paragraphs,
+      slideId: activeSlide.id,
+      richNotes: paragraphs,
     })
   }
 
@@ -1331,9 +1486,10 @@
       target instanceof HTMLTextAreaElement ||
       (target?.isContentEditable ?? false)
 
-    if (creatingTextBox && event.key === 'Escape') {
+    if ((creatingTextBox || creatingShapeKind) && event.key === 'Escape') {
       event.preventDefault()
       cancelCreateTextBox()
+      creatingShapeKind = null
       return
     }
 
@@ -1352,7 +1508,9 @@
       event.preventDefault()
       showComments = !showComments
     } else if (!typing && selectedShapeIndex !== null) {
-      const step = event.shiftKey ? 10 : 1
+      // OOXML uses 9,525 EMU per CSS pixel. A 1/10 EMU nudge is invisible;
+      // retain the familiar one-pixel and ten-pixel keyboard increments.
+      const step = (event.shiftKey ? 10 : 1) * EMU_PER_CSS_PIXEL
       if (event.key === 'Delete' || event.key === 'Backspace') {
         event.preventDefault()
         void deleteSelectedShape()
@@ -1721,6 +1879,12 @@
         <button onclick={() => (exportError = '')} type="button">Dismiss</button>
       </div>
     {/if}
+    {#if actionError}
+      <div class="banner action-error" role="alert">
+        <strong>Editor action failed:</strong> {actionError}
+        <button onclick={() => (actionError = '')} type="button">Dismiss</button>
+      </div>
+    {/if}
 
     {#if showWarnings && warnings.length > 0}
       <div class="banner" role="alert">
@@ -1731,13 +1895,6 @@
           {/each}
         </ul>
         <button onclick={() => (showWarnings = false)} type="button">Dismiss</button>
-      </div>
-    {/if}
-
-    {#if creatingTextBox}
-      <div class="banner banner-info" role="status">
-        <strong>Text box:</strong> click on the slide to place it.
-        <button onclick={cancelCreateTextBox} type="button">Cancel (Esc)</button>
       </div>
     {/if}
 
@@ -1801,12 +1958,16 @@
               Add Section
             </button>
           </div>
+          <button class="add-slide-btn" type="button" onclick={onNewSlide} title="New slide">
+            + Slide
+          </button>
         {/if}
       </aside>
 
       <main
         class="canvas-area"
         class:text-box-mode={creatingTextBox}
+        class:shape-mode={creatingShapeKind !== null}
         bind:this={canvasAreaEl}
         aria-label="Editor canvas"
       >
@@ -1816,10 +1977,15 @@
             background={deck.theme.background}
             media={deck.media}
             slideSize={slideSize}
+            scale={canvasScale}
             highContrast={highContrast}
             selectedShapeIndex={canvasSelectedShapeIndex}
             {editingShapeIndex}
             placeholderGuides={activeLayoutPlaceholders}
+            {creatingTextBox}
+            creatingShapeKind={creatingShapeKind}
+            onPlaceTextBox={onCanvasClickCreateTextBox}
+            {onPlaceShape}
             onEditTextBox={handleTextEdit}
             onSetCellText={handleSetCellText}
             onCellFocus={handleCellFocus}
@@ -1830,21 +1996,43 @@
             onShapeContextMenu={handleShapeContextMenu}
             onCommentOnSelection={handleCommentOnSelection}
           />
-          {#if creatingTextBox}
-            <button
-              class="text-box-catcher"
-              type="button"
-              aria-label="Click to place a text box"
-              onclick={onCanvasClickCreateTextBox}
-            ></button>
-          {/if}
         {:else}
           <div class="empty-canvas">Open or create a deck to start editing.</div>
         {/if}
       </main>
 
-      <aside class="right-panel" aria-label="Notes and animation">
+      <aside class="right-panel" aria-label="Inspector, notes and animation">
         <div class="tab-bar" role="tablist">
+          <button
+            class="tab"
+            class:active={rightPanelTab === 'style'}
+            onclick={() => (rightPanelTab = 'style')}
+            type="button"
+            role="tab"
+            aria-selected={rightPanelTab === 'style'}
+          >
+            Style
+          </button>
+          <button
+            class="tab"
+            class:active={rightPanelTab === 'text'}
+            onclick={() => (rightPanelTab = 'text')}
+            type="button"
+            role="tab"
+            aria-selected={rightPanelTab === 'text'}
+          >
+            Text
+          </button>
+          <button
+            class="tab"
+            class:active={rightPanelTab === 'arrange'}
+            onclick={() => (rightPanelTab = 'arrange')}
+            type="button"
+            role="tab"
+            aria-selected={rightPanelTab === 'arrange'}
+          >
+            Arrange
+          </button>
           <button
             class="tab"
             class:active={rightPanelTab === 'notes'}
@@ -1867,7 +2055,152 @@
           </button>
         </div>
 
-        {#if rightPanelTab === 'notes'}
+        {#if rightPanelTab === 'style'}
+          <div class="panel-content" role="tabpanel">
+            {#if selectedGeometric}
+              <div class="section">
+                <h3>Shape style</h3>
+                <label class="field">
+                  Fill
+                  <input
+                    type="color"
+                    value={colorToHex(selectedGeometric.style.fill?.solid ?? deck!.theme.accentColor)}
+                    onchange={(event) => {
+                      const color = colorFromHex(
+                        (event.target as HTMLInputElement).value,
+                        selectedGeometric!.style.fill?.solid?.a ?? 255,
+                      )
+                      void updateSelectedGeometryStyle((style) => ({
+                        ...style,
+                        fill: { solid: color },
+                      }))
+                    }}
+                  />
+                </label>
+                <label class="field">
+                  Outline
+                  <input
+                    type="color"
+                    value={colorToHex(selectedGeometric.style.outline?.color ?? { r: 0, g: 0, b: 0, a: 255 })}
+                    onchange={(event) => {
+                      const color = colorFromHex((event.target as HTMLInputElement).value)
+                      void updateSelectedGeometryStyle((style) => ({
+                        ...style,
+                        outline: {
+                          color,
+                          widthEmu: style.outline?.widthEmu ?? 9_525,
+                          dash: style.outline?.dash ?? 'solid',
+                        },
+                      }))
+                    }}
+                  />
+                </label>
+                <label class="field">
+                  Outline width
+                  <input
+                    type="range"
+                    min="0"
+                    max="76200"
+                    step="9525"
+                    value={selectedGeometric.style.outline?.widthEmu ?? 0}
+                    onchange={(event) => {
+                      const widthEmu = Number((event.target as HTMLInputElement).value)
+                      void updateSelectedGeometryStyle((style) => ({
+                        ...style,
+                        outline: widthEmu > 0
+                          ? {
+                              color: style.outline?.color ?? { r: 0, g: 0, b: 0, a: 255 },
+                              widthEmu,
+                              dash: style.outline?.dash ?? 'solid',
+                            }
+                          : undefined,
+                      }))
+                    }}
+                  />
+                </label>
+                <label class="field">
+                  Opacity: {Math.round((selectedGeometric.style.fill?.solid?.a ?? 255) / 2.55)}%
+                  <input
+                    type="range"
+                    min="0"
+                    max="255"
+                    value={selectedGeometric.style.fill?.solid?.a ?? 255}
+                    onchange={(event) => {
+                      const alpha = Number((event.target as HTMLInputElement).value)
+                      void updateSelectedGeometryStyle((style) => ({
+                        ...style,
+                        fill: {
+                          solid: {
+                            ...(style.fill?.solid ?? deck!.theme.accentColor),
+                            a: alpha,
+                          },
+                        },
+                      }))
+                    }}
+                  />
+                </label>
+                <label class="check-field">
+                  <input
+                    type="checkbox"
+                    checked={selectedGeometric.style.shadow !== undefined}
+                    onchange={(event) => {
+                      const enabled = (event.target as HTMLInputElement).checked
+                      void updateSelectedGeometryStyle((style) => ({
+                        ...style,
+                        shadow: enabled
+                          ? (style.shadow ?? {
+                              offsetX: 28_575,
+                              offsetY: 28_575,
+                              blur: 38_100,
+                              color: { r: 0, g: 0, b: 0, a: 255 },
+                              opacity: 0.25,
+                            })
+                          : undefined,
+                      }))
+                    }}
+                  />
+                  Shadow
+                </label>
+              </div>
+            {:else}
+              <p class="placeholder">Select a geometric shape to edit its fill, outline, opacity, and shadow.</p>
+            {/if}
+          </div>
+        {:else if rightPanelTab === 'text'}
+          <div class="panel-content" role="tabpanel">
+            {#if selectedShapeIndex !== null && activeSlide?.shapes[selectedShapeIndex]?.kind === 'text_box'}
+              <div class="section">
+                <h3>Text formatting</h3>
+                <div class="inspector-actions">
+                  <button class="tb-btn tb-text" type="button" onclick={() => toggleRunFlag('bold')}>B</button>
+                  <button class="tb-btn tb-text" type="button" onclick={() => toggleRunFlag('italic')}><em>I</em></button>
+                  <button class="tb-btn tb-text" type="button" onclick={() => toggleRunFlag('underline')}><u>U</u></button>
+                  <button class="tb-btn tb-text" type="button" onclick={() => toggleRunFlag('strikethrough')}><s>S</s></button>
+                </div>
+                <p class="helper-copy">Double-click the box to edit its text. These controls apply to the active run while editing, or to the selected text box otherwise.</p>
+              </div>
+            {:else}
+              <p class="placeholder">Select a text box to format its text.</p>
+            {/if}
+          </div>
+        {:else if rightPanelTab === 'arrange'}
+          <div class="panel-content" role="tabpanel">
+            {#if selectedShapeFrame}
+              <div class="section">
+                <h3>Position and size</h3>
+                <div class="arrange-grid">
+                  <label class="field">X<input type="number" value={Math.round(selectedShapeFrame.x)} onchange={(event) => updateSelectedFrame('x', Number((event.target as HTMLInputElement).value))} /></label>
+                  <label class="field">Y<input type="number" value={Math.round(selectedShapeFrame.y)} onchange={(event) => updateSelectedFrame('y', Number((event.target as HTMLInputElement).value))} /></label>
+                  <label class="field">Width<input type="number" min="76200" value={Math.round(selectedShapeFrame.width)} onchange={(event) => updateSelectedFrame('width', Number((event.target as HTMLInputElement).value))} /></label>
+                  <label class="field">Height<input type="number" min="76200" value={Math.round(selectedShapeFrame.height)} onchange={(event) => updateSelectedFrame('height', Number((event.target as HTMLInputElement).value))} /></label>
+                </div>
+                <p class="helper-copy">Drag selected objects on the canvas or use the eight handles to resize them.</p>
+              </div>
+            {:else}
+              <p class="placeholder">Select an object to move or resize it.</p>
+            {/if}
+          </div>
+        {:else if rightPanelTab === 'notes'}
           <div class="panel-content" role="tabpanel">
             {#if activeRichNotes}
               <RichNotesEditor
@@ -2050,21 +2383,27 @@
 <style>
   :global(body) {
     margin: 0;
-    font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    color: #202636;
+    background: #e9edf5;
   }
   .app {
     display: flex;
     flex-direction: column;
     height: 100vh;
+    min-width: 860px;
+    background: #f7f8fb;
   }
   .toolbar {
     display: flex;
     align-items: center;
     gap: 0.35rem;
-    padding: 0.3rem 0.5rem;
-    border-bottom: 1px solid #ccc;
-    background: #f4f4f4;
-    flex-wrap: wrap;
+    min-height: 44px;
+    padding: 0.38rem 0.65rem;
+    border-bottom: 1px solid #d7dce7;
+    background: #ffffff;
+    box-shadow: 0 1px 2px rgba(27, 39, 65, 0.05);
+    flex-wrap: nowrap;
   }
   .tb-group {
     display: flex;
@@ -2088,9 +2427,9 @@
     height: 30px;
     padding: 0 0.4rem;
     background: #fff;
-    border: 1px solid #d0d0d0;
-    border-radius: 4px;
-    color: #333;
+    border: 1px solid #d8deea;
+    border-radius: 5px;
+    color: #273043;
     cursor: pointer;
     line-height: 1;
   }
@@ -2141,8 +2480,8 @@
     align-items: center;
     gap: 0.35rem;
     padding: 0.25rem 0.5rem;
-    border-bottom: 1px solid #ccc;
-    background: #ededed;
+    border-bottom: 1px solid #d7dce7;
+    background: #f7f8fb;
     flex-wrap: wrap;
   }
   .shape-picker-wrap {
@@ -2294,9 +2633,10 @@
     background: #d1ecf1;
     border-bottom-color: #9ecfe0;
   }
-  .banner-info {
-    background: #e7f3ff;
-    border-bottom-color: #b9d8f5;
+  .action-error {
+    background: #fff0f1;
+    border-bottom-color: #efb7bd;
+    color: #7b1f2a;
   }
   .workspace {
     display: flex;
@@ -2304,11 +2644,27 @@
     overflow: hidden;
   }
   .sidebar {
-    width: 180px;
+    width: 196px;
     overflow-y: auto;
-    border-right: 1px solid #ccc;
-    background: #fafafa;
+    border-right: 1px solid #d7dce7;
+    background: #f5f7fb;
+    padding: 0.65rem;
+  }
+  .add-slide-btn {
+    display: block;
+    width: 100%;
+    margin-top: 0.5rem;
     padding: 0.5rem;
+    border: 1px solid #b9c8e2;
+    background: #ffffff;
+    color: #1f5ca8;
+    border-radius: 5px;
+    cursor: pointer;
+    font-size: 0.85rem;
+  }
+  .add-slide-btn:hover {
+    background: #e8e8e8;
+    border-color: #666;
   }
   .canvas-area {
     flex: 1;
@@ -2316,50 +2672,44 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    background: #e0e0e0;
+    background: linear-gradient(135deg, #e9edf5, #dce3ef);
     overflow: auto;
   }
-  .canvas-area.text-box-mode {
-    cursor: crosshair;
-  }
-  .text-box-catcher {
-    position: absolute;
-    inset: 0;
-    z-index: 40;
-    background: transparent;
-    border: none;
-    padding: 0;
+  .canvas-area.text-box-mode,
+  .canvas-area.shape-mode {
     cursor: crosshair;
   }
   .empty-canvas {
     color: #666;
   }
   .right-panel {
-    width: 240px;
-    border-left: 1px solid #ccc;
-    background: #fafafa;
+    width: 252px;
+    border-left: 1px solid #d7dce7;
+    background: #f8f9fc;
     display: flex;
     flex-direction: column;
     overflow: hidden;
   }
   .tab-bar {
-    display: flex;
-    border-bottom: 1px solid #ccc;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    border-bottom: 1px solid #d7dce7;
   }
   .tab {
-    flex: 1;
-    padding: 0.5rem;
-    background: #f0f0f0;
+    min-width: 0;
+    padding: 0.48rem 0.25rem;
+    background: #f1f4f9;
     border: none;
-    border-right: 1px solid #ccc;
+    border-right: 1px solid #dce2ec;
     cursor: pointer;
   }
   .tab:last-child {
     border-right: none;
   }
   .tab.active {
-    background: #fafafa;
-    font-weight: bold;
+    background: #ffffff;
+    color: #145ca8;
+    font-weight: 700;
   }
   .panel-content {
     flex: 1;
@@ -2390,6 +2740,30 @@
   .field select {
     padding: 0.25rem;
     font-size: 0.85rem;
+  }
+  .check-field {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    font-size: 0.85rem;
+  }
+  .inspector-actions {
+    display: flex;
+    gap: 0.35rem;
+  }
+  .arrange-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.45rem;
+  }
+  .arrange-grid .field {
+    min-width: 0;
+  }
+  .helper-copy {
+    margin: 0.55rem 0 0;
+    color: #677084;
+    font-size: 0.78rem;
+    line-height: 1.4;
   }
   .placeholder {
     color: #888;

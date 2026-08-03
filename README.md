@@ -122,12 +122,14 @@ prerequisites are installed.
 
 1. Choose **New** to start from one of the six built-in templates, or **Open**
    to load an existing `.pptx` or `.odp` file.
-2. Click a text box on the canvas and start typing. Edits flow to the Rust
-   backend on each change and the canvas re-renders from the returned
-   snapshot; undo with the toolbar button.
-3. Insert an image from the toolbar (sanitized on the way in) or add a
-   geometric shape from the shape menu. Images and shapes render on the canvas
-   and can be moved and restyled.
+2. Choose **Text Box** from the toolbar or Insert menu, then click the canvas
+   to place one. To edit an existing text box, select it and press Enter or
+   double-click it. Edits flow to the Rust backend on each change and the
+   canvas re-renders from the returned snapshot; undo with the toolbar button.
+3. Insert an image from the toolbar (sanitized on the way in), or choose
+   **Shape** and a geometry from the picker. Click the canvas for a default
+   shape, or click-drag to place it at explicit bounds. Images and shapes render
+   on the canvas and can be moved and restyled.
 4. Insert a table from the toolbar and click cells to edit, or insert a chart
    and double-click it to edit its data. Content 900Slides cannot yet edit
    (e.g. SmartArt) appears as a labelled placeholder — preserved on save but

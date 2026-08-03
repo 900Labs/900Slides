@@ -16,6 +16,9 @@ pub const REL_TYPE_THEME: &str =
 /// Relationship type for slide parts.
 pub const REL_TYPE_SLIDE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide";
+/// Relationship type for the slide layout applied to a slide.
+pub const REL_TYPE_SLIDE_LAYOUT: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout";
 /// Relationship type for notes slide parts.
 pub const REL_TYPE_NOTES_SLIDE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide";

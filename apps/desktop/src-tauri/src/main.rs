@@ -37,14 +37,6 @@ fn main() {
                 true,
                 &[&export_svg_item, &export_png_item, &export_pdf_item],
             )?;
-            let close_item = MenuItem::with_id(
-                app,
-                "menu_close",
-                "Close Window",
-                true,
-                Some("CmdOrCtrl+W"),
-            )?;
-
             let file_menu = Submenu::with_items(
                 app,
                 "File",
@@ -55,8 +47,6 @@ fn main() {
                     &save_item,
                     &save_as_item,
                     &export_sub,
-                    &PredefinedMenuItem::separator(app)?,
-                    &close_item,
                 ],
             )?;
 
@@ -69,13 +59,6 @@ fn main() {
                 true,
                 Some("CmdOrCtrl+Shift+Z"),
             )?;
-            let cut_item = MenuItem::with_id(app, "menu_cut", "Cut", true, Some("CmdOrCtrl+X"))?;
-            let copy_item =
-                MenuItem::with_id(app, "menu_copy", "Copy", true, Some("CmdOrCtrl+C"))?;
-            let paste_item =
-                MenuItem::with_id(app, "menu_paste", "Paste", true, Some("CmdOrCtrl+V"))?;
-            let duplicate_item =
-                MenuItem::with_id(app, "menu_duplicate", "Duplicate", true, Some("CmdOrCtrl+D"))?;
             let find_item =
                 MenuItem::with_id(app, "menu_find", "Find…", true, Some("CmdOrCtrl+F"))?;
             let find_replace_item = MenuItem::with_id(
@@ -93,11 +76,6 @@ fn main() {
                 &[
                     &undo_item,
                     &redo_item,
-                    &PredefinedMenuItem::separator(app)?,
-                    &cut_item,
-                    &copy_item,
-                    &paste_item,
-                    &duplicate_item,
                     &PredefinedMenuItem::separator(app)?,
                     &find_item,
                     &find_replace_item,
@@ -162,14 +140,12 @@ fn main() {
                 true,
                 Some("CmdOrCtrl+Return"),
             )?;
-            let rehearse_item =
-                MenuItem::with_id(app, "menu_rehearse", "Rehearse Timings", true, None::<&str>)?;
 
             let slideshow_menu = Submenu::with_items(
                 app,
                 "Slide Show",
                 true,
-                &[&present_item, &rehearse_item],
+                &[&present_item],
             )?;
 
             let shortcuts_item = MenuItem::with_id(
@@ -179,19 +155,23 @@ fn main() {
                 true,
                 Some("CmdOrCtrl+?"),
             )?;
-            let about_item =
-                MenuItem::with_id(app, "menu_about", "About 900Slides", true, None::<&str>)?;
-
             let help_menu = Submenu::with_items(
                 app,
                 "Help",
                 true,
-                &[&shortcuts_item, &about_item],
+                &[&shortcuts_item],
             )?;
 
             let menu = Menu::with_items(
                 app,
-                &[&file_menu, &edit_menu, &insert_menu, &format_menu, &slideshow_menu, &help_menu],
+                &[
+                    &file_menu,
+                    &edit_menu,
+                    &insert_menu,
+                    &format_menu,
+                    &slideshow_menu,
+                    &help_menu,
+                ],
             )?;
             app.set_menu(menu)?;
 
@@ -206,13 +186,6 @@ fn main() {
         })
         .manage(commands::AppState::new())
         .plugin(tauri_plugin_dialog::init())
-        .setup(|app| {
-            // Load any persisted user-dictionary words into the spell checker
-            // before the UI is interactive. Missing file -> empty user dict.
-            let state = app.state::<commands::AppState>();
-            state.load_user_dictionary();
-            Ok(())
-        })
         .invoke_handler(tauri::generate_handler![
             commands::new_deck,
             commands::open_deck,

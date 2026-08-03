@@ -48,7 +48,7 @@
     const shapeCount = slide.shapes.length
     let cancelled = false
     svg = null
-    invoke<string>('render_slide_svg', { slide_id: id })
+    invoke<string>('render_slide_svg', { slideId: id })
       .then((markup) => {
         if (!cancelled && slide.id === id && slide.shapes.length === shapeCount) {
           svg = markup

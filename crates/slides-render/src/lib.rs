@@ -454,6 +454,12 @@ fn push_style(out: &mut String, style: &Style) {
         Some(Fill::Solid(color)) => {
             let fill = hex_color(color);
             out.push_str(&format!(" fill=\"{fill}\""));
+            if color.a < 255 {
+                out.push_str(&format!(
+                    " fill-opacity=\"{}\"",
+                    fnum(color.a as f64 / 255.0)
+                ));
+            }
         }
         None => out.push_str(" fill=\"none\""),
     }
@@ -843,11 +849,13 @@ fn render_geometry(
             out.push_str("/>");
         }
         Geometry::Line => {
-            // Horizontal line across the frame at its vertical center.
-            let x1 = fnum(frame.x);
-            let y1 = fnum(cy);
-            let x2 = fnum(frame.x + frame.width);
-            let y2 = fnum(cy);
+            // Line creation uses a local horizontal surface and records its
+            // user-drawn direction in the shape transform rotation.
+            let (x1, y1, x2, y2) = (frame.x, cy, frame.x + frame.width, cy);
+            let x1 = fnum(x1);
+            let y1 = fnum(y1);
+            let x2 = fnum(x2);
+            let y2 = fnum(y2);
             out.push_str(&format!(
                 "<line x1=\"{x1}\" y1=\"{y1}\" x2=\"{x2}\" y2=\"{y2}\""
             ));
@@ -1367,6 +1375,53 @@ mod tests {
         let out = render(&slide);
         assert!(out.svg.contains("<rect "));
         assert!(out.svg.contains("fill=\"#ff0000\""));
+    }
+
+    #[test]
+    fn translucent_shape_fill_emits_svg_opacity() {
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::Geometric(GeometricShape {
+            id: String::new(),
+            transform: Transform {
+                frame: rect(0.0, 0.0, 1_000_000.0, 1_000_000.0),
+                rotation: 0.0,
+            },
+            geometry: Geometry::Rectangle,
+            style: Style {
+                fill: Some(Fill::Solid(Color {
+                    r: 20,
+                    g: 40,
+                    b: 60,
+                    a: 128,
+                })),
+                outline: None,
+                shadow: None,
+            },
+        }));
+
+        let out = render(&slide);
+        assert!(out.svg.contains("fill=\"#14283c\""));
+        assert!(out.svg.contains("fill-opacity=\"0.5019607843137255\""));
+    }
+
+    #[test]
+    fn thin_vertical_line_renders_on_its_vertical_axis() {
+        let mut slide = slides_core::Slide::default();
+        slide.shapes.push(Shape::Geometric(GeometricShape {
+            id: String::new(),
+            transform: Transform {
+                frame: rect(100_000.0, 200_000.0, 800_000.0, 76_200.0),
+                rotation: 90.0,
+            },
+            geometry: Geometry::Line,
+            style: Style::default(),
+        }));
+
+        let out = render(&slide);
+        assert!(out
+            .svg
+            .contains("<line x1=\"100000\" y1=\"238100\" x2=\"900000\" y2=\"238100\""));
+        assert!(out.svg.contains("transform=\"rotate(90,500000,238100)\""));
     }
 
     #[test]

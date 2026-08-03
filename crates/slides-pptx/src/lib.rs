@@ -73,8 +73,8 @@ pub fn version() -> &'static str {
 /// The package contains the required OOXML parts for PowerPoint to open it:
 /// `[Content_Types].xml`, `_rels/.rels`, `ppt/presentation.xml`,
 /// `ppt/_rels/presentation.xml.rels`, `ppt/slides/slide1.xml`,
-/// `ppt/theme/theme1.xml`, and a 900Slides custom XML manifest.
-/// The single slide contains one empty text box.
+/// `ppt/theme/theme1.xml`, a blank slide layout, and a 900Slides custom XML
+/// manifest.
 pub fn create_blank_pptx() -> Vec<u8> {
     let mut buf = std::io::Cursor::new(Vec::new());
     {
@@ -107,6 +107,20 @@ pub fn create_blank_pptx() -> Vec<u8> {
         writer.start_file("ppt/slides/slide1.xml", options).unwrap();
         writer.write_all(blank_slide1_xml().as_bytes()).unwrap();
 
+        writer
+            .start_file("ppt/slides/_rels/slide1.xml.rels", options)
+            .unwrap();
+        writer
+            .write_all(blank_slide1_rels_xml().as_bytes())
+            .unwrap();
+
+        writer
+            .start_file("ppt/slideLayouts/slideLayout1.xml", options)
+            .unwrap();
+        writer
+            .write_all(blank_slide_layout_xml().as_bytes())
+            .unwrap();
+
         writer.start_file("ppt/theme/theme1.xml", options).unwrap();
         writer.write_all(blank_theme_xml().as_bytes()).unwrap();
 
@@ -126,6 +140,7 @@ fn blank_content_types_xml() -> String {
   <Default Extension="xml" ContentType="application/xml"/>
   <Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>
   <Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>
+  <Override PartName="/ppt/slideLayouts/slideLayout1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml"/>
   <Override PartName="/ppt/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>
   <Override PartName="/customXml/item1.xml" ContentType="{CT_MANIFEST}"/>
 </Types>"#
@@ -177,6 +192,23 @@ fn blank_slide1_xml() -> String {
     </p:spTree>
   </p:cSld>
 </p:sld>"#
+    )
+}
+
+fn blank_slide1_rels_xml() -> String {
+    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>
+</Relationships>"#
+        .to_string()
+}
+
+fn blank_slide_layout_xml() -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sldLayout xmlns:p="{P_NS}" xmlns:a="{A_NS}" xmlns:r="{R_NS}" type="blank" preserve="1">
+  <p:cSld name="Blank"><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/></p:spTree></p:cSld>
+</p:sldLayout>"#
     )
 }
 

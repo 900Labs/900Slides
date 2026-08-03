@@ -144,7 +144,9 @@ impl Session {
 
     /// Marks a slide as dirty so its XML will be regenerated on save.
     pub fn mark_slide_dirty(&mut self, slide_id: &str) {
-        if self.slide_paths.contains_key(slide_id) {
+        // New slides do not have an OOXML part path until the first save. They
+        // are still dirty model state and must be emitted by the saver.
+        if self.deck.slide(slide_id).is_some() {
             self.dirty_slides.insert(slide_id.to_string());
         }
     }
@@ -231,6 +233,7 @@ impl Session {
                     self.mark_slide_dirty(&id);
                 }
             }
+            self.dirty_slides.retain(|id| self.deck.slide(id).is_some());
             true
         } else {
             false
@@ -249,6 +252,7 @@ impl Session {
                     self.mark_slide_dirty(&id);
                 }
             }
+            self.dirty_slides.retain(|id| self.deck.slide(id).is_some());
             true
         } else {
             false
@@ -262,10 +266,67 @@ impl Session {
 
     /// Commits a successful save by replacing the original bytes and clearing
     /// the dirty slide set.
-    pub fn commit_save(&mut self, new_bytes: Vec<u8>) {
+    ///
+    /// A saved inserted slide has a newly assigned package part path. Reload
+    /// the package metadata and map it back onto the current in-memory slide
+    /// ids by deck order so a later edit in the same session is saved again
+    /// instead of being treated as an unpersistable new slide.
+    pub fn commit_save(&mut self, new_bytes: Vec<u8>) -> Result<()> {
+        let loaded = crate::load::load(&new_bytes)?;
+        let content_types =
+            crate::load::open_and_validate(&new_bytes).and_then(|mut archive| {
+                let xml = crate::load::read_entry_to_string(&mut archive, "[Content_Types].xml")?;
+                crate::package::parse_content_types(&xml)
+            })?;
+        if loaded.deck.slides.len() != self.deck.slides.len() {
+            return Err(crate::error::Error::Save(
+                "saved package reopened with a different slide count; refusing to discard dirty state"
+                    .to_string(),
+            ));
+        }
+        let mut slide_paths = HashMap::new();
+        let mut slide_media_rids = HashMap::new();
+        let mut chart_source_parts = HashMap::new();
+        let mut slide_chart_rids = HashMap::new();
+
+        for (current, reloaded) in self.deck.slides.iter().zip(&loaded.deck.slides) {
+            let path = loaded.slide_paths.get(&reloaded.id).ok_or_else(|| {
+                crate::error::Error::Save(
+                    "saved package is missing a slide path; refusing to discard dirty state"
+                        .to_string(),
+                )
+            })?;
+            slide_paths.insert(current.id.clone(), path.clone());
+            if let Some(rids) = loaded.slide_media_rids.get(&reloaded.id) {
+                slide_media_rids.insert(current.id.clone(), rids.clone());
+            }
+            if let Some(parts) = loaded.chart_source_parts.get(&reloaded.id) {
+                chart_source_parts.insert(current.id.clone(), parts.clone());
+            }
+            if let Some(rids) = loaded.slide_chart_rids.get(&reloaded.id) {
+                slide_chart_rids.insert(current.id.clone(), rids.clone());
+            }
+        }
+
+        self.package_rels = loaded.package_rels;
+        self.content_types = content_types;
+        self.slide_paths = slide_paths;
+        self.slide_media_rids = slide_media_rids;
+        self.chart_source_parts = chart_source_parts;
+        self.original_chart_bytes = loaded.original_chart_bytes;
+        self.slide_chart_rids = slide_chart_rids;
+        self.manifest_path = loaded
+            .manifest_path
+            .unwrap_or_else(|| "customXml/item1.xml".to_string());
+        self.manifest_rel_id = self
+            .package_rels
+            .iter()
+            .find(|rel| rel.rel_type == crate::package::REL_TYPE_MANIFEST)
+            .map(|rel| rel.id.clone());
         self.original_bytes = new_bytes;
         self.dirty_slides.clear();
         self.dirty_charts.clear();
+        Ok(())
     }
 
     /// Returns the number of transactions available to undo.

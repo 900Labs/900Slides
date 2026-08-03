@@ -1,11 +1,12 @@
 # Wave 21 — UI overhaul: professional editor experience
 
-Status: Proposed
+Status: In progress
 Owner: 900 Labs
-Scope target: Complete frontend redesign to match PowerPoint/Keynote/Google
-Slides conventions. Backend (crates) unchanged — this is a desktop-only
-(`apps/desktop/`) rewrite of the Svelte layer.
-Last updated: 2026-07-30
+Scope target: a durable editor interaction upgrade that follows familiar
+presentation-app conventions. This wave includes the desktop UI plus the
+small core and PPTX persistence changes required for new slides to survive
+save, recovery, and reopen.
+Last updated: 2026-08-03
 
 ## Problem
 
@@ -28,42 +29,38 @@ blur because there's no proper selection/edit-mode model.
 6. **Right-side inspector** with contextual tabs.
 7. **Clean blank canvas** — no default shapes.
 
-## What this wave delivers
+## Delivered scope
 
-All changes are in `apps/desktop/` — no crate modifications.
+This is not a complete PowerPoint/Keynote replacement. The delivered scope is
+the working creation and direct-manipulation loop listed below; unsupported
+native menu commands are intentionally omitted instead of being enabled
+no-ops.
 
 | Area | Changes |
 | --- | --- |
-| Native menu | Tauri menu configuration (File/Edit/View/Insert/Format/Arrange/Slide Show/Help) |
+| Native menu | Tauri menu configuration for implemented File, Edit, Insert, Format, Slide Show, and Help actions |
 | Toolbar | Compact icon buttons replacing text boxes; grouped by function |
-| Canvas | Remove default text box; fix selection (click to select, double-click to edit); drag-to-create shapes/text |
-| Shape picker | Flyout palette replacing individual shape buttons |
-| Text box tool | Dedicated text box creation tool (Insert > Text Box or toolbar) |
-| Formatting | Proper scope resolution (shape/run/paragraph); applies on commit, not lost on blur |
+| Canvas | Click to select, keyboard selection, double-click or Enter to edit text, Escape to exit, drag to move/resize, pixel-sized arrow nudges |
+| Shape picker | Flyout palette that arms a geometric creation tool; click uses a default frame and drag supplies explicit bounds, including horizontal and vertical lines |
+| Text box tool | Dedicated click-to-place text box tool (Insert > Text Box or toolbar) |
+| Formatting | Existing runs are retained across textarea edits; untouched bold, italic, and multi-run spans no longer collapse to defaults |
 | Inspector | Right sidebar with Style/Text/Arrange tabs, disclosure sections |
-| Slide navigator | Drag-to-reorder, right-click context menu (New/Duplicate/Delete/Layout) |
+| Slide persistence | Undoable slide insertion plus PPTX slide parts, relationships, content types, ordered presentation IDs, and save/reopen coverage |
 
-## Detailed specs
+## Original target and deferred scope
 
 ### 1. Native menu bar
 
-Configure via Tauri's `Menu` API in `main.rs`. Map menu items to existing
-Tauri commands or frontend events:
+The native menu exposes only actions wired to existing frontend commands:
 
-- **File**: New (⌘N), Open… (⌘O), Close (⌘W), Save (⌘S), Save As… (⇧⌘S),
-  Export ▸ (SVG/PNG/PDF), Print… (⌘P), Quit (⌘Q)
-- **Edit**: Undo (⌘Z), Redo (⇧⌘Z), Cut (⌘X), Copy (⌘C), Paste (⌘V),
-  Duplicate (⌘D), Delete, Select All (⌘A), Find… (⌘F), Find and Replace… (⌓⌘H)
-- **View**: Zoom In (⌘+), Zoom Out (⌘−), Fit to Window (⌘0),
-  Show/Hide Notes, Show/Hide Ruler
+- **File**: New (⌘N), Open… (⌘O), Save (⌘S), Save As… (⇧⌘S), Export ▸
+  (SVG/PNG/PDF)
+- **Edit**: Undo (⌘Z), Redo (⇧⌘Z), Find… (⌘F), Find and Replace… (⌘H)
 - **Insert**: New Slide (⇧⌘N), Text Box, Image…, Shape ▸, Table…, Chart ▸,
-  Hyperlink… (⌘K), Comment
-- **Format**: Font…, Bold (⌘B), Italic (⌘I), Underline (⌘U),
-  Align Left/Center/Right/Justify, Layout ▸
-- **Arrange**: Bring to Front, Bring Forward, Send to Back, Send Backward,
-  Align ▸, Distribute ▸, Rotate ▸, Lock/Unlock
-- **Slide Show**: Start from Beginning, From Current Slide, Rehearse Timings
-- **Help**: Keyboard Shortcuts, About
+  Comment
+- **Format**: Bold (⌘B), Italic (⌘I), Underline (⌘U)
+- **Slide Show**: Start Presentation
+- **Help**: Keyboard Shortcuts
 
 ### 2. Toolbar redesign
 
@@ -78,13 +75,19 @@ Replace the current big text boxes with a compact single-row toolbar:
 
 - **Blank canvas**: new decks/slides start with zero shapes (remove the
   default text box from `new_deck`).
-- **Selection model**: 
+- **Selection model**:
   - Click shape → selects it (shows resize handles + rotation handle).
   - Click empty canvas → deselects.
   - Double-click shape → enters text edit mode (caret appears).
   - Esc or click outside → exits edit mode (shape stays selected).
-- **Drag-to-create**: when a shape/text tool is active, click-drag on the
-  canvas creates the object at the drag bounds.
+- **Shape creation**: when a geometric tool is active, click creates a
+  default frame and click-drag creates the shape at the drag bounds. Horizontal
+  and vertical line drags retain their axis with a thin valid frame. Text boxes
+  currently support click-to-place; text-box drag creation remains planned.
+- **Rotated line manipulation**: a line can be selected and moved along its
+  visible direction. Its resize handles remain intentionally hidden until the
+  editor has rotation-aware resize deltas, rather than exposing a resize action
+  that would alter the wrong axis.
 - **Formatting scope**:
   - Selected + not editing → formatting applies to all text in the shape.
   - Editing + text selected → applies to the selected run only.
@@ -125,26 +128,57 @@ A context-sensitive right sidebar with tabs:
 - Slide numbers shown on thumbnails.
 - Active slide highlighted.
 
-## Execution strategy
-
-This is a large frontend-only change. Split into focused subagents:
-
-1. **Menu + toolbar** — native menu config + compact toolbar.
-2. **Canvas + selection model** — blank canvas, click/double-click/drag-to-
-   create, formatting scope resolution.
-3. **Shape picker + text tool** — flyout palette, drag-to-create.
-4. **Inspector** — right sidebar with contextual tabs.
-5. **Slide navigator** — drag-reorder, context menu.
-
 ## Acceptance criteria
 
-1. The app has a native menu bar with File/Edit/Insert/etc.
-2. New/Open/Save are toolbar buttons, not text boxes.
-3. A blank slide is truly empty (no default text box).
-4. Clicking a shape selects it and shows handles.
-5. Double-clicking a shape enters text edit mode.
-6. The Shape button opens a flyout grid; selecting one enables drag-to-create.
-7. Text box tool creates text boxes via drag-to-create.
-8. Formatting applies correctly based on selection scope.
-9. A right-side inspector shows shape properties.
-10. Slides can be reordered by drag.
+1. Done: the app has a native menu containing only wired actions.
+2. Done: New/Open/Save and New Slide are visible editor controls.
+3. Done: new slides are blank and persist through save, recovery, and reopen.
+4. Done: pointer and keyboard shape selection expose move controls; supported
+   axis-aligned shapes expose resize handles. Rotated-line resize remains the
+   explicit limitation described above.
+5. Done: double-click or Enter edits a text box; Escape exits editing.
+6. Done: the Shape flyout arms click-or-drag geometric creation.
+7. Partial: text boxes support click-to-place; drag-to-create text is planned.
+8. Partial: plain textarea edits preserve existing run formatting; true
+   selection-range editing needs a rich-text editing surface.
+9. Done: the right-side inspector exposes style, text, arrange, notes, and
+   animation controls already backed by commands.
+10. Planned: slide drag reordering, context actions, duplication, deletion,
+    and layout selection require their own structural PPTX commands.
+
+## Implementation checkpoint (2026-08-03)
+
+The desktop editor now has the interaction foundation required for a usable
+local-first editing loop:
+
+- The native menu is installed once and emits only actions handled by the
+  Svelte editor. Unsupported close, clipboard, duplicate, zoom, arrange,
+  rehearse, and about entries were removed rather than left as no-ops.
+- The compact toolbar provides visible New Slide, Save, Text Box, Shape,
+  Image, Table, Chart, Present, and formatting controls. New Slide is also
+  available at the bottom of the navigator and from Insert.
+- Text-box, geometric-shape, transform, animation, presenter, and rendering
+  invokes use Tauri v2's camelCase JavaScript argument names. This removes the
+  command-boundary failures that made inserts and edits appear non-functional.
+- Canvas selection supports click-to-select, keyboard selection, Enter or
+  double-click-to-edit text, drag-to-move, eight resize handles,
+  Escape-to-leave text editing, and pixel-sized arrow-key nudges.
+- The Shape picker now arms an explicit creation mode. A click uses the
+  backend default frame; a drag sends validated EMU bounds to the undoable
+  shape command. Horizontal and vertical line drags preserve their intended
+  axis while using a thin serializable frame.
+- New Slide is an undoable core command. Saving adds the new slide XML,
+  content type, presentation relationship and ordered ID entry, and a copied
+  slide-layout relationship; regression coverage reopens and edits it again.
+- The right panel includes Style, Text, and Arrange inspector tabs. The Style
+  tab edits a selected geometric shape's fill, outline, opacity, and shadow;
+  Arrange edits position and size through the same transform command used by
+  direct manipulation.
+
+The remaining navigator work is drag reordering and the slide context menu
+(duplicate/delete/layout/hide). It needs separate persistence support for
+slide order and copied/deleted slide parts, and is intentionally not presented
+as a completed feature.
+
+Verification is recorded with the implementation run. No network, telemetry,
+analytics, external assets, or new dependencies were added.

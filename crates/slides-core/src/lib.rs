@@ -2149,6 +2149,93 @@ impl CommandBus {
     }
 }
 
+/// Inserts a slide at a stable position in the deck.
+///
+/// Keeping slide insertion in the command bus is important: presentation
+/// structure is user-visible state just like a shape edit, so it must
+/// participate in undo/redo and give the package saver a concrete affected
+/// slide id to persist.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InsertSlide {
+    index: usize,
+    slide: Slide,
+}
+
+impl InsertSlide {
+    /// Creates an insertion command for `slide` at `index`.
+    pub fn new(index: usize, slide: Slide) -> Self {
+        Self { index, slide }
+    }
+}
+
+impl Command for InsertSlide {
+    fn apply(&self, deck: &mut Deck) {
+        deck.slides.insert(self.index, self.slide.clone());
+    }
+
+    fn inverse(&self, _deck: &Deck) -> Box<dyn Command> {
+        Box::new(RemoveInsertedSlide {
+            index: self.index,
+            slide: self.slide.clone(),
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |serialized| serialized.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide.id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        self.index <= deck.slides.len()
+            && !self.slide.id.is_empty()
+            && !deck.slides.iter().any(|slide| slide.id == self.slide.id)
+    }
+}
+
+/// Inverse of [`InsertSlide`]. This deliberately validates both the position
+/// and id so undo never removes a different slide after an invalid mutation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct RemoveInsertedSlide {
+    index: usize,
+    slide: Slide,
+}
+
+impl Command for RemoveInsertedSlide {
+    fn apply(&self, deck: &mut Deck) {
+        if deck
+            .slides
+            .get(self.index)
+            .is_some_and(|slide| slide.id == self.slide.id)
+        {
+            deck.slides.remove(self.index);
+        }
+    }
+
+    fn inverse(&self, _deck: &Deck) -> Box<dyn Command> {
+        Box::new(InsertSlide {
+            index: self.index,
+            slide: self.slide.clone(),
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |serialized| serialized.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide.id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        deck.slides
+            .get(self.index)
+            .is_some_and(|slide| slide.id == self.slide.id)
+    }
+}
+
 /// Replaces a paragraph's runs in a specific slide's text box.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EditText {
@@ -5590,6 +5677,57 @@ mod tests {
         } else {
             panic!("expected text box");
         }
+    }
+
+    #[test]
+    fn insert_slide_is_ordered_and_undoable() {
+        let mut deck = Deck::new();
+        deck.slides.push(Slide {
+            id: "first".to_string(),
+            ..Default::default()
+        });
+        deck.slides.push(Slide {
+            id: "third".to_string(),
+            ..Default::default()
+        });
+        let mut bus = CommandBus::default();
+
+        bus.apply(
+            Box::new(InsertSlide::new(
+                1,
+                Slide {
+                    id: "second".to_string(),
+                    ..Default::default()
+                },
+            )),
+            &mut deck,
+        )
+        .expect("slide insertion should apply");
+        assert_eq!(
+            deck.slides
+                .iter()
+                .map(|slide| slide.id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second", "third"]
+        );
+
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(
+            deck.slides
+                .iter()
+                .map(|slide| slide.id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "third"]
+        );
+
+        assert!(bus.redo(&mut deck).is_some());
+        assert_eq!(
+            deck.slides
+                .iter()
+                .map(|slide| slide.id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second", "third"]
+        );
     }
 
     #[test]
