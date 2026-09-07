@@ -37,8 +37,8 @@ export function preserveEditedRuns(text, original) {
 /**
  * Aligns new textarea lines with source paragraphs. Exact paragraph matches
  * use an LCS so an inserted or deleted line never shifts formatting from the
- * next unchanged paragraph. A changed line inherits an old paragraph only
- * when its surrounding segment is a one-for-one replacement.
+ * next unchanged paragraph. Inserted paragraphs inherit only the adjacent
+ * boundary run; splitting one paragraph retains the runs on both sides.
  */
 export function alignParagraphs(lines, originals) {
   const oldTexts = originals.map((paragraph) => paragraph.runs.map((run) => run.text).join(''))
@@ -82,12 +82,57 @@ export function alignParagraphs(lines, originals) {
       for (let offset = 0; offset < newCount; offset += 1) {
         aligned[newStart + offset] = originals[oldStart + offset]
       }
+    } else if (oldCount === 0 && newCount > 0) {
+      const preceding = originals[oldStart - 1]
+      const source = preceding ?? originals[oldStart]
+      if (source) {
+        // A blank run is intentional: Return followed by a later input (or
+        // autosave) must retain the typing style in the empty new paragraph.
+        const boundaryRun = preceding ? source.runs.at(-1) : source.runs[0]
+        for (let offset = 0; offset < newCount; offset += 1) {
+          aligned[newStart + offset] = {
+            ...source,
+            runs: boundaryRun ? [{ ...boundaryRun, text: '' }] : [],
+          }
+        }
+      }
+    } else if (oldCount === 1 && newCount > 1) {
+      const split = splitEditedParagraph(lines.slice(newStart, newEnd), originals[oldStart])
+      for (let offset = 0; offset < newCount; offset += 1) {
+        aligned[newStart + offset] = split[offset]
+      }
     }
     if (newEnd < lines.length && oldEnd < originals.length) {
       aligned[newEnd] = originals[oldEnd]
     }
   }
   return aligned
+}
+
+/** Keep a split's untouched prefix/suffix runs, rather than applying one
+ * paragraph-wide style to both halves of mixed-format source text. */
+function splitEditedParagraph(lines, original) {
+  const editedRuns = preserveEditedRuns(lines.join('\n'), original)
+  const paragraphs = []
+  let runs = []
+  let boundaryRun = original.runs[0]
+  const finish = () => {
+    paragraphs.push({
+      ...original,
+      runs: runs.length ? runs : boundaryRun ? [{ ...boundaryRun, text: '' }] : [],
+    })
+    runs = []
+  }
+  for (const run of editedRuns) {
+    const parts = run.text.split('\n')
+    for (let index = 0; index < parts.length; index += 1) {
+      boundaryRun = run
+      appendStyledRun(runs, { ...run, text: parts[index] })
+      if (index < parts.length - 1) finish()
+    }
+  }
+  finish()
+  return paragraphs
 }
 
 function runAtInsertionPoint(original, offset) {
@@ -111,20 +156,18 @@ function runAtInsertionPoint(original, offset) {
 function appendStyledRun(runs, run) {
   if (!run.text) return
   const previous = runs[runs.length - 1]
-  if (
-    previous &&
-    previous.bold === run.bold &&
-    previous.italic === run.italic &&
-    previous.underline === run.underline &&
-    previous.strikethrough === run.strikethrough &&
-    previous.verticalAlign === run.verticalAlign &&
-    previous.code === run.code &&
-    previous.fontFamily === run.fontFamily
-  ) {
+  if (previous && sameRunFormatting(previous, run)) {
     previous.text += run.text
     return
   }
   runs.push({ ...run })
+}
+
+/** Preserve every serialized run attribute, including color, size and links. */
+export function sameRunFormatting(a, b) {
+  const fields = new Set([...Object.keys(a), ...Object.keys(b)])
+  fields.delete('text')
+  return [...fields].every((field) => JSON.stringify(a[field]) === JSON.stringify(b[field]))
 }
 
 function appendOriginalRange(output, original, start, end) {

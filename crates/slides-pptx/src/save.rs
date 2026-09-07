@@ -14,7 +14,7 @@ use zip::write::{FileOptions, ZipWriter};
 
 use crate::chart::{
     chart_graphic_frame_xml, chart_part_path, generate_chart_xml, is_chart_frame, next_chart_index,
-    patch_chart_xml, CT_CHART,
+    parse_chart_xml, patch_chart_xml, CT_CHART,
 };
 use crate::error::{Error, Result};
 use crate::geometry;
@@ -38,7 +38,8 @@ const BLANK_SLIDE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone
 /// Serializes the current deck to a PPTX package, preserving every untouched
 /// part byte-for-byte.
 pub fn save(session: &Session) -> Result<Vec<u8>> {
-    let mut archive = zip::ZipArchive::new(Cursor::new(session.original_bytes.as_slice()))?;
+    let source_bytes = session.source_bytes_for_save()?;
+    let mut archive = zip::ZipArchive::new(Cursor::new(source_bytes.as_ref()))?;
     let mut out = Cursor::new(Vec::new());
     let mut writer = ZipWriter::new(&mut out);
     let options = FileOptions::<()>::default().compression_method(zip::CompressionMethod::Deflated);
@@ -46,7 +47,6 @@ pub fn save(session: &Session) -> Result<Vec<u8>> {
     let mut content_types = session.content_types.clone();
     content_types.ensure_override(&session.manifest_path, CT_MANIFEST);
 
-    let manifest_xml = write_manifest(session);
     let need_manifest_rel = session.manifest_rel_id.is_none();
 
     // Existing slides retain their original part paths. Allocate parts for
@@ -58,13 +58,17 @@ pub fn save(session: &Session) -> Result<Vec<u8>> {
     let mut next_slide_index = next_slide_part_index(&mut archive)?;
     for slide in &session.deck.slides {
         if !all_slide_paths.contains_key(&slide.id) {
-            let path = format!("ppt/slides/slide{next_slide_index}.xml");
+            let mut path = format!("ppt/slides/slide{next_slide_index}.xml");
+            while all_slide_paths.values().any(|existing| existing == &path) {
+                next_slide_index += 1;
+                path = format!("ppt/slides/slide{next_slide_index}.xml");
+            }
             next_slide_index += 1;
             all_slide_paths.insert(slide.id.clone(), path);
             new_slide_ids.push(slide.id.clone());
         }
     }
-    for slide_id in &new_slide_ids {
+    for slide_id in session.deck.slides.iter().map(|slide| &slide.id) {
         let path = all_slide_paths
             .get(slide_id)
             .expect("new slide path is allocated above");
@@ -82,6 +86,8 @@ pub fn save(session: &Session) -> Result<Vec<u8>> {
         .iter()
         .filter_map(|id| all_slide_paths.get(id).cloned())
         .collect();
+    let shape_save = prepare_shape_ids(session, &mut archive, &all_slide_paths, &dirty_slide_ids)?;
+    let manifest_xml = write_manifest(session, &all_slide_paths, &shape_save.model_ids);
 
     // A presentation part only needs rewriting for a structural mutation. This
     // covers insertion, undoing a persisted insertion, and future reordering;
@@ -300,6 +306,8 @@ pub fn save(session: &Session) -> Result<Vec<u8>> {
         } else if let Some(slide) =
             find_slide_by_path(session, &all_slide_paths, &dirty_paths, &name)
         {
+            let export_slide = shape_save.normalized_slide(slide);
+            let slide = &export_slide;
             let mut original_xml = String::new();
             entry.read_to_string(&mut original_xml)?;
             let rids = slide_rids
@@ -329,6 +337,8 @@ pub fn save(session: &Session) -> Result<Vec<u8>> {
             .deck
             .slide(slide_id)
             .expect("new slide remains in the deck while saving");
+        let export_slide = shape_save.normalized_slide(slide);
+        let slide = &export_slide;
         let path = all_slide_paths
             .get(slide_id)
             .expect("new slide path is allocated above");
@@ -393,6 +403,140 @@ pub fn save(session: &Session) -> Result<Vec<u8>> {
 }
 
 /// State accumulated while preparing charts for save.
+struct ShapeSaveState {
+    package_ids: HashMap<String, Vec<String>>,
+    model_ids: HashMap<String, HashMap<String, String>>,
+}
+
+impl ShapeSaveState {
+    fn normalized_slide(&self, slide: &Slide) -> Slide {
+        let mut normalized = slide.clone();
+        if let Some(ids) = self.package_ids.get(&slide.id) {
+            for (shape, id) in normalized.shapes.iter_mut().zip(ids) {
+                shape.set_id(id.clone());
+            }
+        }
+        normalized
+    }
+}
+
+/// Allocates positive numeric OOXML IDs while retaining model UUIDs in the
+/// manifest. Reserve all source IDs, including children of opaque groups, so a
+/// newly inserted shape cannot collide with preserved XML or animation targets.
+fn prepare_shape_ids(
+    session: &Session,
+    archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
+    slide_paths: &HashMap<String, String>,
+    dirty_slide_ids: &HashSet<String>,
+) -> Result<ShapeSaveState> {
+    let mut state = ShapeSaveState {
+        package_ids: HashMap::new(),
+        model_ids: session.shape_package_ids.clone(),
+    };
+    for slide in &session.deck.slides {
+        if !dirty_slide_ids.contains(&slide.id) {
+            continue;
+        }
+        let path = &slide_paths[&slide.id];
+        let original = crate::load::read_entry_to_string(archive, path).unwrap_or_default();
+        let original_ids = build_original_id_to_index(&original);
+        let mut reserved: HashSet<u32> = HashSet::from([0, 1]);
+        reserve_shape_ids(&original, &mut reserved)?;
+        for shape in &slide.shapes {
+            if let Shape::Passthrough(object) = shape {
+                reserve_shape_ids(&String::from_utf8_lossy(&object.raw_bytes), &mut reserved)?;
+            }
+        }
+        let mut used = reserved.clone();
+        used.extend(
+            slide
+                .shapes
+                .iter()
+                .filter_map(|shape| shape.id().parse::<u32>().ok()),
+        );
+        if let Some(ids) = state.model_ids.get(&slide.id) {
+            used.extend(ids.values().filter_map(|id| id.parse::<u32>().ok()));
+        }
+        let mut assigned = HashSet::new();
+        let mut next_id = 2u32;
+        let mut package_ids = Vec::with_capacity(slide.shapes.len());
+        let model_ids = state.model_ids.entry(slide.id.clone()).or_default();
+        for (index, shape) in slide.shapes.iter().enumerate() {
+            let existing = model_ids
+                .get(shape.id())
+                .cloned()
+                .or_else(|| match shape {
+                    Shape::Passthrough(object) => {
+                        extract_shape_id(&String::from_utf8_lossy(&object.raw_bytes))
+                    }
+                    _ => None,
+                })
+                .or_else(|| {
+                    if shape.id().is_empty() {
+                        original_ids
+                            .iter()
+                            .find(|(_, source_index)| **source_index == index)
+                            .map(|(id, _)| id.clone())
+                    } else {
+                        shape
+                            .id()
+                            .parse::<u32>()
+                            .ok()
+                            .filter(|id| {
+                                !reserved.contains(id) || original_ids.contains_key(shape.id())
+                            })
+                            .map(|_| shape.id().to_string())
+                    }
+                })
+                .filter(|id| {
+                    id.parse::<u32>()
+                        .is_ok_and(|id| id > 0 && !assigned.contains(&id))
+                });
+            let package_id = if let Some(id) = existing {
+                id
+            } else {
+                while used.contains(&next_id) {
+                    next_id = next_id.checked_add(1).ok_or_else(|| {
+                        Error::Save("slide has exhausted numeric shape identifiers".into())
+                    })?;
+                }
+                next_id.to_string()
+            };
+            let numeric_id = package_id
+                .parse::<u32>()
+                .expect("allocated positive numeric ID");
+            assigned.insert(numeric_id);
+            used.insert(numeric_id);
+            if !shape.id().is_empty() {
+                model_ids.insert(shape.id().to_string(), package_id.clone());
+            }
+            package_ids.push(package_id);
+        }
+        state.package_ids.insert(slide.id.clone(), package_ids);
+    }
+    Ok(state)
+}
+
+fn reserve_shape_ids(xml: &str, reserved: &mut HashSet<u32>) -> Result<()> {
+    let mut reader = Reader::from_str(xml);
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf)? {
+            Event::Start(e) | Event::Empty(e) if qname_str(e.name()) == "cNvPr" => {
+                if let Some(id) = attr_by_local_name(&e, "id").and_then(|id| id.parse::<u32>().ok())
+                {
+                    reserved.insert(id);
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(())
+}
+
+/// State accumulated while preparing charts for save.
 struct ChartSaveState {
     /// Patched bytes for dirty existing chart parts, keyed by part path.
     patched_chart_parts: HashMap<String, Vec<u8>>,
@@ -453,7 +597,7 @@ fn prepare_charts(
             if let Some(part_path) = session
                 .chart_source_parts
                 .get(slide_id)
-                .and_then(|m| m.get(&shape_index))
+                .and_then(|m| m.get(&chart.id))
             {
                 // Existing chart: reuse relationship id.
                 let rid = session
@@ -463,7 +607,17 @@ fn prepare_charts(
                     .cloned()
                     .unwrap_or_else(|| {
                         max_rid += 1;
-                        format!("rId{max_rid}")
+                        let rid = format!("rId{max_rid}");
+                        slide_rels_additions
+                            .entry(rels_path.clone())
+                            .or_default()
+                            .push(Rel {
+                                id: rid.clone(),
+                                rel_type: REL_TYPE_CHART.to_string(),
+                                target: pkgmedia::relative_target(slide_path, part_path),
+                                target_mode: None,
+                            });
+                        rid
                     });
                 state
                     .chart_rids
@@ -471,9 +625,18 @@ fn prepare_charts(
                     .or_default()
                     .insert(shape_index, rid);
 
-                if session.dirty_charts.contains(part_path) {
-                    if let Some(original) = session.original_chart_bytes.get(part_path) {
-                        let original_str = String::from_utf8_lossy(original);
+                if let Some(original) = session.original_chart_bytes.get(part_path) {
+                    let original_str = String::from_utf8_lossy(original);
+                    // Compare against the saved content, rather than the last
+                    // executed command, so undo/redo across saves is persisted.
+                    // A moved chart keeps its part byte-for-byte unchanged.
+                    let unchanged =
+                        parse_chart_xml(&original_str, chart.transform).is_some_and(|saved| {
+                            saved.chart_type == chart.chart_type
+                                && saved.data == chart.data
+                                && saved.title == chart.title
+                        });
+                    if !unchanged {
                         match patch_chart_xml(&original_str, chart) {
                             Ok(bytes) => {
                                 state.patched_chart_parts.insert(part_path.clone(), bytes);
@@ -625,9 +788,8 @@ fn prepare_presentation_save(
         .filter_map(|entry| path_by_rid.get(&entry.rid).cloned())
         .collect();
     let active_paths: HashSet<String> = current_paths.iter().cloned().collect();
-    let removed_slide_paths: HashSet<String> = session
-        .slide_paths
-        .values()
+    let removed_slide_paths: HashSet<String> = original_paths
+        .iter()
         .filter(|path| !active_paths.contains(*path))
         .cloned()
         .collect();
@@ -917,7 +1079,62 @@ fn next_rel_id(rels: &[Rel]) -> String {
     format!("rId{}", max + 1)
 }
 
-fn write_manifest(session: &Session) -> Vec<u8> {
+fn write_manifest(
+    session: &Session,
+    slide_paths: &HashMap<String, String>,
+    shape_ids: &HashMap<String, HashMap<String, String>>,
+) -> Vec<u8> {
+    let mut comments = session.deck.comments.clone();
+    for thread in &mut comments {
+        let (slides_core::CommentAnchor::Slide { slide_id }
+        | slides_core::CommentAnchor::Shape { slide_id, .. }
+        | slides_core::CommentAnchor::TextRange { slide_id, .. }) = &mut thread.anchor;
+        if let Some(path) = slide_paths.get(slide_id) {
+            *slide_id = path.clone();
+        }
+    }
+    let mut sections = session.deck.sections.clone();
+    for section in &mut sections {
+        if let Some(path) = slide_paths.get(&section.start_slide_id) {
+            section.start_slide_id = path.clone();
+        }
+    }
+    let mut collections = Vec::new();
+    if !comments.is_empty() {
+        collections.push((
+            "comments",
+            serde_json::to_string(&comments).unwrap_or_else(|_| "[]".into()),
+        ));
+    }
+    if !sections.is_empty() {
+        collections.push((
+            "sections",
+            serde_json::to_string(&sections).unwrap_or_else(|_| "[]".into()),
+        ));
+    }
+    let mut mappings = Vec::new();
+    for slide in &session.deck.slides {
+        if let (Some(path), Some(ids)) = (slide_paths.get(&slide.id), shape_ids.get(&slide.id)) {
+            for shape in &slide.shapes {
+                if let Some(package_id) = ids.get(shape.id()) {
+                    mappings.push(crate::session::ShapeIdMapping {
+                        slide_path: path.clone(),
+                        model_id: shape.id().to_string(),
+                        package_id: package_id.clone(),
+                    });
+                }
+            }
+        }
+    }
+    mappings.sort_by(|left, right| {
+        (&left.slide_path, &left.model_id).cmp(&(&right.slide_path, &right.model_id))
+    });
+    if !mappings.is_empty() {
+        collections.push((
+            "shapeIds",
+            serde_json::to_string(&mappings).unwrap_or_else(|_| "[]".into()),
+        ));
+    }
     let mut out = Vec::new();
     {
         let mut writer = Writer::new_with_indent(&mut out, b' ', 2);
@@ -937,7 +1154,7 @@ fn write_manifest(session: &Session) -> Vec<u8> {
         ));
         elem.push_attribute(("deckId", session.deck.id.as_str()));
 
-        if session.deck.comments.is_empty() {
+        if collections.is_empty() {
             // No comments: emit the same self-closing element as before so the
             // byte-for-byte round-trip guarantee holds for untouched decks.
             writer.write_event(Event::Empty(elem)).ok();
@@ -946,20 +1163,16 @@ fn write_manifest(session: &Session) -> Vec<u8> {
             // Serialize the thread list to JSON and embed it verbatim inside a
             // CDATA section of <comments>. This keeps complex nested comment
             // data out of hand-written XML while staying inside the manifest.
-            let json =
-                serde_json::to_string(&session.deck.comments).unwrap_or_else(|_| "[]".to_string());
-            // Split on the CDATA terminator so a comment body containing the
-            // literal `]]>` cannot corrupt the manifest XML.
-            let safe = json.replace("]]>", "]]]]><![CDATA[>");
-            writer
-                .write_event(Event::Start(BytesStart::new("comments")))
-                .ok();
-            writer
-                .write_event(Event::CData(BytesCData::new(safe.as_str())))
-                .ok();
-            writer
-                .write_event(Event::End(BytesEnd::new("comments")))
-                .ok();
+            for (name, json) in collections {
+                // Split on the CDATA terminator so a comment body containing the
+                // literal `]]>` cannot corrupt the manifest XML.
+                let safe = json.replace("]]>", "]]]]><![CDATA[>");
+                writer.write_event(Event::Start(BytesStart::new(name))).ok();
+                writer
+                    .write_event(Event::CData(BytesCData::new(safe.as_str())))
+                    .ok();
+                writer.write_event(Event::End(BytesEnd::new(name))).ok();
+            }
             writer
                 .write_event(Event::End(BytesEnd::new("manifest")))
                 .ok();
@@ -1521,11 +1734,17 @@ fn patch_slide_xml(
         original_xml.to_string()
     };
 
-    // If the model has fewer shapes than the original slide XML, a shape was
-    // deleted. The positional patch below cannot represent a deletion (it would
-    // misalign every following shape and leave the deleted element in place), so
-    // fall back to regenerating the entire shape tree from the model.
-    if count_top_level_shapes(&xml)? > slide.shapes.len() {
+    // The positional patch can append shapes, but cannot safely replace,
+    // reorder, or insert before an existing shape. Stable IDs also catch undo
+    // restoring a deleted shape after a save, even when the shape count grows.
+    let original_ids = build_original_id_to_index(&xml);
+    let identities_changed = original_ids.iter().any(|(id, index)| {
+        slide
+            .shapes
+            .get(*index)
+            .is_some_and(|shape| !shape.id().is_empty() && shape.id() != id)
+    });
+    if identities_changed || count_top_level_shapes(&xml)? > slide.shapes.len() {
         return regenerate_sp_tree(slide, &xml, rids, link_rids, chart_rids);
     }
 
@@ -1852,7 +2071,9 @@ fn append_shape<W: Write>(
             }
             writer.get_mut().write_all(b"</p:txBody></p:sp>")?;
         }
-        Shape::Passthrough(_) => {}
+        Shape::Passthrough(object) => {
+            writer.get_mut().write_all(&object.raw_bytes)?;
+        }
         Shape::Table(table) => {
             let name = format!("Table {}", index + 1);
             let xml = table_graphic_frame_xml(table, &id, &name);
@@ -2289,6 +2510,11 @@ fn write_run<W: Write>(
     if run.strikethrough {
         rpr.push_attribute(("strike", "sngStrike"));
     }
+    let font_size;
+    if let Some(size) = run.font_size.filter(|size| size.is_finite() && *size > 0.0) {
+        font_size = (size / 127.0).round().clamp(100.0, 400_000.0).to_string();
+        rpr.push_attribute(("sz", font_size.as_str()));
+    }
     let baseline_str;
     match run.vertical_align {
         VerticalAlign::Superscript => {
@@ -2303,9 +2529,20 @@ fn write_run<W: Write>(
     }
 
     let has_link = run.link.is_some();
-    let needs_rpr_inner = run.font_family.is_some() || has_link;
+    let needs_rpr_inner = run.font_family.is_some() || has_link || run.color.is_some();
     if needs_rpr_inner {
         writer.write_event(Event::Start(rpr))?;
+        if let Some(color) = run.color {
+            let alpha = if color.a == 255 {
+                String::new()
+            } else {
+                format!(
+                    r#"<a:alpha val="{}"/>"#,
+                    (f64::from(color.a) * 100_000.0 / 255.0).round()
+                )
+            };
+            writer.get_mut().write_all(format!(r#"<a:solidFill><a:srgbClr val="{:02X}{:02X}{:02X}">{alpha}</a:srgbClr></a:solidFill>"#, color.r, color.g, color.b).as_bytes())?;
+        }
         if let Some(font) = &run.font_family {
             let mut latin = BytesStart::new("a:latin");
             latin.push_attribute(("typeface", font.as_str()));

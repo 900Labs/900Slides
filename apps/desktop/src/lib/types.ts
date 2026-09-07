@@ -54,6 +54,10 @@ export interface RunDto {
   verticalAlign: VerticalAlignDto
   code: boolean
   fontFamily?: string
+  /** Font size in EMU (12,700 per point). */
+  fontSize?: number
+  /** Explicit text color, when the source specifies one. */
+  color?: ColorDto
 }
 
 /** Paragraph inside a text box. */
@@ -423,6 +427,8 @@ export interface DeckSnapshot {
   /** Named slide sections, in slide order. */
   sections: SlideSectionDto[]
   slides: SlideSnapshot[]
+  /** Monotonic identity for the deck's media payload. */
+  mediaRevision: number
   media: MediaMap
   /** Presenter settings (laser pointer + highlighter). */
   presenterSettings: PresenterSettingsDto
@@ -469,6 +475,10 @@ export interface ProjectorFiltersDto {
 
 /** Presenter view state. */
 export interface PresenterState {
+  bodyFont: string
+  headingFont: string
+  /** Same theme background used by the editor and exports. */
+  background: ColorDto
   currentSlide: SlideSnapshot
   nextSlide: SlideSnapshot | null
   slideNumber: number
@@ -551,10 +561,10 @@ export interface AccessibilityIssueDto {
   fixHint?: string
 }
 
-/** Result of checking a deck for accessibility, with a WCAG 2.2 AA score. */
+/** Result of checking a deck for accessibility, with a Document check score. */
 export interface AccessibilityReportDto {
   issues: AccessibilityIssueDto[]
-  /** WCAG 2.2 AA conformance score (0–100). 100 = no issues. */
+  /** Heuristic document check score (0–100). 100 = no issues. */
   score: number
   totalSlides: number
   slidesWithIssues: number

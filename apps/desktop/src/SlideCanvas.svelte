@@ -1,5 +1,8 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core'
+  import { onDestroy } from 'svelte'
+  import { createDraftQueue } from './lib/draftQueue.js'
+  import { shapeKeyboardAction } from './lib/shapeKeyboard.js'
   import type {
     AnimationDto,
     BorderEdgeDto,
@@ -48,6 +51,9 @@
     slide: SlideSnapshot
     /** Deck background color. */
     background: ColorDto
+    /** Installed theme fonts; no font downloads are performed. */
+    bodyFont?: string
+    headingFont?: string
     /** Media store, base64-encoded, used to render image shapes. */
     media?: MediaMap
     /** Callback invoked when a text box is edited. */
@@ -55,7 +61,7 @@
       slideId: string
       shapeIndex: number
       paragraphs: ParagraphDto[]
-    }) => void
+    }) => void | Promise<void>
     /** Callback invoked when a table cell's text is edited. */
     onSetCellText?: (detail: {
       slideId: string
@@ -63,7 +69,9 @@
       row: number
       col: number
       text: string
-    }) => void
+    }) => void | Promise<void>
+    /** Reports uncommitted edits, including commits still in flight. */
+    onDraftChange?: (dirty: boolean) => void
     /** Callback invoked when a table cell gains focus. */
     onCellFocus?: (detail: { shapeIndex: number; row: number; col: number }) => void
     /** Callback invoked when a chart shape is double-clicked. */
@@ -127,9 +135,12 @@
   let {
     slide,
     background,
+    bodyFont = 'sans-serif',
+    headingFont = 'sans-serif',
     media,
     onEditTextBox,
     onSetCellText,
+    onDraftChange,
     onCellFocus,
     onEditChart,
     onSelectShape,
@@ -172,6 +183,10 @@
   /** Background color, forced to black when high-contrast is on. */
   const effectiveBackground = $derived<ColorDto>(
     highContrast ? { r: 0, g: 0, b: 0, a: 255 } : background,
+  )
+  const defaultTextColor = $derived(
+    highContrast || (0.299 * background.r + 0.587 * background.g + 0.114 * background.b) < 140
+      ? '#ffffff' : '#202637',
   )
 
   /** Current build-in state per shape index for presenter playback. */
@@ -359,17 +374,6 @@
     return paragraph.runs.map((run) => run.text).join('')
   }
 
-  /** Compares two paragraph styles for equality. */
-  function paragraphStyleEqual(a: ParagraphStyleDto, b: ParagraphStyleDto): boolean {
-    return (
-      a.heading === b.heading &&
-      a.blockquote === b.blockquote &&
-      a.codeBlock === b.codeBlock &&
-      a.codeStepRanges === b.codeStepRanges &&
-      a.indentLevel === b.indentLevel
-    )
-  }
-
   /** Class name for a paragraph based on its style. */
   function paragraphClass(style: ParagraphStyleDto): string {
     const classes: string[] = []
@@ -407,6 +411,50 @@
     if (run.verticalAlign === 'subscript') classes.push('subscript')
     if (run.code) classes.push('code')
     return classes.join(' ')
+  }
+
+  /** Core font sizes are EMU, independent of the UI font and canvas zoom. */
+  function runFontSize(run: RunDto): string | undefined {
+    if (!run.fontSize || !Number.isFinite(run.fontSize) || run.fontSize <= 0) return undefined
+    const shift = run.verticalAlign === 'baseline' ? 1 : 0.7
+    return `${run.fontSize * EMU_TO_PX * shift}px`
+  }
+
+  function runColor(run: RunDto): string | undefined {
+    return highContrast ? '#ffffff' : run.color ? toRgba(run.color) : undefined
+  }
+
+  /** Missing installed fonts use the same fallback during and after editing. */
+  function fontStack(family: string, code = false): string {
+    const fallback = code ? 'monospace' : 'sans-serif'
+    const name = family.trim()
+    if (!name) return fallback
+    if (['serif', 'sans-serif', 'monospace', 'system-ui'].includes(name)) return name
+    return `${JSON.stringify(name)}, ${fallback}`
+  }
+
+  function paragraphFont(paragraph: ParagraphDto): string {
+    return fontStack(
+      paragraph.style.codeBlock ? 'Courier New' : paragraph.style.heading ? headingFont : bodyFont,
+      paragraph.style.codeBlock,
+    )
+  }
+
+  function runFont(run: RunDto, paragraph: ParagraphDto): string | undefined {
+    if (!run.fontFamily && !run.code) return undefined
+    return fontStack(run.fontFamily ?? 'Courier New', run.code || paragraph.style.codeBlock)
+  }
+
+  /** Native textareas use one type style. Match the leading paragraph while
+   *  retaining every individual run's formatting in the editable draft. */
+  function editorTypography(paragraphs: ParagraphDto[]): string {
+    const paragraph = paragraphs[0]
+    const run = paragraph?.runs[0]
+    const headingScale: Record<string, number> = { h1: 2, h2: 1.5, h3: 1.25, h4: 1.1, h5: 1, h6: 0.9 }
+    const defaultSize = 24 * (headingScale[paragraph?.style.heading ?? ''] ?? 1)
+    const size = run ? runFontSize(run) ?? `${defaultSize}px` : `${defaultSize}px`
+    const font = paragraph ? (run && runFont(run, paragraph)) ?? paragraphFont(paragraph) : fontStack(bodyFont)
+    return `font-size: ${size}; font-family: ${font}; font-weight: ${run?.bold || paragraph?.style.heading ? 'bold' : 'normal'}; font-style: ${run?.italic ? 'italic' : 'normal'};`
   }
 
   /** Preserves formatting in untouched portions of a textarea edit. */
@@ -447,53 +495,69 @@
     }
   }
 
-  /** Emits a text-box edit command for the given textarea value, if it changed. */
-  function commitTextBox(textarea: HTMLTextAreaElement, shapeIndex: number): void {
-    if (!onEditTextBox) return
-    const textBox = slide.shapes[shapeIndex].value as TextBoxSnapshot
-    const originalParagraphs = textBox.paragraphs
-    const lines = textarea.value.split('\n')
+  type Draft =
+    | { kind: 'text'; slideId: string; shapeIndex: number; text: string; paragraphs: ParagraphDto[] }
+    | { kind: 'cell'; slideId: string; shapeIndex: number; row: number; col: number; text: string }
 
-    const alignedOriginals = alignParagraphs(lines, originalParagraphs) as Array<
-      ParagraphDto | undefined
-    >
-    const newParagraphs: ParagraphDto[] = lines.map((line, index) =>
-      buildParagraph(line, alignedOriginals[index]),
-    )
+  /** Makes the queue's pending values visible to Svelte without binding the
+   *  textarea to snapshots returned by an older asynchronous request. */
+  let draftRevision = $state(0)
+  const drafts = createDraftQueue<Draft>({
+    commit: async (draft) => {
+      if (draft.kind === 'text') await onEditTextBox?.(draft)
+      else await onSetCellText?.(draft)
+    },
+    onChange: (dirty) => {
+      draftRevision += 1
+      onDraftChange?.(dirty)
+    },
+  })
+  onDestroy(() => {
+    drafts.dispose()
+    for (const timer of spellTimers.values()) clearTimeout(timer)
+    spellTokens.clear()
+  })
 
-    const changed =
-      newParagraphs.length !== originalParagraphs.length ||
-      newParagraphs.some((paragraph, index) => {
-        const original = originalParagraphs[index]
-        if (!original) return true
-        if (paragraph.runs.length !== original.runs.length) return true
-        if (paragraph.listStyle !== original.listStyle) return true
-        if (!paragraphStyleEqual(paragraph.style, original.style)) return true
-        return paragraph.runs.some(
-          (run, runIndex) =>
-            run.text !== original.runs[runIndex]?.text ||
-            run.bold !== original.runs[runIndex]?.bold ||
-            run.italic !== original.runs[runIndex]?.italic ||
-            run.underline !== original.runs[runIndex]?.underline ||
-            run.strikethrough !== original.runs[runIndex]?.strikethrough ||
-            run.verticalAlign !== original.runs[runIndex]?.verticalAlign ||
-            run.code !== original.runs[runIndex]?.code ||
-            run.fontFamily !== original.runs[runIndex]?.fontFamily,
-        )
-      })
-
-    if (changed) {
-      onEditTextBox({
-        slideId: slide.id,
-        shapeIndex,
-        paragraphs: newParagraphs,
-      })
-    }
+  /** Await before commands that save, navigate, or replace the document. */
+  export async function flushEdits(): Promise<void> {
+    await drafts.flush()
   }
 
-  /** Emits a text-box edit command on blur. */
+  function draftKey(shapeIndex: number, row?: number, col?: number): string {
+    return `${slide.id}:${shapeIndex}:${row ?? 'text'}:${col ?? ''}`
+  }
+
+  function textBoxValue(shapeIndex: number, paragraphs: ParagraphDto[]): string {
+    void draftRevision
+    return drafts.peek(draftKey(shapeIndex))?.text ?? textFromParagraphs(paragraphs)
+  }
+
+  function cellValue(shapeIndex: number, row: number, col: number, text: string): string {
+    void draftRevision
+    return drafts.peek(draftKey(shapeIndex, row, col))?.text ?? text
+  }
+
+  /** Reconcile against the latest local runs, including edits still in flight. */
+  function queueTextBox(textarea: HTMLTextAreaElement, shapeIndex: number): void {
+    if (!onEditTextBox) return
+    const key = draftKey(shapeIndex)
+    const pending = drafts.peek(key)
+    const textBox = slide.shapes[shapeIndex]?.value as TextBoxSnapshot | undefined
+    if (!textBox?.paragraphs) return
+    const originalParagraphs = pending?.kind === 'text' ? pending.paragraphs : textBox.paragraphs
+    if (textarea.value === textFromParagraphs(originalParagraphs)) return
+    const lines = textarea.value.split('\n')
+    const originals = alignParagraphs(lines, originalParagraphs) as Array<ParagraphDto | undefined>
+    drafts.set(key, {
+      kind: 'text', slideId: slide.id, shapeIndex, text: textarea.value,
+      paragraphs: lines.map((line, index) => buildParagraph(line, originals[index])),
+    })
+  }
+
+  /** Blur starts an immediate flush; explicit document actions await flushEdits. */
   function handleBlur(event: FocusEvent, shapeIndex: number): void {
-    commitTextBox(event.target as HTMLTextAreaElement, shapeIndex)
+    queueTextBox(event.target as HTMLTextAreaElement, shapeIndex)
+    void flushEdits().catch(() => {})
   }
 
   /** Dash pattern in EMU for a given dash style, matching slides-render. */
@@ -702,19 +766,15 @@
     return offsets
   }
 
-  /** Emits a cell-text edit command if the cell value changed on blur. */
-  function handleCellBlur(
-    event: FocusEvent,
-    shapeIndex: number,
-    row: number,
-    col: number,
-    original: string,
+  /** Capture a table edit on every input, before another command can run. */
+  function queueCellText(
+    event: Event, shapeIndex: number, row: number, col: number, original: string,
   ): void {
     if (!onSetCellText) return
-    const target = event.target as HTMLTextAreaElement
-    if (target.value !== original) {
-      onSetCellText({ slideId: slide.id, shapeIndex, row, col, text: target.value })
-    }
+    const text = (event.currentTarget as HTMLTextAreaElement).value
+    const key = draftKey(shapeIndex, row, col)
+    if (text === (drafts.peek(key)?.text ?? original)) return
+    drafts.set(key, { kind: 'cell', slideId: slide.id, shapeIndex, row, col, text })
   }
 
   /** Cache for rendered chart SVGs, keyed by a stable shape key. */
@@ -878,6 +938,7 @@
   function handleInput(event: Event, shapeIndex: number): void {
     const textarea = event.currentTarget as HTMLTextAreaElement
     liveText = { ...liveText, [shapeIndex]: textarea.value }
+    queueTextBox(textarea, shapeIndex)
     syncScroll(event)
     scheduleSpellCheck(shapeIndex, textarea.value)
   }
@@ -1015,7 +1076,8 @@
     textarea.focus()
     textarea.setSelectionRange(caret, caret)
     liveText = { ...liveText, [spellMenuShapeIndex]: next }
-    commitTextBox(textarea, spellMenuShapeIndex)
+    queueTextBox(textarea, spellMenuShapeIndex)
+    void flushEdits().catch(() => {})
     scheduleSpellCheck(spellMenuShapeIndex, next)
   }
 
@@ -1235,6 +1297,7 @@
   function onShapePointerDown(event: PointerEvent, shapeIndex: number): void {
     if (readonly) return
     onSelectShape?.({ shapeIndex })
+    if (event.target instanceof HTMLElement && event.target.closest('textarea, input, select, [contenteditable="true"]')) return
     if (shapeIndex === editingShapeIndex) return
     beginDrag(event, shapeIndex, 'move')
   }
@@ -1242,15 +1305,15 @@
   /** Selects a shape from the keyboard; Enter starts text editing when relevant. */
   function onShapeKeydown(event: KeyboardEvent, shapeIndex: number, isTextBox = false): void {
     if (readonly) return
-    if (event.key === 'Escape') {
-      event.preventDefault()
+    const action = shapeKeyboardAction(event, isTextBox)
+    if (!action) return
+    event.preventDefault()
+    if (action === 'exit') {
       onEditShape?.({ shapeIndex: null })
       return
     }
-    if (event.key !== 'Enter' && event.key !== ' ') return
-    event.preventDefault()
     onSelectShape?.({ shapeIndex })
-    if (event.key === 'Enter' && isTextBox) onEditShape?.({ shapeIndex })
+    if (action === 'edit') onEditShape?.({ shapeIndex })
   }
 
   /** Converts a pointer coordinate into clamped slide EMUs. */
@@ -1324,7 +1387,7 @@
 
   /** Escape while editing exits text-edit mode but keeps the shape selected. */
   function onEditKeydown(event: KeyboardEvent): void {
-    if (event.key !== 'Escape') return
+    if (event.key !== 'Escape' || event.isComposing) return
     event.preventDefault()
     const target = event.currentTarget as HTMLTextAreaElement
     onEditShape?.({ shapeIndex: null })
@@ -1395,6 +1458,8 @@
     style:width={canvasWidthPx}
     style:height={canvasHeightPx}
     style:background-color={toRgba(effectiveBackground)}
+    style:color={defaultTextColor}
+    style:font-family={fontStack(bodyFont)}
     style:transform={`scale(${slideSurface.surfaceScale})`}
     role="application"
     aria-label="Slide canvas"
@@ -1421,7 +1486,8 @@
       {@const frame = liveFrame(shapeIndex, textBox.frame) ?? textBox.frame}
       {@const isEditing = !readonly && shapeIndex === editingShapeIndex}
       {@const interactive = isInteractiveShape(shapeIndex)}
-      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <!-- The wrapper is tabbable only in button mode; editing exposes the textarea. -->
+      <!-- svelte-ignore a11y_no_static_element_interactions, a11y_no_noninteractive_tabindex -->
       <div
         class="text-box-container"
         class:build-shape={buildStateFor(shapeIndex) !== undefined}
@@ -1440,21 +1506,23 @@
         onkeydown={(event) => onShapeKeydown(event, shapeIndex, true)}
         ondblclick={() => onTextBoxDblClick(shapeIndex)}
         oncontextmenu={(event) => handleShapeContextMenu(event, textBox.id, shapeIndex)}
-        tabindex={readonly ? -1 : 0}
-        role="button"
+        tabindex={readonly || isEditing ? -1 : 0}
+        role={isEditing ? 'group' : 'button'}
         aria-label="Text box"
       >
         {#if isEditing}
           <div class="text-box-editor">
-            <div class="text-box-overlay" aria-hidden="true">
+            <div class="text-box-overlay" style={editorTypography(textBox.paragraphs)} aria-hidden="true">
               {@html textBoxOverlay(shapeIndex, textBox.paragraphs)}
             </div>
             <textarea
               class="text-box"
+              style={editorTypography(textBox.paragraphs)}
+              style:color={textBox.paragraphs[0]?.runs[0] ? runColor(textBox.paragraphs[0].runs[0]) : undefined}
               bind:this={editBoxTextarea}
               data-slide-id={slide.id}
               data-shape-index={shapeIndex}
-              value={textFromParagraphs(textBox.paragraphs)}
+              value={textBoxValue(shapeIndex, textBox.paragraphs)}
               oninput={(event) => handleInput(event, shapeIndex)}
               onscroll={syncScroll}
               onkeydown={onEditKeydown}
@@ -1471,9 +1539,9 @@
         {:else}
           <div class="text-box-readonly">
             {#each textBox.paragraphs as paragraph, pIndex}
-              <p class={readonlyParagraphClass(paragraph.style, pIndex)}>
+              <p class={readonlyParagraphClass(paragraph.style, pIndex)} style:font-family={paragraphFont(paragraph)}>
                 {#each paragraph.runs as run}
-                  <span class={runClass(run)}>{run.text}</span>
+                  <span class={runClass(run)} style:font-size={runFontSize(run)} style:font-family={runFont(run, paragraph)} style:color={runColor(run)}>{run.text}</span>
                 {/each}
               </p>
             {/each}
@@ -1595,8 +1663,8 @@
         onpointerdown={(event) => onShapePointerDown(event, shapeIndex)}
         onkeydown={(event) => onShapeKeydown(event, shapeIndex)}
         oncontextmenu={(event) => handleShapeContextMenu(event, table.id, shapeIndex)}
-        tabindex={readonly ? -1 : 0}
-        role="button"
+        tabindex="-1"
+        role="group"
         aria-label="Table"
         style:left={toPx(tframe.x)}
         style:top={toPx(tframe.y)}
@@ -1636,9 +1704,10 @@
                   data-row={rowIndex}
                   data-col={colIndex}
                   style:text-align={cellTextAlign(cell.align)}
-                  value={cell.text}
+                  value={cellValue(shapeIndex, rowIndex, colIndex, cell.text)}
                   onfocus={() => onCellFocus?.({ shapeIndex, row: rowIndex, col: colIndex })}
-                  onblur={(event) => handleCellBlur(event, shapeIndex, rowIndex, colIndex, cell.text)}
+                  oninput={(event) => queueCellText(event, shapeIndex, rowIndex, colIndex, cell.text)}
+                  onblur={() => { void flushEdits().catch(() => {}) }}
                   aria-label={`Cell row ${rowIndex + 1} column ${colIndex + 1}`}
                 ></textarea>
               {/if}
@@ -1781,6 +1850,7 @@
     box-shadow: 0 0 0 1px #ccc;
     overflow: hidden;
     transform-origin: top left;
+    font-size: 24px;
   }
   .canvas-footprint {
     position: relative;
@@ -1900,7 +1970,8 @@
     border: 1px solid transparent;
     padding: 0.25rem;
     font-family: inherit;
-    font-size: 1rem;
+    font-size: inherit;
+    box-sizing: border-box;
     line-height: 1.3;
     white-space: pre-wrap;
     overflow-wrap: break-word;
@@ -1924,7 +1995,9 @@
     background: transparent;
     resize: none;
     font-family: inherit;
-    font-size: 1rem;
+    font-size: inherit;
+    color: inherit;
+    box-sizing: border-box;
     line-height: 1.3;
     padding: 0.25rem;
   }
@@ -1935,6 +2008,7 @@
     width: 100%;
     height: 100%;
     padding: 0.25rem;
+    box-sizing: border-box;
   }
   .text-box-readonly p {
     margin: 0 0 0.5rem;
@@ -1963,27 +2037,27 @@
     font-family: 'Courier New', monospace;
   }
   .text-box-readonly p.heading-1 {
-    font-size: 2rem;
+    font-size: 2em;
     font-weight: bold;
   }
   .text-box-readonly p.heading-2 {
-    font-size: 1.5rem;
+    font-size: 1.5em;
     font-weight: bold;
   }
   .text-box-readonly p.heading-3 {
-    font-size: 1.25rem;
+    font-size: 1.25em;
     font-weight: bold;
   }
   .text-box-readonly p.heading-4 {
-    font-size: 1.1rem;
+    font-size: 1.1em;
     font-weight: bold;
   }
   .text-box-readonly p.heading-5 {
-    font-size: 1rem;
+    font-size: 1em;
     font-weight: bold;
   }
   .text-box-readonly p.heading-6 {
-    font-size: 0.9rem;
+    font-size: 0.9em;
     font-weight: bold;
   }
   .text-box-readonly p.blockquote {

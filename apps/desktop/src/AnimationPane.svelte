@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { invoke } from '@tauri-apps/api/core'
+  import { invokeApp as invoke } from './lib/invokeDeckSnapshot'
   import MotionPathEditor from './MotionPathEditor.svelte'
   import type {
     BuildEffectDto,

@@ -5,21 +5,31 @@
     SlideSnapshot,
     TextBoxSnapshot,
   } from './lib/types'
+  import {
+    requestThumbnail,
+    thumbnailRevisionKey,
+  } from './lib/thumbnailCache.js'
 
   /** Props for a slide thumbnail. */
   interface Props {
     /** Slide data to preview. */
     slide: SlideSnapshot
+    /** Signature of every deck-wide input used by the backend renderer. */
+    deckRenderKey: string
+    /** Aspect ratio for the thumbnail frame. */
+    aspectRatio: string
     /** Whether this thumbnail is currently selected. */
     selected: boolean
     /** Click handler to select the slide. */
     onClick: () => void
   }
 
-  let { slide, selected, onClick }: Props = $props()
+  let { slide, deckRenderKey, aspectRatio, selected, onClick }: Props = $props()
 
   /** Rendered SVG markup from the backend, or null while loading. */
   let svg = $state<string | null>(null)
+  let visible = $state(false)
+  let thumbnailElement = $state<HTMLButtonElement>()
 
   /** Builds a short text preview of the slide (fallback while SVG loads). */
   function previewText(): string {
@@ -41,34 +51,49 @@
       .trim()
   }
 
-  // Re-render the thumbnail SVG whenever the slide identity or its shape list
-  // changes (the backend hands back fresh snapshot objects after each command).
+  // Render only thumbnails in or near the viewport. Environments without
+  // IntersectionObserver (including test harnesses) fall back to eager render.
   $effect(() => {
-    const id = slide.id
-    const shapeCount = slide.shapes.length
-    let cancelled = false
-    svg = null
-    invoke<string>('render_slide_svg', { slideId: id })
-      .then((markup) => {
-        if (!cancelled && slide.id === id && slide.shapes.length === shapeCount) {
-          svg = markup
-        }
-      })
-      .catch(() => {
-        if (!cancelled) svg = null
-      })
-    return () => {
-      cancelled = true
+    const element = thumbnailElement
+    if (!element) return
+    if (typeof IntersectionObserver === 'undefined') {
+      visible = true
+      return
     }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        visible = entries.some((entry) => entry.isIntersecting)
+      },
+      { rootMargin: '160px 0px' },
+    )
+    observer.observe(element)
+    return () => observer.disconnect()
+  })
+
+  $effect(() => {
+    // Each offscreen component must release its SVG, otherwise it keeps an
+    // unbounded second copy/reference after the shared LRU evicts the entry.
+    svg = null
+    if (!visible) return
+
+    const key = thumbnailRevisionKey(slide, deckRenderKey)
+    const slideId = slide.id
+    return requestThumbnail(
+      key,
+      () => invoke<string>('render_slide_svg', { slideId }),
+      (markup) => { svg = markup },
+    )
   })
 </script>
 
 <button
+  bind:this={thumbnailElement}
   class="thumbnail"
   class:selected
   onclick={onClick}
   type="button"
   aria-label={`Slide ${slide.id}`}
+  style:aspect-ratio={aspectRatio}
 >
   {#if svg}
     <div class="preview-svg">{@html svg}</div>
@@ -80,7 +105,6 @@
 <style>
   .thumbnail {
     width: 100%;
-    aspect-ratio: 16 / 9;
     padding: 0.25rem;
     margin-bottom: 0.5rem;
     border: 1px solid #ccc;

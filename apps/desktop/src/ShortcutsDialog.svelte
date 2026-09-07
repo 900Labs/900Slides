@@ -13,7 +13,7 @@
       title: 'Global',
       shortcuts: [
         { keys: 'Ctrl/Cmd+F', label: 'Find' },
-        { keys: 'Ctrl/Cmd+H', label: 'Find and replace' },
+        { keys: 'Ctrl+H / Cmd+Option+F', label: 'Find and replace' },
         { keys: '?', label: 'Open this shortcuts dialog' },
         { keys: 'Esc', label: 'Close dialog' },
       ],

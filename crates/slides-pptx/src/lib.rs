@@ -46,6 +46,7 @@ pub fn load(bytes: &[u8]) -> Result<Session> {
         result.package_rels,
         content_types,
         result.slide_paths,
+        result.shape_package_ids,
         result.slide_media_rids,
         result.chart_source_parts,
         result.original_chart_bytes,

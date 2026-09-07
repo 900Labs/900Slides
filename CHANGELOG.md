@@ -7,22 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-This section tracks work toward v0.2.0 (editor completeness). See
-[`docs/ROADMAP.md`](docs/ROADMAP.md),
-[`docs/sprint-records/wave-1.md`](docs/sprint-records/wave-1.md),
-[`docs/sprint-records/wave-2.md`](docs/sprint-records/wave-2.md),
-[`docs/sprint-records/wave-3.md`](docs/sprint-records/wave-3.md),
-[`docs/sprint-records/wave-4.md`](docs/sprint-records/wave-4.md), and
-[`docs/sprint-records/wave-5.md`](docs/sprint-records/wave-5.md), and
-[`docs/sprint-records/wave-6.md`](docs/sprint-records/wave-6.md), and
-[`docs/sprint-records/wave-7.md`](docs/sprint-records/wave-7.md), and
-[`docs/sprint-records/wave-8.md`](docs/sprint-records/wave-8.md), and
-[`docs/sprint-records/wave-9.md`](docs/sprint-records/wave-9.md),
-[`docs/sprint-records/wave-10.md`](docs/sprint-records/wave-10.md), and
-[`docs/sprint-records/wave-11.md`](docs/sprint-records/wave-11.md), and
-[`docs/sprint-records/wave-12.md`](docs/sprint-records/wave-12.md), and
-[`docs/sprint-records/wave-13.md`](docs/sprint-records/wave-13.md), and
-[`docs/sprint-records/wave-14.md`](docs/sprint-records/wave-14.md).
+### Added — Wave 23 (reliable editing and modest-hardware readiness)
+
+- Save and Save As have separate behavior; document status and unsaved-work
+  prompts protect New, Open, and Quit. Atomic replacement preserves the previous
+  file when writing fails. Active text, notes and table drafts flush before
+  document actions and commit during typing.
+- Bounded undo history rolls forward after 100 edits instead of blocking new
+  work; oversized individual transactions remain rejected.
+- Undoable slide reordering/deletion with package preservation across saved
+  deletions; section boundaries/comments stay consistent.
+- Fixed text entry swallowing spaces/newlines, preserved explicit font size/color
+  through editing and export, and restored the native macOS application/File menus.
+- A clearer document header, first-slide guidance, compact editor controls,
+  responsive template previews, and keyboard-safe dialogs.
+- Thumbnail and historical media caches have byte budgets and release stale or
+  offscreen data. Active source media is still part of the document working set.
+- Chart round-trip fixes cover edit/save/undo/save and structural edits. Presenter
+  background colors match the editor; embedded image/font resources are allowed
+  by the production content policy.
+- Saved PPTX shapes receive valid, distinct numeric package IDs while preserving
+  editor identity, comment associations and animation targets across reopening.
+- Frontend tests/build and separate desktop checks are included in CI. Release
+  jobs explicitly request platform bundles and fail if artifacts are absent;
+  Windows packaging includes an offline WebView2 installer.
+- Updated competitor research and measurable low-resource acceptance criteria.
+  Hardware, cross-platform installation, localization and accessibility
+  qualification remain open. The document check score does not establish WCAG
+  conformance.
+- See [`docs/sprint-records/wave-23.md`](docs/sprint-records/wave-23.md) for the
+  audit, verification results and remaining release gates.
+
+### Added — Wave 22 (performance and release size)
+
+- Debounced recovery, lazy spell-check, revision-aware media snapshots and
+  viewport-aware thumbnail rendering.
+- Reduced image/ZIP features and optimized release profile in the separate Tauri
+  workspace. A fresh production executable is checked against the 16 MiB budget.
+- See [`docs/sprint-records/wave-22.md`](docs/sprint-records/wave-22.md).
+
+### Added — Wave 21 (editor interactions)
+
+- Native menu wiring, compact toolbar, direct text/shape editing and an inspector.
+- See [`docs/sprint-records/wave-21.md`](docs/sprint-records/wave-21.md).
 
 ## [0.4.0] — 2026-07-30
 
@@ -61,12 +88,12 @@ This section tracks work toward v0.2.0 (editor completeness). See
   `SetBuildStepMotionPath`, `SetSlideReduceMotion`.
 - `docs/sprint-records/wave-19.md` documenting the wave scope.
 
-### Added — Wave 18 (accessibility checker + WCAG 2.2 AA)
+### Added — Wave 18 (document accessibility checker)
 
 - An **accessibility checker** audits decks for common issues: missing alt
   text, low-contrast text, missing slide titles, reading-order problems,
   small text, and empty slides. Runs offline against the deck model.
-- **WCAG 2.2 AA conformance score** (0-100): computed from issue count and
+- **Heuristic document check score** (0-100): computed from issue count and
   severity (errors -10, warnings -3, suggestions -1, floored at 0).
 - Contrast ratios computed using the WCAG relative luminance formula with
   correct sRGB gamma correction. Large-text threshold (3:1) applies to

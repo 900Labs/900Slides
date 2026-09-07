@@ -43,7 +43,7 @@ jobs:
         run: cargo test --workspace
 
   desktop-frontend:
-    name: Desktop frontend (svelte-check)
+    name: Desktop frontend (check, test, build)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -58,6 +58,12 @@ jobs:
 
       - name: svelte-check
         run: npm run check --prefix apps/desktop
+
+      - name: Frontend unit tests
+        run: npm test --prefix apps/desktop
+
+      - name: Production frontend
+        run: npm run build --prefix apps/desktop
 
   desktop-build:
     name: Desktop Rust target build
@@ -85,8 +91,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
-      - name: Build desktop target
-        run: cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml
+      - name: Desktop formatting
+        run: cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml -- --check
+
+      - name: Desktop clippy
+        run: cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: Desktop tests
+        run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
+
+      - name: Production desktop build
+        run: npm run tauri:build --prefix apps/desktop -- --no-bundle
 
   privacy-gate:
     name: Public-release privacy gate

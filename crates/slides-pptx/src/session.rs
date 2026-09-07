@@ -1,13 +1,23 @@
 //! Editing session that binds a loaded deck to its original PPTX bytes.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::io::{Cursor, Write};
+use std::sync::Arc;
 
-use slides_core::{ChartShape, Command, CommandBus};
+use slides_core::{Command, CommandBus};
 
 use crate::error::Result;
 use crate::ledger::LossLedger;
 use crate::package::{ContentTypes, Rel};
 use crate::Deck;
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ShapeIdMapping {
+    pub slide_path: String,
+    pub model_id: String,
+    pub package_id: String,
+}
 
 /// An editing session that owns the in-memory deck and the original package
 /// bytes needed for a lossless save.
@@ -17,12 +27,17 @@ pub struct Session {
     pub deck: Deck,
     /// Original PPTX bytes used to preserve untouched parts.
     pub(crate) original_bytes: Vec<u8>,
+    /// Deleted slide XML and relationship parts retained only for session undo.
+    /// They are excluded from saved decks until that slide is restored.
+    retained_slide_parts: HashMap<String, Arc<[u8]>>,
     /// Package relationships from `_rels/.rels`.
     pub(crate) package_rels: Vec<Rel>,
     /// Parsed `[Content_Types].xml`.
     pub(crate) content_types: ContentTypes,
     /// Map of slide id to original part path.
     pub(crate) slide_paths: HashMap<String, String>,
+    /// Stable model shape IDs mapped to schema-valid numeric OOXML IDs.
+    pub(crate) shape_package_ids: HashMap<String, HashMap<String, String>>,
     /// For each slide (keyed by id), a map from a media content key (into
     /// `deck.media`) to the OOXML relationship id that resolves it. Used by the
     /// saver to emit `<a:blip r:embed="...">` for modeled images and to recognize
@@ -34,11 +49,9 @@ pub struct Session {
     pub(crate) manifest_rel_id: Option<String>,
     /// Slide ids that have been edited and need regeneration on save.
     pub(crate) dirty_slides: HashSet<String>,
-    /// Chart part paths that have been edited and need patching on save.
-    pub(crate) dirty_charts: HashSet<String>,
-    /// For each slide (keyed by id), a map from shape index to the chart part
-    /// path that backs the chart shape.
-    pub(crate) chart_source_parts: HashMap<String, HashMap<usize, String>>,
+    /// For each slide (keyed by id), a map from stable shape id to the chart
+    /// part path that backs it. Shape positions can change after deletions.
+    pub(crate) chart_source_parts: HashMap<String, HashMap<String, String>>,
     /// Original bytes of every chart part encountered during load, keyed by part
     /// path. Used by the saver to preserve unedited chart XML byte-for-byte.
     pub(crate) original_chart_bytes: HashMap<String, Vec<u8>>,
@@ -72,14 +85,15 @@ impl Session {
         Self {
             deck,
             original_bytes,
+            retained_slide_parts: HashMap::new(),
             package_rels,
             content_types,
             slide_paths,
+            shape_package_ids: HashMap::new(),
             slide_media_rids,
             manifest_path,
             manifest_rel_id,
             dirty_slides: HashSet::new(),
-            dirty_charts: HashSet::new(),
             chart_source_parts: HashMap::new(),
             original_chart_bytes: HashMap::new(),
             slide_chart_rids: HashMap::new(),
@@ -96,6 +110,7 @@ impl Session {
         package_rels: Vec<Rel>,
         content_types: ContentTypes,
         slide_paths: HashMap<String, String>,
+        shape_package_ids: HashMap<String, HashMap<String, String>>,
         slide_media_rids: HashMap<String, HashMap<String, String>>,
         chart_source_parts: HashMap<String, HashMap<usize, String>>,
         original_chart_bytes: HashMap<String, Vec<u8>>,
@@ -108,17 +123,31 @@ impl Session {
             .iter()
             .find(|r| r.rel_type == crate::package::REL_TYPE_MANIFEST)
             .map(|r| r.id.clone());
+        let chart_source_parts = chart_source_parts
+            .into_iter()
+            .filter_map(|(slide_id, parts)| {
+                let slide = deck.slide(&slide_id)?;
+                let parts = parts
+                    .into_iter()
+                    .filter_map(|(index, part)| {
+                        Some((slide.shapes.get(index)?.id().to_string(), part))
+                    })
+                    .collect();
+                Some((slide_id, parts))
+            })
+            .collect();
         Self {
             deck,
             original_bytes,
+            retained_slide_parts: HashMap::new(),
             package_rels,
             content_types,
             slide_paths,
+            shape_package_ids,
             slide_media_rids,
             manifest_path,
             manifest_rel_id,
             dirty_slides: HashSet::new(),
-            dirty_charts: HashSet::new(),
             chart_source_parts,
             original_chart_bytes,
             slide_chart_rids,
@@ -156,29 +185,18 @@ impl Session {
         &self.dirty_slides
     }
 
-    /// Applies a command transactionally and tracks dirty slides and chart parts.
+    /// Applies a command transactionally and tracks dirty slides. Chart content
+    /// is compared with the saved package during save, including after undo.
     pub fn execute(&mut self, command: Box<dyn Command>) -> Result<()> {
         let affected = command.affected_slide_ids();
-        // Snapshot chart shapes on affected slides so we can detect chart edits.
-        let before: HashMap<String, Vec<Option<ChartShape>>> = affected
-            .iter()
-            .filter_map(|id| {
-                let slide = self.deck.slides.iter().find(|s| s.id == *id)?;
-                Some((
-                    id.clone(),
-                    slide
-                        .shapes
-                        .iter()
-                        .map(|s| match s {
-                            slides_core::Shape::Chart(c) => Some(c.clone()),
-                            _ => None,
-                        })
-                        .collect(),
-                ))
-            })
-            .collect();
-
+        let affects_content = command.affects_slide_content();
         self.command_bus.apply(command, &mut self.deck)?;
+        self.prune_retained_sources();
+
+        if !affects_content {
+            self.dirty_slides.retain(|id| self.deck.slide(id).is_some());
+            return Ok(());
+        }
 
         if affected.is_empty() {
             // Deck-level commands (SetTemplate, SetHighContrast, etc.) return
@@ -191,29 +209,6 @@ impl Session {
         } else {
             for id in affected {
                 self.mark_slide_dirty(&id);
-                // Mark chart parts dirty when chart data, title, or type changed.
-                if let Some(before_shapes) = before.get(&id) {
-                    if let Some(after_slide) = self.deck.slides.iter().find(|s| s.id == id) {
-                        for (index, before_chart) in before_shapes.iter().enumerate() {
-                            let after_chart = after_slide.shapes.get(index).and_then(|s| match s {
-                                slides_core::Shape::Chart(c) => Some(c),
-                                _ => None,
-                            });
-                            if let (Some(before), Some(after)) = (before_chart, after_chart) {
-                                if before.chart_type != after.chart_type
-                                    || before.data != after.data
-                                    || before.title != after.title
-                                {
-                                    if let Some(parts) = self.chart_source_parts.get(&id) {
-                                        if let Some(part) = parts.get(&index) {
-                                            self.dirty_charts.insert(part.clone());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
             }
         }
         Ok(())
@@ -223,8 +218,11 @@ impl Session {
     ///
     /// Returns `true` if a command was undone.
     pub fn undo(&mut self) -> bool {
+        let affects_content = self.command_bus.undo_affects_slide_content();
         if let Some(affected) = self.command_bus.undo(&mut self.deck) {
-            if affected.is_empty() {
+            if !affects_content {
+                // Presentation order is saved independently of slide content.
+            } else if affected.is_empty() {
                 for slide in &self.deck.slides {
                     self.dirty_slides.insert(slide.id.clone());
                 }
@@ -234,6 +232,7 @@ impl Session {
                 }
             }
             self.dirty_slides.retain(|id| self.deck.slide(id).is_some());
+            self.prune_retained_sources();
             true
         } else {
             false
@@ -242,8 +241,11 @@ impl Session {
 
     /// Re-applies the most recently undone command.
     pub fn redo(&mut self) -> bool {
+        let affects_content = self.command_bus.redo_affects_slide_content();
         if let Some(affected) = self.command_bus.redo(&mut self.deck) {
-            if affected.is_empty() {
+            if !affects_content {
+                // Presentation order is saved independently of slide content.
+            } else if affected.is_empty() {
                 for slide in &self.deck.slides {
                     self.dirty_slides.insert(slide.id.clone());
                 }
@@ -253,6 +255,7 @@ impl Session {
                 }
             }
             self.dirty_slides.retain(|id| self.deck.slide(id).is_some());
+            self.prune_retained_sources();
             true
         } else {
             false
@@ -264,6 +267,70 @@ impl Session {
         self.command_bus.redo_len()
     }
 
+    fn prune_retained_sources(&mut self) {
+        let mut retained_ids = self.command_bus.history_slide_ids();
+        retained_ids.extend(self.deck.slides.iter().map(|slide| slide.id.clone()));
+        self.slide_paths.retain(|id, _| retained_ids.contains(id));
+        self.shape_package_ids
+            .retain(|id, _| retained_ids.contains(id));
+        self.slide_media_rids
+            .retain(|id, _| retained_ids.contains(id));
+        self.chart_source_parts
+            .retain(|id, _| retained_ids.contains(id));
+        self.slide_chart_rids
+            .retain(|id, _| retained_ids.contains(id));
+        let retained_paths: HashSet<String> = self
+            .slide_paths
+            .values()
+            .flat_map(|path| [path.clone(), crate::load::rels_path_for(path)])
+            .collect();
+        self.retained_slide_parts
+            .retain(|path, _| retained_paths.contains(path));
+        let chart_paths: HashSet<&String> = self
+            .chart_source_parts
+            .values()
+            .flat_map(|parts| parts.values())
+            .collect();
+        self.original_chart_bytes
+            .retain(|path, _| chart_paths.contains(path));
+    }
+
+    /// Restores source parts to the save input only when their deleted slide
+    /// has been undone. The actual saved package still excludes deleted slides.
+    pub(crate) fn source_bytes_for_save(&self) -> Result<Cow<'_, [u8]>> {
+        let mut restored = Vec::new();
+        for slide in &self.deck.slides {
+            if let Some(path) = self.slide_paths.get(&slide.id) {
+                for part in [path.clone(), crate::load::rels_path_for(path)] {
+                    if let Some(bytes) = self.retained_slide_parts.get(&part) {
+                        restored.push((part, bytes));
+                    }
+                }
+            }
+        }
+        if restored.is_empty() {
+            return Ok(Cow::Borrowed(&self.original_bytes));
+        }
+        restored.sort_by(|(left, _), (right, _)| left.cmp(right));
+        let mut archive = zip::ZipArchive::new(Cursor::new(self.original_bytes.as_slice()))?;
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let existing: HashSet<String> = archive.file_names().map(str::to_string).collect();
+        for index in 0..archive.len() {
+            writer.raw_copy_file(archive.by_index(index)?)?;
+        }
+        for (part, bytes) in restored {
+            if !existing.contains(&part) {
+                writer.start_file(
+                    part,
+                    zip::write::FileOptions::<()>::default()
+                        .compression_method(zip::CompressionMethod::Deflated),
+                )?;
+                writer.write_all(bytes)?;
+            }
+        }
+        Ok(Cow::Owned(writer.finish()?.into_inner()))
+    }
+
     /// Commits a successful save by replacing the original bytes and clearing
     /// the dirty slide set.
     ///
@@ -273,10 +340,12 @@ impl Session {
     /// instead of being treated as an unpersistable new slide.
     pub fn commit_save(&mut self, new_bytes: Vec<u8>) -> Result<()> {
         let loaded = crate::load::load(&new_bytes)?;
-        let content_types =
-            crate::load::open_and_validate(&new_bytes).and_then(|mut archive| {
+        let (content_types, saved_part_paths) = crate::load::open_and_validate(&new_bytes)
+            .and_then(|mut archive| {
                 let xml = crate::load::read_entry_to_string(&mut archive, "[Content_Types].xml")?;
-                crate::package::parse_content_types(&xml)
+                let content_types = crate::package::parse_content_types(&xml)?;
+                let paths: HashSet<String> = archive.file_names().map(str::to_string).collect();
+                Ok((content_types, paths))
             })?;
         if loaded.deck.slides.len() != self.deck.slides.len() {
             return Err(crate::error::Error::Save(
@@ -284,10 +353,30 @@ impl Session {
                     .to_string(),
             ));
         }
-        let mut slide_paths = HashMap::new();
-        let mut slide_media_rids = HashMap::new();
-        let mut chart_source_parts = HashMap::new();
-        let mut slide_chart_rids = HashMap::new();
+        let mut retained_slide_parts = self.retained_slide_parts.clone();
+        retained_slide_parts.retain(|part, _| !saved_part_paths.contains(part));
+        let mut previous_archive = crate::load::open_and_validate(&self.original_bytes)?;
+        for path in self.slide_paths.values() {
+            if !saved_part_paths.contains(path) {
+                for part in [path.clone(), crate::load::rels_path_for(path)] {
+                    if let Ok(bytes) =
+                        crate::load::read_entry_to_bytes(&mut previous_archive, &part)
+                    {
+                        retained_slide_parts.insert(part, Arc::from(bytes));
+                    }
+                }
+            }
+        }
+        let mut slide_paths = self.slide_paths.clone();
+        let mut shape_package_ids = self.shape_package_ids.clone();
+        let mut slide_media_rids = self.slide_media_rids.clone();
+        // Deleted chart parts are preserved in the package. Keep their stable
+        // associations so undo after a save can restore the original XML.
+        let mut chart_source_parts = self.chart_source_parts.clone();
+        for parts in chart_source_parts.values_mut() {
+            parts.retain(|_, part| saved_part_paths.contains(part));
+        }
+        let mut slide_chart_rids = self.slide_chart_rids.clone();
 
         for (current, reloaded) in self.deck.slides.iter().zip(&loaded.deck.slides) {
             let path = loaded.slide_paths.get(&reloaded.id).ok_or_else(|| {
@@ -297,11 +386,23 @@ impl Session {
                 )
             })?;
             slide_paths.insert(current.id.clone(), path.clone());
+            if let Some(ids) = loaded.shape_package_ids.get(&reloaded.id) {
+                shape_package_ids.insert(current.id.clone(), ids.clone());
+            }
             if let Some(rids) = loaded.slide_media_rids.get(&reloaded.id) {
                 slide_media_rids.insert(current.id.clone(), rids.clone());
             }
             if let Some(parts) = loaded.chart_source_parts.get(&reloaded.id) {
-                chart_source_parts.insert(current.id.clone(), parts.clone());
+                let current_parts = chart_source_parts.entry(current.id.clone()).or_default();
+                for (index, part) in parts {
+                    let shape = current.shapes.get(*index).ok_or_else(|| {
+                        crate::error::Error::Save(
+                            "saved chart has no matching model shape; refusing to discard dirty state"
+                                .to_string(),
+                        )
+                    })?;
+                    current_parts.insert(shape.id().to_string(), part.clone());
+                }
             }
             if let Some(rids) = loaded.slide_chart_rids.get(&reloaded.id) {
                 slide_chart_rids.insert(current.id.clone(), rids.clone());
@@ -311,9 +412,13 @@ impl Session {
         self.package_rels = loaded.package_rels;
         self.content_types = content_types;
         self.slide_paths = slide_paths;
+        self.shape_package_ids = shape_package_ids;
         self.slide_media_rids = slide_media_rids;
         self.chart_source_parts = chart_source_parts;
-        self.original_chart_bytes = loaded.original_chart_bytes;
+        self.original_chart_bytes
+            .retain(|part, _| saved_part_paths.contains(part));
+        self.original_chart_bytes
+            .extend(loaded.original_chart_bytes);
         self.slide_chart_rids = slide_chart_rids;
         self.manifest_path = loaded
             .manifest_path
@@ -324,13 +429,49 @@ impl Session {
             .find(|rel| rel.rel_type == crate::package::REL_TYPE_MANIFEST)
             .map(|rel| rel.id.clone());
         self.original_bytes = new_bytes;
+        self.retained_slide_parts = retained_slide_parts;
         self.dirty_slides.clear();
-        self.dirty_charts.clear();
+        self.prune_retained_sources();
         Ok(())
     }
 
     /// Returns the number of transactions available to undo.
     pub fn undo_len(&self) -> usize {
         self.command_bus.undo_len()
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    use slides_core::{DeleteSlide, InsertSlide, SetHighContrast, Slide};
+
+    #[test]
+    fn evicted_deleted_slide_sources_are_released() {
+        let mut session = crate::load(&crate::create_blank_pptx()).unwrap();
+        let removed_id = session.deck.slides[0].id.clone();
+        session
+            .execute(Box::new(InsertSlide::new(
+                1,
+                Slide {
+                    id: "remaining".into(),
+                    ..Default::default()
+                },
+            )))
+            .unwrap();
+        session.commit_save(crate::save(&session).unwrap()).unwrap();
+        session
+            .execute(Box::new(DeleteSlide::new(removed_id.clone())))
+            .unwrap();
+        session.commit_save(crate::save(&session).unwrap()).unwrap();
+        assert!(!session.retained_slide_parts.is_empty());
+        for index in 0..CommandBus::MAX_TRANSACTIONS {
+            session
+                .execute(Box::new(SetHighContrast::new(index % 2 == 0)))
+                .unwrap();
+        }
+        assert!(!session.slide_paths.contains_key(&removed_id));
+        assert!(session.retained_slide_parts.is_empty());
+        assert_eq!(session.undo_len(), CommandBus::MAX_TRANSACTIONS);
     }
 }

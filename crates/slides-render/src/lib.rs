@@ -558,9 +558,18 @@ fn line_step_state(
 
 /// Renders a text box as a `<g>` containing one `<text>` per paragraph.
 fn render_text_box(text_box: &TextBox, theme: &Theme, code_active_step: usize, out: &mut String) {
-    out.push_str("<g>");
+    let background = theme.background;
+    let dark_background =
+        (0.299 * background.r as f64 + 0.587 * background.g as f64 + 0.114 * background.b as f64)
+            < 140.0;
+    let foreground = if theme.high_contrast || dark_background {
+        "#ffffff"
+    } else {
+        "#202637"
+    };
+    out.push_str(&format!("<g fill=\"{foreground}\">"));
     let base_x = text_box.frame.x + TEXT_PADDING_EMU;
-    let line_height = TEXT_LINE_HEIGHT_EMU;
+    let mut baseline = text_box.frame.y;
     for (index, paragraph) in text_box.paragraphs.iter().enumerate() {
         let style = &paragraph.style;
         let logical_x = base_x + style.indent_level as f64 * INDENT_EMU;
@@ -570,7 +579,15 @@ fn render_text_box(text_box: &TextBox, theme: &Theme, code_active_step: usize, o
             } else {
                 0.0
             };
-        let y = text_box.frame.y + line_height * (index as f64 + 1.0);
+        let largest_run = paragraph
+            .runs
+            .iter()
+            .filter_map(|run| run.font_size)
+            .filter(|size| size.is_finite() && *size > 0.0)
+            .fold(paragraph_font(paragraph, theme).1, f64::max);
+        let line_height = TEXT_LINE_HEIGHT_EMU.max(largest_run * 1.25);
+        baseline += line_height;
+        let y = baseline;
 
         // Stepped-code highlighting applies only to code blocks carrying a
         // non-empty `code_step_ranges`; everything else renders normally so old
@@ -615,7 +632,7 @@ fn render_text_box(text_box: &TextBox, theme: &Theme, code_active_step: usize, o
         }
 
         for run in &paragraph.runs {
-            push_run(run, out);
+            push_run(run, out, theme.high_contrast);
         }
         out.push_str("</text>");
 
@@ -719,7 +736,7 @@ fn push_list_marker(paragraph: &Paragraph, index: usize, out: &mut String) {
 }
 
 /// Pushes a run as a `<tspan>` with run-level formatting.
-fn push_run(run: &Run, out: &mut String) {
+fn push_run(run: &Run, out: &mut String, high_contrast: bool) {
     if let Some(link) = &run.link {
         let href = escape_xml(&link.url);
         if is_safe_href(&link.url) {
@@ -742,15 +759,37 @@ fn push_run(run: &Run, out: &mut String) {
         (false, true) => out.push_str(" text-decoration=\"line-through\""),
         (false, false) => {}
     }
+    if let Some(color) = run.color.as_ref().filter(|_| !high_contrast) {
+        out.push_str(&format!(" fill=\"{}\"", hex_color(color)));
+        if color.a < 255 {
+            out.push_str(&format!(
+                " fill-opacity=\"{}\"",
+                fnum(color.a as f64 / 255.0)
+            ));
+        }
+    }
+    let explicit_size = run.font_size.filter(|size| size.is_finite() && *size > 0.0);
+    if let Some(size) = explicit_size {
+        let size = if run.vertical_align == VerticalAlign::Baseline {
+            size
+        } else {
+            size * 0.7
+        };
+        out.push_str(&format!(" font-size=\"{}\"", fnum(size)));
+    }
     match run.vertical_align {
         VerticalAlign::Baseline => {}
         VerticalAlign::Superscript => {
             out.push_str(" baseline-shift=\"super\"");
-            out.push_str(&format!(" font-size=\"{SCRIPT_FONT_SIZE}\""));
+            if explicit_size.is_none() {
+                out.push_str(&format!(" font-size=\"{SCRIPT_FONT_SIZE}\""));
+            }
         }
         VerticalAlign::Subscript => {
             out.push_str(" baseline-shift=\"sub\"");
-            out.push_str(&format!(" font-size=\"{SCRIPT_FONT_SIZE}\""));
+            if explicit_size.is_none() {
+                out.push_str(&format!(" font-size=\"{SCRIPT_FONT_SIZE}\""));
+            }
         }
     }
     if run.code {
@@ -1892,6 +1931,18 @@ mod tests {
         assert!(out
             .svg
             .contains("text-decoration=\"underline line-through\""));
+    }
+
+    #[test]
+    fn explicit_run_size_and_color_survive_svg_rendering() {
+        let run = Run::new("Large colored text")
+            .font_size(457_200.0)
+            .color(Color::rgb(20, 80, 120));
+        let mut output = String::new();
+        super::push_run(&run, &mut output, false);
+        assert!(output.contains("font-size=\"457200\""));
+        assert!(output.contains("fill=\"#145078\""));
+        assert!(output.contains("Large colored text"));
     }
 
     #[test]

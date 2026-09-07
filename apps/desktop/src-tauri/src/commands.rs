@@ -9,10 +9,11 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::document::DocumentStatus;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
@@ -30,6 +31,10 @@ const SLIDE_HEIGHT_EMU: f64 = 6_858_000.0;
 pub struct AppState {
     /// The active PPTX editing session, if any.
     pub session: Mutex<Option<slides_pptx::Session>>,
+    /// Current file identity and whether committed editor commands need saving.
+    pub document: Mutex<DocumentStatus>,
+    /// Only the completed Save/Discard close workflow may authorize app exit.
+    pub close_confirmed: AtomicBool,
     /// Recovery tracking and directory.
     pub recovery: Mutex<RecoveryTracker>,
     /// Index of the slide currently shown in presenter mode.
@@ -40,24 +45,35 @@ pub struct AppState {
     /// media store has not changed so that non-media commands (text edits,
     /// moves, style changes) do not re-encode every image on every keystroke.
     pub media_cache: Mutex<MediaCache>,
-    /// Offline en-US spell checker (bundled dictionary + learned user words).
-    /// Held behind a Mutex because learning a word needs `&mut self`.
-    pub spell: Mutex<slides_spell::SpellChecker>,
+    /// Lazily initialized offline en-US spell checker. Most presentations do
+    /// not invoke spell checking during startup, so its dictionary is loaded
+    /// only on the first spell command.
+    pub spell: Mutex<Option<slides_spell::SpellChecker>>,
     /// Path to the newline-delimited user dictionary file. `spell_add_word`
-    /// appends learned words here; on startup the checker reloads them.
+    /// appends learned words here; first spell use reloads them.
     pub user_dictionary_path: PathBuf,
     /// 900Slides app-data root (`<data_dir>/900Slides`). Version-history
     /// snapshots are stored under `<version_dir>/versions/<deck_id>/`.
     pub version_dir: PathBuf,
 }
 
-/// Cached media snapshot, keyed by a content fingerprint of the deck's media.
+/// Cached media snapshot, keyed by the core store's mutation generation.
 #[derive(Debug, Default)]
 pub struct MediaCache {
-    /// Fingerprint the cached `dto` corresponds to (`u64::MAX` forces a rebuild).
-    pub fingerprint: u64,
+    /// Exact media identity the cached DTO corresponds to.
+    pub identity: Option<MediaIdentity>,
+    /// Monotonic media revision sent with every deck snapshot.
+    pub revision: u64,
     /// Last-encoded media DTO map.
     pub dto: BTreeMap<String, MediaEntryDto>,
+}
+
+/// Exact in-process identity of a deck media store. The core generation
+/// changes on every effective insert, replacement, removal, and deserialize.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaIdentity {
+    deck_id: String,
+    generation: u64,
 }
 
 /// Tracks pending recovery writes and the directory they are stored in.
@@ -66,32 +82,106 @@ pub struct RecoveryTracker {
     pub dir: PathBuf,
     /// Token of the most recently scheduled recovery write.
     pub pending_token: u64,
-    /// Serialized PPTX bytes waiting to be written.
-    pub pending_bytes: Option<Vec<u8>>,
     /// Deck id for the pending recovery write.
     pub pending_deck_id: Option<String>,
+    /// Deadline after which an idle edit burst may be serialized.
+    pub deadline: Option<Instant>,
+    /// Whether a worker is already servicing this edit burst.
+    pub worker_running: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoveryWork {
+    token: u64,
+    deck_id: String,
+}
+
+impl RecoveryTracker {
+    fn schedule(&mut self, token: u64, deck_id: String, now: Instant) -> bool {
+        self.pending_token = token;
+        self.pending_deck_id = Some(deck_id);
+        self.deadline = Some(now + Duration::from_millis(750));
+        if self.worker_running {
+            false
+        } else {
+            self.worker_running = true;
+            true
+        }
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    fn due_work(&self, now: Instant) -> Option<RecoveryWork> {
+        if self.deadline.is_some_and(|deadline| now >= deadline) {
+            self.pending_deck_id.as_ref().map(|deck_id| RecoveryWork {
+                token: self.pending_token,
+                deck_id: deck_id.clone(),
+            })
+        } else {
+            None
+        }
+    }
+
+    fn is_current(&self, work: &RecoveryWork) -> bool {
+        self.pending_token == work.token
+            && self.pending_deck_id.as_deref() == Some(work.deck_id.as_str())
+    }
+
+    fn cancel(&mut self, token: u64) {
+        self.pending_token = token;
+        self.pending_deck_id = None;
+        self.deadline = None;
+    }
+
+    fn finish_if_current(&mut self, work: &RecoveryWork) -> bool {
+        if !self.is_current(work) {
+            return false;
+        }
+        self.pending_deck_id = None;
+        self.deadline = None;
+        self.worker_running = false;
+        true
+    }
+
+    fn stop_if_idle(&mut self) -> bool {
+        if self.pending_deck_id.is_none() {
+            self.worker_running = false;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl AppState {
     /// Creates a new application state with the default recovery directory.
     pub fn new() -> Self {
         let app_dir = dirs::data_dir().unwrap_or_default().join("900Slides");
+        Self::with_app_dir(app_dir)
+    }
+
+    fn with_app_dir(app_dir: PathBuf) -> Self {
         fs::create_dir_all(&app_dir).ok();
         let recovery_dir = app_dir.join("recovery");
         fs::create_dir_all(&recovery_dir).ok();
         let user_dictionary_path = app_dir.join("user-dictionary.txt");
         Self {
             session: Mutex::new(None),
+            document: Mutex::new(DocumentStatus::default()),
+            close_confirmed: AtomicBool::new(false),
             recovery: Mutex::new(RecoveryTracker {
                 dir: recovery_dir,
                 pending_token: 0,
-                pending_bytes: None,
                 pending_deck_id: None,
+                deadline: None,
+                worker_running: false,
             }),
             presenter_index: Mutex::new(0),
             recovery_token: AtomicU64::new(0),
             media_cache: Mutex::new(MediaCache::default()),
-            spell: Mutex::new(slides_spell::SpellChecker::new()),
+            spell: Mutex::new(None),
             user_dictionary_path,
             version_dir: app_dir,
         }
@@ -99,18 +189,39 @@ impl AppState {
 }
 
 impl AppState {
-    /// Builds a [`DeckSnapshot`], reusing the cached media DTO when the deck's
-    /// media store is unchanged so that non-media commands do not re-encode
-    /// every image's bytes to base64 on each keystroke.
+    /// Builds a [`DeckSnapshot`]. Media payloads are sent only when their exact
+    /// identity changes; the frontend merges omitted payloads by revision.
     pub fn snapshot(&self, deck: &slides_core::Deck) -> DeckSnapshot {
-        let fingerprint = media_fingerprint(deck);
-        let media = {
+        self.snapshot_inner(deck, false)
+    }
+
+    /// Called while the mutation holds the session lock, so Save cannot clear
+    /// dirty state between an edit and its recovery scheduling.
+    fn changed_snapshot(&self, deck: &slides_core::Deck) -> DeckSnapshot {
+        if let Ok(mut document) = self.document.lock() {
+            document.is_dirty = true;
+        }
+        self.snapshot(deck)
+    }
+
+    /// Builds a snapshot that always includes media. Used as a recovery path
+    /// when a frontend has no cached payload for the reported revision.
+    pub fn snapshot_with_media(&self, deck: &slides_core::Deck) -> DeckSnapshot {
+        self.snapshot_inner(deck, true)
+    }
+
+    fn snapshot_inner(&self, deck: &slides_core::Deck, force_media: bool) -> DeckSnapshot {
+        let identity = media_identity(deck);
+        let (media_revision, media) = {
             let mut cache = self.media_cache.lock().expect("media cache mutex poisoned");
-            if cache.fingerprint != fingerprint {
+            let changed = cache.identity.as_ref() != Some(&identity);
+            if changed {
                 cache.dto = media_to_dto(&deck.media);
-                cache.fingerprint = fingerprint;
+                cache.identity = Some(identity);
+                cache.revision = cache.revision.saturating_add(1);
             }
-            cache.dto.clone()
+            let media = (changed || force_media).then(|| cache.dto.clone());
+            (cache.revision, media)
         };
         DeckSnapshot {
             id: deck.id.clone(),
@@ -122,6 +233,7 @@ impl AppState {
             slide_size: deck.slide_size.as_ref().map(slide_size_to_dto),
             sections: deck.sections.iter().map(section_to_dto).collect(),
             slides: deck.slides.iter().map(slide_to_dto).collect(),
+            media_revision,
             media,
             presenter_settings: presenter_settings_to_dto(&deck.presenter_settings),
             comments: deck.comments.iter().map(comment_thread_to_dto).collect(),
@@ -129,44 +241,32 @@ impl AppState {
         }
     }
 
-    /// Loads the persisted user dictionary (if any) into the spell checker.
-    ///
-    /// Called once at startup. Read errors are ignored gracefully: a missing
-    /// or unreadable file simply yields an empty user dictionary, so spell
-    /// checking still works from the bundled en-US word list.
-    pub fn load_user_dictionary(&self) {
-        let Ok(content) = fs::read_to_string(&self.user_dictionary_path) else {
-            return;
-        };
-        let Ok(mut checker) = self.spell.lock() else {
-            return;
-        };
-        for line in content.lines() {
-            let word = line.trim();
-            if !word.is_empty() {
-                checker.add_user_word(word);
+    fn with_spell_checker<T>(
+        &self,
+        operation: impl FnOnce(&mut slides_spell::SpellChecker) -> T,
+    ) -> Result<T, String> {
+        let mut slot = self.spell.lock().map_err(|error| error.to_string())?;
+        if slot.is_none() {
+            let mut checker = slides_spell::SpellChecker::new();
+            if let Ok(content) = fs::read_to_string(&self.user_dictionary_path) {
+                for line in content.lines() {
+                    let word = line.trim();
+                    if !word.is_empty() {
+                        checker.add_user_word(word);
+                    }
+                }
             }
+            *slot = Some(checker);
         }
+        Ok(operation(slot.as_mut().expect("spell checker initialized")))
     }
 }
 
-/// Computes a runtime fingerprint of a deck's media store. Only used to decide
-/// whether the cached base64 DTO is still valid; not persisted, so a
-/// non-stable hasher is acceptable.
-fn media_fingerprint(deck: &slides_core::Deck) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::Hasher;
-    let mut hasher = DefaultHasher::new();
-    hasher.write(deck.id.as_bytes());
-    hasher.write_u64(deck.media.len() as u64);
-    for (key, entry) in deck.media.iter() {
-        hasher.write(key.as_bytes());
-        hasher.write(entry.mime.as_bytes());
-        hasher.write(&entry.bytes);
-        hasher.write_u32(entry.width);
-        hasher.write_u32(entry.height);
+fn media_identity(deck: &slides_core::Deck) -> MediaIdentity {
+    MediaIdentity {
+        deck_id: deck.id.clone(),
+        generation: deck.media.generation(),
     }
-    hasher.finish()
 }
 
 /// Snapshot of a deck sent to the frontend after every command.
@@ -198,9 +298,12 @@ pub struct DeckSnapshot {
     /// Ordered slides in the deck.
     pub slides: Vec<SlideSnapshot>,
     /// Media store: image bytes keyed by their media reference, base64-encoded
-    /// so the frontend can render images directly from the snapshot.
+    /// so the frontend can render images directly from the snapshot. Omitted
+    /// when unchanged from the reported revision.
     #[serde(default)]
-    pub media: BTreeMap<String, MediaEntryDto>,
+    pub media_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<BTreeMap<String, MediaEntryDto>>,
     /// Presenter settings (laser pointer, highlighter).
     #[serde(default)]
     pub presenter_settings: PresenterSettingsDto,
@@ -1232,6 +1335,12 @@ pub struct RunDto {
     /// Run-level font family override.
     #[serde(default)]
     pub font_family: Option<String>,
+    /// Explicit font size in EMU (12,700 per point).
+    #[serde(default)]
+    pub font_size: Option<f64>,
+    /// Explicit text color, when present in the source.
+    #[serde(default)]
+    pub color: Option<ColorDto>,
 }
 
 /// Loss ledger warning data transfer object.
@@ -1296,6 +1405,12 @@ pub struct MorphFrameDto {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PresenterState {
+    /// Deck body font used by the editor and renderer.
+    pub body_font: String,
+    /// Deck heading font used by the editor and renderer.
+    pub heading_font: String,
+    /// Theme background shared with the editor.
+    pub background: ColorDto,
     /// Current slide snapshot.
     pub current_slide: SlideSnapshot,
     /// Next slide snapshot, if any.
@@ -1340,18 +1455,26 @@ pub struct RecoverySnapshot {
 #[tauri::command]
 pub fn new_deck(
     template_name: Option<String>,
+    discard_changes: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<DeckSnapshot, String> {
     let bytes = slides_pptx::create_blank_pptx();
     let mut session = slides_pptx::load(&bytes).map_err(|e| e.to_string())?;
     let fresh = slides_core::Deck::new();
     session.deck_mut().id = fresh.id;
+    let is_dirty = template_name.is_some();
     if let Some(name) = template_name {
         let command = Box::new(slides_core::SetTemplate::new(name));
         session.execute(command).map_err(|e| e.to_string())?;
     }
     let snapshot = state.snapshot(session.deck());
-    *state.session.lock().map_err(|e| e.to_string())? = Some(session);
+    replace_session(
+        &state,
+        session,
+        None,
+        is_dirty,
+        discard_changes.unwrap_or(false),
+    )?;
     *state.presenter_index.lock().map_err(|e| e.to_string())? = 0;
     Ok(snapshot)
 }
@@ -1380,7 +1503,7 @@ pub fn set_template(
     let session = guard.as_mut().ok_or("no deck is open")?;
     let command = Box::new(slides_core::SetTemplate::new(template_name));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -1401,7 +1524,7 @@ pub fn set_slide_layout(
     let session = guard.as_mut().ok_or("no deck is open")?;
     let command = Box::new(slides_core::SetSlideLayout::new(slide_id, layout_name));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -1420,9 +1543,12 @@ pub fn set_slide_rehearsed_duration(
 ) -> Result<DeckSnapshot, String> {
     let mut guard = state.session.lock().map_err(|e| e.to_string())?;
     let session = guard.as_mut().ok_or("no deck is open")?;
-    let command = Box::new(slides_core::SetSlideRehearsedDuration::new(slide_id, duration_ms));
+    let command = Box::new(slides_core::SetSlideRehearsedDuration::new(
+        slide_id,
+        duration_ms,
+    ));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -1430,7 +1556,11 @@ pub fn set_slide_rehearsed_duration(
 
 /// Opens a PPTX file from the given path and returns its deck snapshot.
 #[tauri::command]
-pub fn open_deck(path: String, state: State<'_, AppState>) -> Result<DeckSnapshot, String> {
+pub fn open_deck(
+    path: String,
+    discard_changes: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
     let bytes = fs::read(&path).map_err(|e| e.to_string())?;
     let session = slides_pptx::load(&bytes).map_err(|e| e.to_string())?;
     let mut snapshot = state.snapshot(session.deck());
@@ -1440,27 +1570,119 @@ pub fn open_deck(path: String, state: State<'_, AppState>) -> Result<DeckSnapsho
         .iter()
         .map(warning_to_dto)
         .collect();
-    *state.session.lock().map_err(|e| e.to_string())? = Some(session);
+    replace_session(
+        &state,
+        session,
+        Some(path),
+        false,
+        discard_changes.unwrap_or(false),
+    )?;
     *state.presenter_index.lock().map_err(|e| e.to_string())? = 0;
     Ok(snapshot)
 }
 
 /// Saves the current deck to the given path.
 #[tauri::command]
-pub fn save_deck(path: String, state: State<'_, AppState>) -> Result<(), String> {
+pub fn save_deck(
+    path: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<DocumentStatus, String> {
     let mut guard = state.session.lock().map_err(|e| e.to_string())?;
     let session = guard.as_mut().ok_or("no deck is open")?;
+    let mut document = state.document.lock().map_err(|e| e.to_string())?;
+    let path = path
+        .or_else(|| document.path.clone())
+        .ok_or("Choose a file for the first save")?;
     let bytes = slides_pptx::save(session).map_err(|e| e.to_string())?;
     // Do not commit before the selected file is durable. A failed disk write
     // must leave the session dirty so recovery and a retry still contain edits.
-    fs::write(&path, &bytes).map_err(|e| e.to_string())?;
-    session.commit_save(bytes.clone()).map_err(|e| e.to_string())?;
+    crate::document::atomic_save(Path::new(&path), &bytes)?;
+    session.commit_save(bytes).map_err(|e| e.to_string())?;
+    *document = DocumentStatus {
+        path: Some(path),
+        is_dirty: false,
+    };
+    let status = document.clone();
+    drop(document);
     let deck_id = session.deck().id.clone();
     // Record a content-addressed version snapshot (deduplicated by hash).
     // Errors here never block the PPTX save itself.
     let _ = crate::versions::save_snapshot(&state.version_dir, &deck_id, session.deck());
-    drop(guard);
     retire_recovery(&state, &deck_id);
+    drop(guard);
+    Ok(status)
+}
+
+/// Current file identity, without transferring deck or image payloads.
+#[tauri::command]
+pub fn get_document_status(state: State<'_, AppState>) -> Result<DocumentStatus, String> {
+    state
+        .document
+        .lock()
+        .map(|status| status.clone())
+        .map_err(|e| e.to_string())
+}
+
+fn replace_session(
+    state: &AppState,
+    session: slides_pptx::Session,
+    path: Option<String>,
+    is_dirty: bool,
+    discard_changes: bool,
+) -> Result<(), String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let mut document = state.document.lock().map_err(|e| e.to_string())?;
+    document.check_replace(discard_changes)?;
+    // Parsing succeeded and every required lock is held before replacing work.
+    cancel_pending_recovery(state);
+    if discard_changes {
+        if let Some(previous) = guard.as_ref() {
+            retire_recovery(state, &previous.deck().id);
+        }
+    }
+    *guard = Some(session);
+    *document = DocumentStatus { path, is_dirty };
+    Ok(())
+}
+
+/// Persist a final recovery copy before close or another document transition.
+#[tauri::command]
+pub fn flush_recovery(state: State<'_, AppState>) -> Result<(), String> {
+    let guard = state.session.lock().map_err(|e| e.to_string())?;
+    let Some(session) = guard.as_ref() else {
+        return Ok(());
+    };
+    if !state.document.lock().map_err(|e| e.to_string())?.is_dirty {
+        return Ok(());
+    }
+    let bytes = slides_pptx::save(session).map_err(|e| e.to_string())?;
+    let mut tracker = state.recovery.lock().map_err(|e| e.to_string())?;
+    write_recovery_snapshot(&tracker.dir, &session.deck().id, &bytes)?;
+    tracker.cancel(state.recovery_token.fetch_add(1, Ordering::SeqCst) + 1);
+    Ok(())
+}
+
+/// Called only after the editor flushed drafts and resolved its close dialog.
+#[tauri::command]
+pub fn complete_close(
+    discard_changes: bool,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let guard = state.session.lock().map_err(|e| e.to_string())?;
+    state
+        .document
+        .lock()
+        .map_err(|e| e.to_string())?
+        .check_replace(discard_changes)?;
+    if discard_changes {
+        if let Some(session) = guard.as_ref() {
+            retire_recovery(&state, &session.deck().id);
+        }
+    }
+    drop(guard);
+    state.close_confirmed.store(true, Ordering::SeqCst);
+    app.exit(0);
     Ok(())
 }
 
@@ -1506,7 +1728,11 @@ impl slides_core::Command for RestoreDeck {
         // slides as dirty. Without this, undo-after-save would leave the
         // model and file desynced (the file would contain the restored deck
         // while the editor shows the prior one).
-        self.replacement.slides.iter().map(|s| s.id.clone()).collect()
+        self.replacement
+            .slides
+            .iter()
+            .map(|s| s.id.clone())
+            .collect()
     }
 }
 
@@ -1553,7 +1779,7 @@ pub fn restore_version(
     for id in prior_slide_ids.iter().chain(restored_ids.iter()) {
         session.mark_slide_dirty(id);
     }
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -1659,7 +1885,7 @@ impl slides_core::Command for SetChartDataAndType {
 #[tauri::command]
 pub fn get_snapshot(state: State<'_, AppState>) -> Option<DeckSnapshot> {
     let guard = state.session.lock().ok()?;
-    guard.as_ref().map(|s| state.snapshot(s.deck()))
+    guard.as_ref().map(|s| state.snapshot_with_media(s.deck()))
 }
 
 /// Edits a paragraph inside a text box and returns the updated deck snapshot.
@@ -1682,7 +1908,7 @@ pub fn edit_text(
         core_runs,
     ));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -1707,7 +1933,7 @@ pub fn edit_text_box(
         core_paragraphs,
     ));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -1759,7 +1985,7 @@ pub fn set_run_style(
     session
         .execute(Box::new(command))
         .map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -1785,7 +2011,7 @@ pub fn set_paragraph_style(
         core_style,
     ));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -1820,7 +2046,7 @@ pub fn insert_image(
         slide_id, media_key, entry, transform, None,
     ));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -1849,7 +2075,7 @@ pub fn add_shape(
     });
     let command = Box::new(slides_core::AddShape::new(slide_id, shape));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -1902,25 +2128,44 @@ fn shape_transform_from_frame(
 /// [`slides_core::AddShape`] command (with a [`slides_core::Shape::TextBox`]),
 /// so the insertion is undoable and saves with the rest of the slide.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub fn add_text_box(
     slide_id: String,
     x: f64,
     y: f64,
     width: f64,
     height: f64,
+    as_title: Option<bool>,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
     let shape = slides_core::Shape::TextBox(slides_core::TextBox {
         id: slides_core::Shape::generate_id(),
         frame: slides_core::Rect::new(x, y, width, height),
-        paragraphs: Vec::new(),
+        paragraphs: if as_title.unwrap_or(false) {
+            vec![slides_core::Paragraph {
+                runs: vec![slides_core::Run {
+                    text: String::new(),
+                    bold: true,
+                    font_size: Some(457_200.0),
+                    font_family: Some(session.deck().theme.heading_font.clone()),
+                    ..Default::default()
+                }],
+                style: slides_core::ParagraphStyle {
+                    heading: Some(slides_core::HeadingLevel::H1),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }]
+        } else {
+            Vec::new()
+        },
     });
-    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
-    let session = guard.as_mut().ok_or("no deck is open")?;
     let command = Box::new(slides_core::AddShape::new(slide_id, shape));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -1948,7 +2193,45 @@ pub fn new_slide(
     session
         .execute(Box::new(slides_core::InsertSlide::new(insert_at, slide)))
         .map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Moves a slide to its final zero-based position; the operation is undoable.
+#[tauri::command]
+pub fn move_slide(
+    slide_id: String,
+    to_index: usize,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    session
+        .execute(Box::new(slides_core::MoveSlide::new(slide_id, to_index)))
+        .map_err(|e| e.to_string())?;
+    let snapshot = state.changed_snapshot(session.deck());
+    drop(guard);
+    schedule_recovery(&app, &state);
+    Ok(snapshot)
+}
+
+/// Deletes a slide and its attached content; Undo restores it. A presentation
+/// must retain at least one slide, enforced by the core command.
+#[tauri::command]
+pub fn delete_slide(
+    slide_id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeckSnapshot, String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("no deck is open")?;
+    session
+        .execute(Box::new(slides_core::DeleteSlide::new(slide_id)))
+        .map_err(|e| e.to_string())?;
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -1972,7 +2255,7 @@ pub fn update_shape_transform(
         transform_to_core(transform),
     ));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -1995,7 +2278,7 @@ pub fn update_shape_style(
         style_to_core(style),
     ));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -2013,7 +2296,7 @@ pub fn delete_shape(
     let session = guard.as_mut().ok_or("no deck is open")?;
     let command = Box::new(slides_core::DeleteShape::new(slide_id, shape_index));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -2034,7 +2317,7 @@ pub fn add_table(
     let session = guard.as_mut().ok_or("no deck is open")?;
     let command = Box::new(slides_core::AddTable::new(slide_id, table));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -2062,7 +2345,7 @@ pub fn set_cell_text(
         text,
     ));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -2105,7 +2388,7 @@ pub fn set_cell_style(
     session
         .execute(Box::new(command))
         .map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -2138,7 +2421,7 @@ pub fn insert_row(
         row,
     ));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -2165,7 +2448,7 @@ pub fn insert_column(
         width,
     ));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -2184,7 +2467,7 @@ pub fn delete_row(
     let session = guard.as_mut().ok_or("no deck is open")?;
     let command = Box::new(slides_core::DeleteRow::new(slide_id, shape_index, index));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -2204,7 +2487,7 @@ pub fn delete_column(
     let session = guard.as_mut().ok_or("no deck is open")?;
     let command = Box::new(slides_core::DeleteColumn::new(slide_id, shape_index, index));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -2235,7 +2518,7 @@ pub fn add_chart(
     let session = guard.as_mut().ok_or("no deck is open")?;
     let command = Box::new(slides_core::AddChart::new(slide_id, chart));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -2263,7 +2546,7 @@ pub fn set_chart_type(
         chart_type,
     ));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -2319,7 +2602,7 @@ pub fn set_chart_data(
     };
 
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -2344,7 +2627,7 @@ pub fn set_chart_title(
         title,
     ));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -2367,7 +2650,7 @@ pub fn set_transition(
     let session = guard.as_mut().ok_or("no deck is open")?;
     let command = Box::new(slides_core::SetTransition::new(slide_id, transition));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -2393,7 +2676,7 @@ pub fn set_slide_animation(
     let session = guard.as_mut().ok_or("no deck is open")?;
     let command = Box::new(slides_core::SetSlideAnimation::new(slide_id, animation));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -2415,7 +2698,7 @@ pub fn add_build_step(
     let session = guard.as_mut().ok_or("no deck is open")?;
     let command = Box::new(slides_core::AddBuildStep::new(slide_id, step));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -2434,7 +2717,7 @@ pub fn remove_build_step(
     let session = guard.as_mut().ok_or("no deck is open")?;
     let command = Box::new(slides_core::RemoveBuildStepAt::new(slide_id, step_index));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -2454,7 +2737,7 @@ pub fn move_build_step(
     let session = guard.as_mut().ok_or("no deck is open")?;
     let command = Box::new(slides_core::MoveBuildStep::new(slide_id, from, to));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -2479,7 +2762,7 @@ pub fn set_build_step_trigger(
         trigger_from_dto(trigger),
     ));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -2498,9 +2781,11 @@ pub fn set_build_step_delay(
 ) -> Result<DeckSnapshot, String> {
     let mut guard = state.session.lock().map_err(|e| e.to_string())?;
     let session = guard.as_mut().ok_or("no deck is open")?;
-    let command = Box::new(slides_core::SetBuildStepDelay::new(slide_id, step_index, delay_ms));
+    let command = Box::new(slides_core::SetBuildStepDelay::new(
+        slide_id, step_index, delay_ms,
+    ));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -2521,10 +2806,11 @@ pub fn set_build_step_motion_path(
     let core_path = path.map(|rects| rects.into_iter().map(rect_to_core).collect());
     let mut guard = state.session.lock().map_err(|e| e.to_string())?;
     let session = guard.as_mut().ok_or("no deck is open")?;
-    let command =
-        Box::new(slides_core::SetBuildStepMotionPath::new(slide_id, step_index, core_path));
+    let command = Box::new(slides_core::SetBuildStepMotionPath::new(
+        slide_id, step_index, core_path,
+    ));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -2543,9 +2829,12 @@ pub fn set_slide_reduce_motion(
 ) -> Result<DeckSnapshot, String> {
     let mut guard = state.session.lock().map_err(|e| e.to_string())?;
     let session = guard.as_mut().ok_or("no deck is open")?;
-    let command = Box::new(slides_core::SetSlideReduceMotion::new(slide_id, reduce_motion));
+    let command = Box::new(slides_core::SetSlideReduceMotion::new(
+        slide_id,
+        reduce_motion,
+    ));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -2695,7 +2984,7 @@ pub fn set_slide_size(
     let core_size = slide_size.map(slide_size_from_dto);
     let command = Box::new(slides_core::SetSlideSize::new(core_size));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -2714,7 +3003,7 @@ pub fn set_sections(
     let core_sections = sections.iter().map(section_from_dto).collect();
     let command = Box::new(slides_core::SetSections::new(core_sections));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -2736,7 +3025,7 @@ pub fn set_rich_notes(
         rich_notes.map(|paragraphs| paragraphs.iter().map(paragraph_from_dto).collect());
     let command = Box::new(slides_core::SetRichNotes::new(slide_id, core_notes));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -2754,7 +3043,7 @@ pub fn set_high_contrast(
     let session = guard.as_mut().ok_or("no deck is open")?;
     let command = Box::new(slides_core::SetHighContrast::new(high_contrast));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -2775,7 +3064,7 @@ pub fn set_presenter_settings(
         presenter_settings_from_dto(&settings),
     ));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -2789,7 +3078,7 @@ pub fn undo(app: AppHandle, state: State<'_, AppState>) -> Result<DeckSnapshot, 
     if !session.undo() {
         return Err("nothing to undo".to_string());
     }
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -2803,7 +3092,7 @@ pub fn redo(app: AppHandle, state: State<'_, AppState>) -> Result<DeckSnapshot, 
     if !session.redo() {
         return Err("nothing to redo".to_string());
     }
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -2971,7 +3260,7 @@ pub fn restore_recovery(id: String, state: State<'_, AppState>) -> Result<DeckSn
         .iter()
         .map(warning_to_dto)
         .collect();
-    *state.session.lock().map_err(|e| e.to_string())? = Some(session);
+    replace_session(&state, session, None, true, false)?;
     *state.presenter_index.lock().map_err(|e| e.to_string())? = 0;
     Ok(snapshot)
 }
@@ -2995,16 +3284,17 @@ pub fn spell_check(
     text: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<MisspellingDto>, String> {
-    let checker = state.spell.lock().map_err(|e| e.to_string())?;
-    Ok(checker
-        .check(&text)
-        .into_iter()
-        .map(|m| MisspellingDto {
-            word: m.word,
-            byte_start: m.byte_start,
-            byte_end: m.byte_end,
-        })
-        .collect())
+    state.with_spell_checker(|checker| {
+        checker
+            .check(&text)
+            .into_iter()
+            .map(|m| MisspellingDto {
+                word: m.word,
+                byte_start: m.byte_start,
+                byte_end: m.byte_end,
+            })
+            .collect()
+    })
 }
 
 /// Returns up to `max` correction suggestions for `word`, ranked by edit
@@ -3015,8 +3305,7 @@ pub fn spell_suggest(
     max: usize,
     state: State<'_, AppState>,
 ) -> Result<Vec<String>, String> {
-    let checker = state.spell.lock().map_err(|e| e.to_string())?;
-    Ok(checker.suggest(&word, max))
+    state.with_spell_checker(|checker| checker.suggest(&word, max))
 }
 
 /// Learns `word` into the in-memory user dictionary and appends it to the
@@ -3028,10 +3317,7 @@ pub fn spell_add_word(word: String, state: State<'_, AppState>) -> Result<(), St
     if trimmed.is_empty() {
         return Ok(());
     }
-    {
-        let mut checker = state.spell.lock().map_err(|e| e.to_string())?;
-        checker.add_user_word(trimmed);
-    }
+    state.with_spell_checker(|checker| checker.add_user_word(trimmed))?;
     let path = state.user_dictionary_path.clone();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -3067,6 +3353,9 @@ fn presenter_state_at(state: &AppState) -> Result<PresenterState, String> {
     let next = slides.get(idx + 1).map(slide_to_dto);
     let notes = slides.get(idx).map(|s| s.notes.clone()).unwrap_or_default();
     Ok(PresenterState {
+        body_font: session.deck().theme.body_font.clone(),
+        heading_font: session.deck().theme.heading_font.clone(),
+        background: color_to_dto(session.deck().theme.background),
         current_slide: current,
         next_slide: next,
         slide_number: idx + 1,
@@ -3097,7 +3386,7 @@ pub fn add_comment(
         body,
     ));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -3120,7 +3409,7 @@ pub fn reply_to_comment(
         thread_id, slide_id, author, body,
     ));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -3142,7 +3431,7 @@ pub fn set_comment_resolved(
         thread_id, slide_id, resolved,
     ));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -3164,7 +3453,7 @@ pub fn assign_comment(
         thread_id, slide_id, assignee,
     ));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
@@ -3182,55 +3471,110 @@ pub fn delete_comment_thread(
     let session = guard.as_mut().ok_or("no deck is open")?;
     let command = Box::new(slides_core::DeleteCommentThread::new(thread_id, slide_id));
     session.execute(command).map_err(|e| e.to_string())?;
-    let snapshot = state.snapshot(session.deck());
+    let snapshot = state.changed_snapshot(session.deck());
     drop(guard);
     schedule_recovery(&app, &state);
     Ok(snapshot)
 }
 
 fn schedule_recovery(app: &AppHandle, state: &State<'_, AppState>) {
-    let Some(mut guard) = state.session.lock().ok() else {
+    let Some(guard) = state.session.lock().ok() else {
         return;
     };
-    let Some(session) = guard.as_mut() else {
-        return;
-    };
-    let Some(bytes) = slides_pptx::save(session).ok() else {
+    let Some(session) = guard.as_ref() else {
         return;
     };
     let deck_id = session.deck().id.clone();
-    drop(guard);
+    if !state
+        .document
+        .lock()
+        .map(|document| document.is_dirty)
+        .unwrap_or(true)
+    {
+        return;
+    }
 
     let token = state.recovery_token.fetch_add(1, Ordering::SeqCst) + 1;
-    if let Ok(mut tracker) = state.recovery.lock() {
-        tracker.pending_token = token;
-        tracker.pending_bytes = Some(bytes);
-        tracker.pending_deck_id = Some(deck_id);
+    let should_spawn = state
+        .recovery
+        .lock()
+        .map(|mut tracker| tracker.schedule(token, deck_id, Instant::now()))
+        .unwrap_or(false);
+    drop(guard);
+    if !should_spawn {
+        return;
     }
 
     let app_handle = app.clone();
     std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(750));
-        let Some(state) = app_handle.try_state::<AppState>() else {
-            return;
-        };
-        let (bytes, deck_id, dir) = {
-            let Ok(tracker) = state.recovery.lock() else {
+        loop {
+            let Some(state) = app_handle.try_state::<AppState>() else {
                 return;
             };
-            if tracker.pending_token != token {
+            let deadline = {
+                let Ok(mut tracker) = state.recovery.lock() else {
+                    return;
+                };
+                let Some(deadline) = tracker.next_deadline() else {
+                    tracker.stop_if_idle();
+                    return;
+                };
+                deadline
+            };
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+
+            let work = {
+                let Ok(tracker) = state.recovery.lock() else {
+                    return;
+                };
+                tracker.due_work(Instant::now())
+            };
+            let Some(work) = work else {
+                continue;
+            };
+
+            // Expensive PPTX serialization happens only after the deck has
+            // been idle for the full debounce interval.
+            let bytes = {
+                let Ok(mut guard) = state.session.lock() else {
+                    return;
+                };
+                let Some(session) = guard.as_mut() else {
+                    return;
+                };
+                if session.deck().id != work.deck_id {
+                    None
+                } else {
+                    slides_pptx::save(session).ok()
+                }
+            };
+
+            let Ok(mut tracker) = state.recovery.lock() else {
+                return;
+            };
+            if !tracker.is_current(&work) {
+                continue;
+            };
+            let Some(bytes) = bytes else {
+                tracker.finish_if_current(&work);
+                return;
+            };
+            // Keep the tracker locked through the atomic write. Deck switches
+            // and manual saves cancel through this same mutex, so a canceled
+            // generation cannot be written after the replacement/save.
+            let _ = write_recovery_snapshot(&tracker.dir, &work.deck_id, &bytes);
+            if tracker.finish_if_current(&work) {
                 return;
             }
-            (
-                tracker.pending_bytes.clone(),
-                tracker.pending_deck_id.clone(),
-                tracker.dir.clone(),
-            )
-        };
-        if let (Some(bytes), Some(deck_id)) = (bytes, deck_id) {
-            let _ = write_recovery_snapshot(&dir, &deck_id, &bytes);
         }
     });
+}
+
+fn cancel_pending_recovery(state: &AppState) {
+    let token = state.recovery_token.fetch_add(1, Ordering::SeqCst) + 1;
+    if let Ok(mut tracker) = state.recovery.lock() {
+        tracker.cancel(token);
+    }
 }
 
 fn sanitize_recovery_id(dir: &Path, id: &str) -> Result<PathBuf, String> {
@@ -3261,7 +3605,7 @@ fn write_recovery_snapshot(dir: &Path, deck_id: &str, bytes: &[u8]) -> Result<()
     // Write atomically (temp file + fsync + rename) so a crash or power loss
     // during the write cannot truncate the snapshot. Only delete older
     // snapshots after the rename succeeds.
-    crate::versions::atomic_write(&path, bytes)?;
+    crate::document::atomic_save(&path, bytes)?;
     for entry in fs::read_dir(dir).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         let other = entry.path();
@@ -3279,8 +3623,10 @@ fn write_recovery_snapshot(dir: &Path, deck_id: &str, bytes: &[u8]) -> Result<()
     Ok(())
 }
 
-fn retire_recovery(state: &State<'_, AppState>, deck_id: &str) {
-    if let Ok(tracker) = state.recovery.lock() {
+fn retire_recovery(state: &AppState, deck_id: &str) {
+    let token = state.recovery_token.fetch_add(1, Ordering::SeqCst) + 1;
+    if let Ok(mut tracker) = state.recovery.lock() {
+        tracker.cancel(token);
         if let Ok(entries) = fs::read_dir(&tracker.dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -4078,6 +4424,8 @@ fn run_to_dto(run: &slides_core::Run) -> RunDto {
         }),
         code: run.code,
         font_family: run.font_family.clone(),
+        font_size: run.font_size,
+        color: run.color.map(color_to_dto),
     }
 }
 
@@ -4099,8 +4447,13 @@ fn run_from_dto(run: &RunDto) -> slides_core::Run {
             .and_then(|link| slides_core::Link::new(link.url.clone()).ok()),
         code: run.code,
         font_family: run.font_family.clone(),
-        color: None,
-        font_size: None,
+        color: run.color.as_ref().map(|color| slides_core::Color {
+            r: color.r,
+            g: color.g,
+            b: color.b,
+            a: color.a,
+        }),
+        font_size: run.font_size.filter(|size| size.is_finite() && *size > 0.0),
     }
 }
 
@@ -4188,7 +4541,7 @@ pub struct AccessibilityIssueDto {
 pub struct AccessibilityReportDto {
     /// Every issue found, in document order.
     pub issues: Vec<AccessibilityIssueDto>,
-    /// WCAG 2.2 AA conformance score (0–100). 100 means no issues.
+    /// Heuristic document check score (0–100). 100 means no issues.
     pub score: u32,
     /// Total number of slides in the deck.
     pub total_slides: usize,
@@ -4263,9 +4616,171 @@ pub fn check_accessibility(state: State<'_, AppState>) -> Result<AccessibilityRe
 mod tests {
     use super::{
         average_column_width, sanitize_recovery_id, shape_transform_from_frame, table_grid_metrics,
-        table_to_dto, AppState, CellAlignDto, RectDto,
+        table_to_dto, AppState, CellAlignDto, RecoveryTracker, RectDto,
     };
+    use base64::Engine as _;
     use std::fs;
+    use std::time::{Duration, Instant};
+
+    fn test_app_dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("900slides-{name}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn recovery_burst_uses_one_worker_and_only_latest_idle_generation() {
+        let now = Instant::now();
+        let mut tracker = RecoveryTracker {
+            dir: test_app_dir("recovery-tracker"),
+            pending_token: 0,
+            pending_deck_id: None,
+            deadline: None,
+            worker_running: false,
+        };
+
+        assert!(tracker.schedule(1, "deck-a".to_string(), now));
+        assert!(!tracker.schedule(2, "deck-a".to_string(), now + Duration::from_millis(100)));
+        assert!(tracker.due_work(now + Duration::from_millis(849)).is_none());
+        let work = tracker
+            .due_work(now + Duration::from_millis(850))
+            .expect("latest generation becomes due after 750 ms idle");
+        assert_eq!(work.token, 2);
+        assert_eq!(work.deck_id, "deck-a");
+        assert!(tracker.finish_if_current(&work));
+        assert!(!tracker.worker_running);
+    }
+
+    #[test]
+    fn read_snapshots_do_not_dirty_the_document_but_mutations_do() {
+        let state = AppState::with_app_dir(test_app_dir("document-dirty"));
+        let deck = slides_core::Deck::new();
+        state.snapshot(&deck);
+        assert!(!state.document.lock().unwrap().is_dirty);
+        state.changed_snapshot(&deck);
+        assert!(state.document.lock().unwrap().is_dirty);
+        state.document.lock().unwrap().is_dirty = false;
+        state.snapshot_with_media(&deck);
+        assert!(!state.document.lock().unwrap().is_dirty);
+    }
+
+    #[test]
+    fn recovery_cancel_invalidates_deck_switch_and_manual_save_work() {
+        let now = Instant::now();
+        let mut tracker = RecoveryTracker {
+            dir: test_app_dir("recovery-cancel"),
+            pending_token: 0,
+            pending_deck_id: None,
+            deadline: None,
+            worker_running: false,
+        };
+        tracker.schedule(10, "old-deck".to_string(), now);
+        let stale = tracker
+            .due_work(now + Duration::from_millis(750))
+            .expect("work due");
+        tracker.cancel(11);
+
+        assert!(!tracker.is_current(&stale));
+        assert!(tracker.due_work(now + Duration::from_secs(2)).is_none());
+        assert!(tracker.stop_if_idle());
+    }
+
+    #[test]
+    fn snapshots_omit_unchanged_media_and_advance_exact_revisions() {
+        let state = AppState::with_app_dir(test_app_dir("media-revision"));
+        let mut deck = slides_core::Deck::new();
+
+        let first = state.snapshot(&deck);
+        assert_eq!(first.media_revision, 1);
+        assert_eq!(first.media.as_ref().map(|media| media.len()), Some(0));
+        let unchanged = state.snapshot(&deck);
+        assert_eq!(unchanged.media_revision, 1);
+        assert!(unchanged.media.is_none());
+
+        let bytes = vec![0x89, 0x50, 0x4e, 0x47];
+        let key = slides_pptx::media_key(&bytes);
+        deck.media.insert(
+            key.clone(),
+            slides_core::MediaEntry {
+                mime: "image/png".to_string(),
+                bytes,
+                width: 16,
+                height: 16,
+            },
+        );
+        let inserted = state.snapshot(&deck);
+        assert_eq!(inserted.media_revision, 2);
+        assert!(inserted
+            .media
+            .as_ref()
+            .is_some_and(|media| media.contains_key(&key)));
+        let inserted_bytes = inserted
+            .media
+            .as_ref()
+            .and_then(|media| media.get(&key))
+            .map(|entry| entry.bytes.clone())
+            .expect("inserted base64 payload");
+        let forced = state.snapshot_with_media(&deck);
+        assert_eq!(forced.media_revision, 2);
+        assert!(forced.media.is_some());
+
+        // Replacement under the same key with identical MIME, byte length,
+        // and dimensions must still invalidate and re-encode the payload.
+        let replacement_bytes = vec![0x89, 0x50, 0x4e, 0x48];
+        deck.media.insert(
+            key.clone(),
+            slides_core::MediaEntry {
+                mime: "image/png".to_string(),
+                bytes: replacement_bytes,
+                width: 16,
+                height: 16,
+            },
+        );
+        let replaced = state.snapshot(&deck);
+        assert_eq!(replaced.media_revision, 3);
+        let replaced_bytes = replaced
+            .media
+            .as_ref()
+            .and_then(|media| media.get(&key))
+            .map(|entry| entry.bytes.clone())
+            .expect("replacement base64 payload");
+        assert_ne!(replaced_bytes, inserted_bytes);
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(&replaced_bytes)
+                .expect("decode replacement payload"),
+            vec![0x89, 0x50, 0x4e, 0x48]
+        );
+
+        // Deserialization represents open/restore/version-load boundaries and
+        // receives a fresh store generation even when content is identical.
+        let serialized = serde_json::to_vec(&deck).expect("serialize deck");
+        let reloaded: slides_core::Deck = serde_json::from_slice(&serialized).expect("reload deck");
+        let reloaded_snapshot = state.snapshot(&reloaded);
+        assert_eq!(reloaded_snapshot.media_revision, 4);
+        assert!(reloaded_snapshot.media.is_some());
+        let cloned_snapshot = state.snapshot(&reloaded.clone());
+        assert_eq!(cloned_snapshot.media_revision, 4);
+        assert!(cloned_snapshot.media.is_none());
+
+        deck = reloaded;
+        deck.media.remove(&key);
+        let removed = state.snapshot(&deck);
+        assert_eq!(removed.media_revision, 5);
+        assert_eq!(removed.media.as_ref().map(|media| media.len()), Some(0));
+    }
+
+    #[test]
+    fn spell_dictionary_loads_on_first_spell_operation() {
+        let app_dir = test_app_dir("lazy-spell");
+        fs::create_dir_all(&app_dir).unwrap();
+        fs::write(app_dir.join("user-dictionary.txt"), "slidesword\n").unwrap();
+        let state = AppState::with_app_dir(app_dir);
+
+        assert!(state.spell.lock().unwrap().is_none());
+        assert!(state
+            .with_spell_checker(|checker| checker.is_user_word("SlidesWord"))
+            .unwrap());
+        assert!(state.spell.lock().unwrap().is_some());
+    }
 
     #[test]
     fn sanitize_recovery_id_rejects_path_traversal() {
@@ -4356,6 +4871,33 @@ mod tests {
             None,
         )
         .is_err());
+    }
+
+    #[test]
+    fn text_edits_preserve_explicit_size_color_and_font_at_the_command_boundary() {
+        let mut original = slides_core::Run::new("Original text");
+        original.font_size = Some(457_200.0);
+        original.color = Some(slides_core::Color::rgb(20, 80, 120));
+        original.font_family = Some("Source Serif 4".to_string());
+        let mut dto = super::run_to_dto(&original);
+        dto.text = "Edited text".to_string();
+        let edited = super::run_from_dto(&dto);
+        assert_eq!(edited.text, "Edited text");
+        assert_eq!(edited.font_size, original.font_size);
+        assert_eq!(edited.color, original.color);
+        assert_eq!(edited.font_family, original.font_family);
+    }
+
+    #[test]
+    fn presenter_uses_the_editor_theme_background() {
+        let state = AppState::new();
+        let blank = slides_pptx::create_blank_pptx();
+        let mut session = slides_pptx::load(&blank).expect("load blank pptx");
+        let background = slides_core::Color::rgb(18, 32, 54);
+        session.deck_mut().theme.background = background;
+        *state.session.lock().unwrap() = Some(session);
+        let presentation = super::presenter_state_at(&state).expect("presenter state");
+        assert_eq!(presentation.background, super::color_to_dto(background));
     }
 
     #[test]

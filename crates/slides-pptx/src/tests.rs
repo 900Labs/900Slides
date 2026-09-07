@@ -734,6 +734,189 @@ fn undoing_a_persisted_slide_insertion_removes_package_structure() {
 }
 
 #[test]
+fn numeric_package_shape_ids_preserve_model_identity_and_animation_targets() {
+    let slide_xml = slide1_xml().replace("</p:spTree>", r#"<p:grpSp><p:nvGrpSpPr><p:cNvPr id="100000" name="Opaque group"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/><p:sp><p:nvSpPr><p:cNvPr id="4" name="Nested reserved ID"/></p:nvSpPr><p:spPr/></p:sp></p:grpSp></p:spTree>"#);
+    let mut session = load(&build_pptx(&slide_xml, Some(&base_slide1_rels_xml()), &[])).unwrap();
+    let slide_id = session.deck().slides[0].id.clone();
+    let start = session.deck().slides[0].shapes.len();
+    let text_id = "ab102030405060708090aabbccddeeff0";
+    let table_id = "table-model-uuid";
+    let chart_id = "chart-model-uuid";
+    let mut table = slides_core::TableShape::default_grid(1, 1, Rect::new(0.0, 0.0, 300.0, 200.0));
+    table.id = table_id.into();
+    let mut chart = slides_core::ChartShape::new(
+        Transform::default(),
+        slides_core::ChartType::Column,
+        slides_core::ChartData::Category {
+            categories: vec!["A".into()],
+            series: vec![slides_core::CategorySeries {
+                name: "Series".into(),
+                values: vec![1.0],
+            }],
+        },
+        Some("Chart".into()),
+    )
+    .unwrap();
+    chart.id = chart_id.into();
+    let shapes = [
+        Shape::TextBox(TextBox {
+            id: text_id.into(),
+            frame: Rect::new(0.0, 0.0, 300.0, 100.0),
+            paragraphs: vec![Paragraph {
+                runs: vec![Run::new("New text")],
+                ..Default::default()
+            }],
+        }),
+        Shape::Geometric(GeometricShape {
+            id: "4".into(),
+            transform: Transform::default(),
+            geometry: Geometry::Rectangle,
+            style: Style::default(),
+        }),
+        Shape::Table(table),
+        Shape::Chart(chart),
+    ];
+    for shape in shapes {
+        session
+            .execute(Box::new(AddShape::new(slide_id.clone(), shape)))
+            .unwrap();
+    }
+    session.deck_mut().slides[0].animation = Some(Animation::new(
+        (start..start + 4)
+            .map(|index| BuildStep::new(index, BuildEffect::Fade, 300))
+            .collect(),
+    ));
+    session
+        .deck_mut()
+        .comments
+        .push(slides_core::CommentThread {
+            id: "comment".into(),
+            anchor: slides_core::CommentAnchor::Shape {
+                slide_id: slide_id.clone(),
+                shape_id: text_id.into(),
+            },
+            comments: vec![],
+            assigned_to: None,
+            resolved: false,
+        });
+    let saved = save(&session).unwrap();
+    let check_ids = |bytes: &[u8]| {
+        let xml = String::from_utf8(entry_bytes(bytes, "ppt/slides/slide1.xml")).unwrap();
+        let mut reader = quick_xml::Reader::from_str(&xml);
+        let mut buf = Vec::new();
+        let mut ids = Vec::new();
+        let mut targets = Vec::new();
+        loop {
+            match reader.read_event_into(&mut buf).unwrap() {
+                quick_xml::events::Event::Start(e) | quick_xml::events::Event::Empty(e) => {
+                    let local = crate::load::qname_str(e.name());
+                    if local == "cNvPr" {
+                        ids.push(
+                            crate::load::attr_by_local_name(&e, "id")
+                                .unwrap()
+                                .parse::<u32>()
+                                .unwrap(),
+                        );
+                    }
+                    if local == "spTgt" {
+                        targets.push(
+                            crate::load::attr_by_local_name(&e, "spid")
+                                .unwrap()
+                                .parse::<u32>()
+                                .unwrap(),
+                        );
+                    }
+                }
+                quick_xml::events::Event::Eof => break,
+                _ => {}
+            }
+            buf.clear();
+        }
+        let unique: HashSet<_> = ids.iter().copied().collect();
+        assert_eq!(ids.len(), unique.len());
+        for id in [0, 2, 3, 4, 100000] {
+            assert!(unique.contains(&id));
+        }
+        assert_eq!(targets.len(), 4);
+        assert!(targets.iter().all(|id| unique.contains(id)));
+        ids
+    };
+    let original_ids = check_ids(&saved);
+    let reloaded = load(&saved).unwrap();
+    assert_eq!(reloaded.deck().slides[0].shapes[start].id(), text_id);
+    assert_eq!(reloaded.deck().slides[0].shapes[start + 1].id(), "4");
+    assert_eq!(reloaded.deck().slides[0].shapes[start + 2].id(), table_id);
+    assert_eq!(reloaded.deck().slides[0].shapes[start + 3].id(), chart_id);
+    assert_eq!(
+        reloaded.deck().slides[0]
+            .animation
+            .as_ref()
+            .unwrap()
+            .steps
+            .iter()
+            .map(|step| step.shape_index)
+            .collect::<Vec<_>>(),
+        (start..start + 4).collect::<Vec<_>>()
+    );
+    assert_eq!(reloaded.deck().comments, session.deck().comments);
+    session.commit_save(saved).unwrap();
+    session
+        .execute(Box::new(EditText::new(
+            slide_id,
+            start,
+            0,
+            vec![Run::new("Edited again")],
+        )))
+        .unwrap();
+    let second = save(&session).unwrap();
+    assert_eq!(check_ids(&second), original_ids);
+    assert_eq!(
+        load(&second).unwrap().deck().slides[0].shapes[start].id(),
+        text_id
+    );
+}
+
+#[test]
+fn new_slide_reserves_nested_passthrough_ids_before_allocating() {
+    let mut session = load(&crate::create_blank_pptx()).unwrap();
+    let raw = br#"<p:grpSp><p:nvGrpSpPr><p:cNvPr id="2" name="Group"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/><p:sp><p:nvSpPr><p:cNvPr id="3" name="Child"/></p:nvSpPr><p:spPr/></p:sp></p:grpSp>"#;
+    session
+        .execute(Box::new(InsertSlide::new(
+            1,
+            Slide {
+                id: "new-slide".into(),
+                shapes: vec![
+                    Shape::TextBox(TextBox {
+                        id: "new-text-uuid".into(),
+                        frame: Rect::new(0.0, 0.0, 100.0, 100.0),
+                        paragraphs: vec![Paragraph {
+                            runs: vec![Run::new("New")],
+                            ..Default::default()
+                        }],
+                    }),
+                    Shape::Passthrough(PassthroughObject {
+                        id: "opaque-model-id".into(),
+                        label: "grpSp".into(),
+                        source_part: "new-slide".into(),
+                        raw_bytes: raw.to_vec(),
+                        frame: None,
+                    }),
+                ],
+                ..Default::default()
+            },
+        )))
+        .unwrap();
+    let saved = save(&session).unwrap();
+    let xml = String::from_utf8(entry_bytes(&saved, "ppt/slides/slide2.xml")).unwrap();
+    assert!(xml.contains(r#"id="4" name="TextBox 1""#));
+    assert_eq!(xml.matches(r#"id="2""#).count(), 1);
+    assert_eq!(xml.matches(r#"id="3""#).count(), 1);
+    let reloaded = load(&saved).unwrap();
+    assert_eq!(reloaded.deck().slides[1].shapes[0].id(), "new-text-uuid");
+    assert_eq!(reloaded.deck().slides[1].shapes[1].id(), "opaque-model-id");
+}
+
+#[test]
 fn blank_theme_font_scheme_is_outside_color_scheme() {
     let bytes = crate::create_blank_pptx();
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();

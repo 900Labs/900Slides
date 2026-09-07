@@ -1,9 +1,9 @@
-//! Accessibility checker and WCAG 2.2 AA scoring.
+//! Automated document accessibility checks.
 //!
 //! [`check_accessibility`] audits a [`Deck`] offline (no network, no browser
 //! engine) for common accessibility issues — missing image alt text, low text
 //! contrast, missing slide titles, poor reading order, undersized text, and
-//! empty slides — and rolls them up into a 0–100 WCAG 2.2 AA conformance score.
+//! empty slides — and rolls them up into a heuristic 0–100 document check score, not a conformance assessment.
 
 use std::collections::HashSet;
 
@@ -80,7 +80,7 @@ pub enum IssueCategory {
 pub struct AccessibilityReport {
     /// Every issue found, in document order.
     pub issues: Vec<AccessibilityIssue>,
-    /// WCAG 2.2 AA conformance score (0–100). 100 means no issues.
+    /// Document check score (0–100). 100 means no issues detected by these checks.
     pub score: u32,
     /// Total number of slides in the deck.
     pub total_slides: usize,
@@ -88,8 +88,8 @@ pub struct AccessibilityReport {
     pub slides_with_issues: usize,
 }
 
-/// Checks a deck for accessibility issues and returns a report with a WCAG 2.2
-/// AA conformance score.
+/// Checks a deck for accessibility issues and returns a report with a heuristic
+/// document check score.
 ///
 /// Runs entirely against the in-memory deck model — fully offline.
 #[must_use]
@@ -269,7 +269,7 @@ fn check_slide(
     }
 }
 
-/// Computes the WCAG 2.2 AA score: 100 minus weighted penalties, floored at 0.
+/// Computes the document check score: 100 minus weighted penalties, floored at 0.
 fn compute_score(issues: &[AccessibilityIssue]) -> u32 {
     let mut errors = 0u32;
     let mut warnings = 0u32;

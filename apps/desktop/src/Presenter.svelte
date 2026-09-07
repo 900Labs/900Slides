@@ -613,7 +613,7 @@
 
   /** Returns a readable background color for a slide, or white. */
   function backgroundColor(): ColorDto {
-    return { r: 255, g: 255, b: 255, a: 255 }
+    return presenterState?.background ?? { r: 255, g: 255, b: 255, a: 255 }
   }
 
   /** CSS class for the transition kind of the current slide. */
@@ -660,6 +660,8 @@
           <SlideCanvas
             slide={presenterState.currentSlide}
             background={backgroundColor()}
+            bodyFont={presenterState.bodyFont}
+            headingFont={presenterState.headingFont}
             media={presenterState.media}
             slideSize={presenterState.slideSize}
             highContrast={presenterState.highContrast}
@@ -675,6 +677,8 @@
           <SlideCanvas
             slide={morph.prev}
             background={{ r: 255, g: 255, b: 255, a: 0 }}
+            bodyFont={presenterState.bodyFont}
+            headingFont={presenterState.headingFont}
             media={presenterState.media}
             slideSize={presenterState.slideSize}
             highContrast={presenterState.highContrast}
@@ -883,6 +887,8 @@
           <SlideCanvas
             slide={presenterState.nextSlide}
             background={backgroundColor()}
+            bodyFont={presenterState.bodyFont}
+            headingFont={presenterState.headingFont}
             media={presenterState.media}
             slideSize={presenterState.slideSize}
             highContrast={presenterState.highContrast}

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { modalFocus } from './lib/modalFocus.js'
   import type {
     AccessibilityIssueDto,
     AccessibilityReportDto,
@@ -91,7 +92,7 @@
     aria-label="Close accessibility panel"
     onclick={onClose}
   ></button>
-  <div class="dialog" role="dialog" aria-modal="true" aria-label="Accessibility checker">
+  <div class="dialog" use:modalFocus={onClose} tabindex="-1" role="dialog" aria-modal="true" aria-label="Accessibility checker">
     <div class="dialog-header">
       <h2>Accessibility</h2>
       <div class="header-actions">
@@ -108,10 +109,11 @@
           {report ? report.score : '–'}
         </div>
         <div class="score-meta">
-          <div class="score-title">WCAG 2.2 AA score</div>
+          <div class="score-title">Document check score</div>
+          <p class="score-summary">Checks common slide issues; this is not a WCAG conformance assessment.</p>
           {#if report}
             {#if report.issues.length === 0}
-              <p class="score-summary good">No issues found — this deck meets WCAG 2.2 AA.</p>
+              <p class="score-summary good">No issues found by these automated checks.</p>
             {:else}
               <p class="score-summary">
                 {report.issues.length} issue{report.issues.length === 1 ? '' : 's'} across
@@ -128,7 +130,7 @@
       </section>
 
       {#if report && report.issues.length === 0}
-        <p class="empty">Nothing to fix. 🎉</p>
+        <p class="empty">Review reading order, image descriptions, and your exported slides manually too.</p>
       {:else if groups.length === 0}
         <p class="empty">No issues to show. Click “Re-check” to audit the deck.</p>
       {:else}

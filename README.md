@@ -3,7 +3,7 @@
 A free, local-first desktop presentation editor. An open-source alternative to
 PowerPoint and Google Slides that runs entirely on your own computer — no
 account, no subscription, no telemetry, no constant internet connection, and
-your `.pptx` files are preserved byte-for-byte.
+untouched parts of your `.pptx` files are preserved byte-for-byte.
 
 900Slides is built for the people and communities priced out of subscription
 productivity software: classrooms, small businesses, researchers, public
@@ -12,33 +12,38 @@ ordinary laptop, including when the Wi-Fi is down.
 
 ## Download
 
-Pre-built binaries are produced by GitHub Actions for every tagged release.
-Grab the latest from the [Releases page](../../releases) — see
-[`docs/RELEASES.md`](docs/RELEASES.md) for full instructions.
+The source is on the **0.4 development track**. The release workflow builds
+platform artifacts on tagged releases and manual runs; check a successful run in
+[GitHub Actions](https://github.com/900Labs/900Slides/actions/workflows/release.yml)
+for downloads. A configured job is not evidence that an installer has been tested.
+See [`docs/RELEASES.md`](docs/RELEASES.md) for installation and validation status.
 
-| Build | Artifact |
-| ----- | -------- |
-| **macOS** | `900Slides-macos` — an ad-hoc signed `.app` bundle |
-| **Linux** | `900Slides-linux-deb` (`.deb`) and `900Slides-linux-appimage` (`.AppImage`) |
+| Platform | Configured artifact | Validation still required |
+| --- | --- | --- |
+| macOS | Ad-hoc signed `.app` | Target OS install and Gatekeeper flow; not notarized |
+| Linux | `.deb` and `.AppImage`, built on Ubuntu 22.04 | Clean supported systems and offline dependencies |
+| Windows | NSIS installer including the offline WebView2 installer | Clean offline Windows installation; not code signed |
 
-The macOS build is **ad-hoc signed, not notarized** (no paid Apple Developer
-account is used). On first launch, Gatekeeper will block it — right-click the
-`.app`, choose **Open**, then **Open anyway** (or run
-`xattr -cr /path/to/900Slides.app`). Windows and other platforms can build
-from source (see below).
+The Windows offline bundle includes a browser runtime and is substantially larger
+than the app executable. The 16 MiB executable regression budget is **not** an
+installer-size or RAM claim. Supported older-device targets and outstanding tests
+are tracked in [`docs/LOW_RESOURCE_REQUIREMENTS.md`](docs/LOW_RESOURCE_REQUIREMENTS.md).
 
 ## Why it exists
 
 Presentation software is basic working infrastructure — for teaching, running
-a small business, organizing a community, or publishing research. Where the
-mainstream tools demand subscriptions, accounts, cloud sync, and always-on
-connectivity, 900 Labs builds open-source tools that stay useful on a laptop
-with intermittent access and an aging OS. 900Slides is the presentation sibling
-in that family, and it is built to remain that way.
+a small business, organizing a community, or publishing research. Many
+established tools work offline, but licensing, account setup, runtime requirements,
+and offline installation differ. 900 Labs builds open-source tools that stay
+useful with intermittent access and modest hardware. 900Slides is the presentation
+sibling in that family, and it is built to remain that way.
 
 ## Features
 
 **Slide editing**
+
+- **Slide organization**: add, move up/down and delete slides, with undo. The
+  final slide is retained; reordering and deletion persist when saving PPTX.
 
 - **Rich text** in every text box: bold, italic, underline, strikethrough,
   super/subscript, inline code, links, headings (H1–H6), blockquotes, fenced
@@ -46,9 +51,13 @@ in that family, and it is built to remain that way.
   levels.
 - **Images and shapes**: PNG, JPEG, GIF, WebP, and SVG, plus geometric shapes
   (rectangle, rounded rectangle, ellipse, triangle, line, arrow, right-arrow
-  callout, five-point star) with fill, outline, shadow, rotation, and crop.
-- **Tables** up to 50 rows × 50 columns with cell text, fills, borders, column
-  and row resize, header rows, and cell alignment.
+  callout, five-point star). Objects can be moved and resized; geometric shapes
+  have fill, outline, opacity, and shadow controls. Imported image crops and
+  rotations render, but dedicated crop/rotation controls remain open.
+- **Tables** up to 50 rows × 50 columns with text editing and row/column
+  insertion and deletion. Imported fills, borders, header rows, cell alignment,
+  and dimensions render; dedicated cell-formatting and row/column resize
+  controls remain open.
 - **Charts** (bar, column, line, area, pie, scatter) with an in-place
   data-table editor for categories, series, and values. Switch the chart type
   at any time.
@@ -87,13 +96,14 @@ in that family, and it is built to remain that way.
   objects and re-emitted unchanged; save regenerates only the slides you
   touched. A per-slide **loss ledger** warns you about content that is preserved
   but not yet editable (e.g. SmartArt).
-- **ODP import and export** (OpenDocument Presentation) — open `.odp` files and
-  export decks to `.odp`.
+- **ODP import and export library** (OpenDocument Presentation). The current
+  desktop file chooser exposes PPTX; ODP UI integration remains open.
 - **Deterministic export** to **SVG** (per slide), **PNG** (2× retina, per
   slide), and **PDF** (entire deck) — fully offline, identical inputs yield
   byte-identical output.
-- **Bundled fonts** (Inter, Source Serif 4, JetBrains Mono) are embedded on
-  export so files render identically on any platform.
+- **Bundled render/export fonts** (Inter, Source Serif 4, JetBrains Mono) reduce
+  dependence on installed fonts. Editor substitution and additional script
+  coverage still require qualification.
 
 **Private & resilient**
 
@@ -104,28 +114,23 @@ in that family, and it is built to remain that way.
   scripts, event handlers, and unsafe URL references.
 - **Offline spell-check** (en-US) with red squiggles, right-click suggestions,
   and a personal dictionary that persists across sessions.
-- **Crash recovery** via debounced autosave snapshots and a startup recovery
-  prompt.
-
-## Platform support
-
-| Platform | v0.3.0 status |
-| -------- | ------------- |
-| macOS    | Downloadable `.app` (ad-hoc signed) via GitHub Actions |
-| Linux    | Downloadable `.deb` and `.AppImage` via GitHub Actions |
-| Windows  | Source build only |
-
-Source builds may also work on any Tauri-supported system once its
-prerequisites are installed.
+- **Safer file workflow**: Save reuses the current PPTX path; Save As creates
+  a copy. New, Open, and Quit protect unsaved work with Save / Discard / Cancel.
+- **Crash recovery**: text, table cells, and notes commit while you type;
+  debounced recovery snapshots and a startup recovery prompt help recover work.
+- **Bounded preview caches**: viewport-aware thumbnails release offscreen SVGs
+  and use a byte budget. The active deck and its source media still require RAM.
+- **Local history, comments, and document accessibility checks** are available.
+  The accessibility score is a heuristic, not a WCAG conformance assessment.
 
 ## How to use it
 
 1. Choose **New** to start from one of the six built-in templates, or **Open**
-   to load an existing `.pptx` or `.odp` file.
+   to load an existing `.pptx` file.
 2. Choose **Text Box** from the toolbar or Insert menu, then click the canvas
    to place one. To edit an existing text box, select it and press Enter or
-   double-click it. Edits flow to the Rust backend on each change and the
-   canvas re-renders from the returned snapshot; undo with the toolbar button.
+   double-click it. Edits commit automatically while typing, with an explicit flush before
+   saving or switching slides. Undo with the toolbar button.
 3. Insert an image from the toolbar (sanitized on the way in), or choose
    **Shape** and a geometry from the picker. Click the canvas for a default
    shape, or click-drag to place it at explicit bounds. Images and shapes render
@@ -134,9 +139,9 @@ prerequisites are installed.
    and double-click it to edit its data. Content 900Slides cannot yet edit
    (e.g. SmartArt) appears as a labelled placeholder — preserved on save but
    not modifiable.
-5. Choose **Save** to write a `.pptx` (or export to `.odp`, SVG, PNG, or PDF).
-   Only edited slides are regenerated; every other part of the original file is
-   unchanged.
+5. Choose **Save** to write a `.pptx`, or use the Export menu for SVG, PNG,
+   or PDF. For imported PPTX, save patches supported edited parts and preserves
+   untouched package content; ODP conversion has a separate compatibility scope.
 6. Choose **Present** to open dual-display mode: a presenter window and a
    fullscreen audience window. Navigate with arrow keys, space, Home, End, and
    Escape. Press `B` / `W` for a black/white Q&A slide, `L` for the laser
@@ -152,20 +157,17 @@ discard one, or skip to a new deck.
 
 ## What it does not do (yet)
 
-900Slides is at v0.3.0. The following are planned for later releases
-([`docs/ROADMAP.md`](docs/ROADMAP.md)) and are not yet available:
+The next milestone is a dependable everyday editor on supported modest hardware.
+These remain open acceptance gaps ([roadmap](docs/ROADMAP.md)):
 
-- **Local version history** (content-addressed snapshots, named versions,
-  visual diffs) — v0.4.0.
-- **Local comments** anchored to slides, objects, and text ranges — v0.4.0.
-- **Accessibility checker** and WCAG 2.2 AA measurement — v0.4.0+.
-- **Collaboration and cloud sync** — out of scope until v0.5.0+ and always
-  self-hosted / local-first, never a required service.
-- **Mobile and web clients.**
-- **AI-assisted deck generation** — deferred until on-device models meet the
-  project's quality bar; the architecture leaves room for it.
-- A **notarized** macOS installer and **Windows/Linux installers** — held for
-  v1.0.
+- Verified 2 GB / 4 GB device performance and clean offline installation on Windows/Linux.
+- Desktop ODP controls, slide duplication, full mixed-style text editing,
+  and broader PowerPoint/LibreOffice interoperability coverage, master-layout fidelity,
+  and clear font substitution reporting.
+- Complete image alt-text editing, keyboard/screen-reader audits, localized UI,
+  and RTL/CJK validation. The current UI and spell checker are English-first.
+- A notarized macOS distribution and a signed Windows installer.
+- Collaboration, mobile/web clients, and on-device AI features remain deferred.
 
 ## Build from source
 
@@ -188,6 +190,22 @@ To produce a release bundle:
 npm run tauri:build --prefix apps/desktop
 ```
 
+The standalone Tauri workspace owns the release profile used for distributable
+builds: size optimization, link-time optimization, one codegen unit, stripped
+symbols, and abort-on-panic. The size gate runs the full Tauri build so the
+frontend is rebuilt from source, the distributable `custom-protocol` feature is
+enabled, and the resulting target executable is checked against the maintained
+16 MiB regression budget:
+
+```bash
+./scripts/verify-wave22.sh
+```
+
+Passing a binary path checks an already packaged executable without rebuilding.
+No-argument mode requires installed npm dependencies plus the platform's Tauri
+system prerequisites. Plain `cargo build --release` is a development-protocol
+build and is not the representative release-size measurement.
+
 ### Validate the source
 
 After installing the Tauri prerequisites for your platform, run the source
@@ -197,7 +215,9 @@ checks:
 ./scripts/verify-local.sh
 ```
 
-This runs formatting, clippy, workspace tests, and the frontend type-check.
+This runs workspace and standalone desktop formatting, clippy and tests,
+frontend type-check, unit tests, production frontend build, and the privacy gate.
+Complete the native smoke test with `npm run tauri:dev --prefix apps/desktop`.
 Run the public-release privacy gate before publishing or changing repository
 visibility:
 

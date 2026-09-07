@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { invoke } from '@tauri-apps/api/core'
+  import { invokeApp as invoke } from './lib/invokeDeckSnapshot'
   import type {
     DeckSnapshot,
     SlideSnapshot,
@@ -13,9 +13,11 @@
     onClose: () => void
     /** Called after a restore; the parent adopts the returned deck snapshot. */
     onRestore: (deck: DeckSnapshot) => void
+    /** Commit pending edits so restoring cannot race an older draft. */
+    onBeforeRestore: () => Promise<void>
   }
 
-  let { onClose, onRestore }: Props = $props()
+  let { onClose, onRestore, onBeforeRestore }: Props = $props()
 
   /** All saved versions of the current deck, newest first. */
   let versions = $state<VersionInfoDto[]>([])
@@ -104,6 +106,7 @@
     restoring = true
     error = ''
     try {
+      await onBeforeRestore()
       const snapshot = await invoke<DeckSnapshot>('restore_version', { hash })
       onRestore(snapshot)
       await refresh()

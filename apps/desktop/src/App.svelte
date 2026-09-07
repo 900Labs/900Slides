@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { invoke } from '@tauri-apps/api/core'
+  import { invokeApp as invoke } from './lib/invokeDeckSnapshot'
   import { listen } from '@tauri-apps/api/event'
   import { tick } from 'svelte'
   import { open, save } from '@tauri-apps/plugin-dialog'
@@ -15,10 +15,13 @@
   import ShortcutsDialog from './ShortcutsDialog.svelte'
   import VersionHistory from './VersionHistory.svelte'
   import TemplatePicker from './TemplatePicker.svelte'
+  import SaveChangesDialog from './SaveChangesDialog.svelte'
+  import { confirmDocumentTransition, documentFileName } from './lib/documentLifecycle.js'
   import Comments from './Comments.svelte'
   import AccessibilityPanel from './AccessibilityPanel.svelte'
   import AnimationPane from './AnimationPane.svelte'
   import { fitCanvasScale } from './lib/canvasScale.js'
+  import { resetThumbnailCache, thumbnailDeckRenderKey } from './lib/thumbnailCache.js'
   import type {
     AccessibilityReportDto,
     ChartDataDto,
@@ -57,6 +60,18 @@
   const isAudience = window.location.hash === '#/audience'
 
   let deck = $state<DeckSnapshot | null>(null)
+  let documentStatus = $state<{ path: string | null; isDirty: boolean }>({ path: null, isDirty: false })
+  let documentBusy = $state(false)
+  let canvasEditor = $state<{ flushEdits: () => Promise<void> } | undefined>()
+  let notesEditor = $state<{ flushEdits: () => Promise<void> } | undefined>()
+  let canvasDraftDirty = $state(false)
+  let notesDraftDirty = $state(false)
+  let savePrompt = $state<{ action: string; resolve: (choice: 'save' | 'discard' | 'cancel') => void } | null>(null)
+  let showInspector = $state(true)
+  let statusRequest = 0
+  let pendingDraftCommit: Promise<void> = Promise.resolve()
+  const documentName = $derived(documentFileName(documentStatus.path))
+  const hasUnsavedChanges = $derived(documentStatus.isDirty || canvasDraftDirty || notesDraftDirty)
   let activeIndex = $state(0)
   let warnings = $state<WarningDto[]>([])
   let showWarnings = $state(true)
@@ -91,7 +106,7 @@
   let showComments = $state(false)
   /** Whether the accessibility checker panel is open. */
   let showAccessibility = $state(false)
-  /** Latest WCAG 2.2 AA report, or null while loading/none. */
+  /** Latest document accessibility report, or null while loading/none. */
   let accessibility = $state<AccessibilityReportDto | null>(null)
   /** True while an accessibility check is running. */
   let checkingAccessibility = $state(false)
@@ -162,6 +177,22 @@
 
   /** Deck slide size (aspect ratio), when set. */
   const slideSize = $derived<SlideSizeDto | undefined>(deck?.slideSize)
+  const thumbnailDeckKey = $derived.by(() =>
+    deck
+      ? thumbnailDeckRenderKey(
+          deck.theme,
+          deck.template,
+          deck.layouts,
+          deck.master,
+          deck.slideSize,
+          deck.mediaRevision,
+          deck.id,
+        )
+      : '',
+  )
+  const thumbnailAspectRatio = $derived(
+    `${deck?.slideSize?.widthEmu ?? 12_192_000} / ${deck?.slideSize?.heightEmu ?? 6_858_000}`,
+  )
   /** Default zoom fits the whole slide between the fixed side panels. */
   const canvasScale = $derived(
     fitCanvasScale(
@@ -294,28 +325,121 @@
       }
       await newDeck()
     } catch (err) {
-      console.error('Failed to load initial state:', err)
+      reportActionError('Could not load the presentation', err)
     }
+  }
+
+  async function refreshDocumentStatus(): Promise<void> {
+    const request = ++statusRequest
+    const status = await invoke<typeof documentStatus>('get_document_status')
+    if (request === statusRequest) documentStatus = status
+  }
+
+  $effect(() => {
+    void deck
+    if (!isPresenter && !isAudience) {
+      void refreshDocumentStatus().catch((error) => reportActionError('Could not check save status', error))
+    }
+  })
+
+  async function flushEditorDrafts(): Promise<void> {
+    await canvasEditor?.flushEdits()
+    await notesEditor?.flushEdits()
+  }
+
+  function commitEditorDraft(task: () => Promise<void>): Promise<void> {
+    const next = pendingDraftCommit.then(task)
+    pendingDraftCommit = next.catch(() => {})
+    return next
+  }
+
+  async function selectInspectorTab(tab: typeof rightPanelTab): Promise<void> {
+    try {
+      await notesEditor?.flushEdits()
+      rightPanelTab = tab
+    } catch (error) { reportActionError('Could not save the notes edit', error) }
+  }
+
+  async function openVersionHistory(): Promise<void> {
+    try {
+      await flushEditorDrafts()
+      showVersionHistory = true
+    } catch (error) { reportActionError('Could not save the current edits', error) }
+  }
+
+  async function usePlainNotes(): Promise<void> {
+    try {
+      await notesEditor?.flushEdits()
+      await handleSetRichNotes(null)
+    } catch (error) { reportActionError('Could not change the notes format', error) }
+  }
+
+  async function addStarterTitle(): Promise<void> {
+    if (!activeSlide) return
+    try {
+      const width = slideSize?.widthEmu ?? 12_192_000
+      const height = slideSize?.heightEmu ?? 6_858_000
+      deck = await invoke<DeckSnapshot>('add_text_box', {
+        slideId: activeSlide.id, asTitle: true, x: width * .1, y: height * .18,
+        width: width * .8, height: height * .25,
+      })
+      selectedShapeIndex = (deck.slides[activeIndex]?.shapes.length ?? 1) - 1
+      editingShapeIndex = selectedShapeIndex
+      await tick()
+      canvasAreaEl?.querySelector<HTMLTextAreaElement>('textarea.text-box')?.focus()
+    } catch (error) { reportActionError('Could not add a title', error) }
+  }
+
+  function chooseSaveAction(choice: 'save' | 'discard' | 'cancel'): void {
+    const prompt = savePrompt
+    savePrompt = null
+    prompt?.resolve(choice)
+  }
+
+  async function confirmTransition(action: string): Promise<'continue' | 'discard' | 'cancel'> {
+    return confirmDocumentTransition({
+      flush: flushEditorDrafts,
+      isDirty: async () => { await refreshDocumentStatus(); return documentStatus.isDirty },
+      recover: () => invoke<void>('flush_recovery'),
+      decide: () => new Promise((resolve) => { savePrompt = { action, resolve } }),
+      save: () => saveDocument(false),
+    })
+  }
+
+  function resetDocumentView(snapshot: DeckSnapshot): void {
+    if (deck?.id !== snapshot.id) resetThumbnailCache()
+    deck = snapshot
+    activeIndex = 0
+    warnings = snapshot.warnings
+    showWarnings = true
+    showRecovery = false
+    selectedShapeIndex = null
+    editingShapeIndex = null
+    activeCell = null
+    activeChart = null
+    canvasDraftDirty = false
+    notesDraftDirty = false
   }
 
   /** Creates a new blank deck from the Rust model, optionally applying a template. */
   async function newDeck(templateName?: string | null): Promise<void> {
-    const payload = templateName ? { templateName: templateName } : {}
+    if (documentBusy) return
+    documentBusy = true
     try {
-      deck = await invoke<DeckSnapshot>('new_deck', payload)
-      activeIndex = 0
-      warnings = deck?.warnings ?? []
-      showWarnings = true
-      showRecovery = false
-      selectedShapeIndex = null
-      editingShapeIndex = null
+      const decision = await confirmTransition('creating another presentation')
+      if (decision === 'cancel') return
+      resetDocumentView(await invoke<DeckSnapshot>('new_deck', { templateName, discardChanges: decision === 'discard' }))
+      await refreshDocumentStatus()
     } catch (error) {
       reportActionError('Could not create a new presentation', error)
+    } finally {
+      documentBusy = false
     }
   }
 
   /** Loads built-in templates and opens the template picker. */
   async function openTemplatePicker(): Promise<void> {
+    if (documentBusy) return
     if (templates.length === 0) {
       try {
         templates = await invoke<TemplateInfoDto[]>('list_templates')
@@ -334,39 +458,72 @@
 
   /** Opens an existing .pptx file via the system dialog. */
   async function onOpen(): Promise<void> {
+    if (documentBusy) return
+    documentBusy = true
     try {
       const path = await open({
         multiple: false,
         filters: [{ name: 'Presentation', extensions: ['pptx'] }],
       })
       if (typeof path !== 'string') return
-      deck = await invoke<DeckSnapshot>('open_deck', { path })
-      activeIndex = 0
-      warnings = deck?.warnings ?? []
-      showWarnings = true
-      selectedShapeIndex = null
-      editingShapeIndex = null
+      const decision = await confirmTransition('opening another presentation')
+      if (decision === 'cancel') return
+      resetDocumentView(await invoke<DeckSnapshot>('open_deck', { path, discardChanges: decision === 'discard' }))
+      await refreshDocumentStatus()
     } catch (error) {
       reportActionError('Could not open the presentation', error)
+    } finally {
+      documentBusy = false
     }
   }
 
-  /** Saves the current deck to a .pptx file via the system dialog. */
-  async function onSave(): Promise<void> {
-    try {
-      const path = await save({
-        filters: [{ name: 'Presentation', extensions: ['pptx'] }],
+  /** Save reuses the current file; Save As always chooses a new destination. */
+  async function saveDocument(saveAs: boolean): Promise<boolean> {
+    await flushEditorDrafts()
+    await refreshDocumentStatus()
+    let path = documentStatus.path
+    if (saveAs || !path) {
+      path = await save({
+        defaultPath: path ?? 'Untitled presentation.pptx',
+        filters: [{ name: 'PowerPoint presentation', extensions: ['pptx'] }],
       })
-      if (typeof path !== 'string') return
-      await invoke('save_deck', { path })
+      if (!path) return false
+    }
+    const status = await invoke<typeof documentStatus>('save_deck', { path })
+    statusRequest += 1
+    documentStatus = status
+    actionError = ''
+    return true
+  }
+
+  async function onSave(saveAs = false): Promise<void> {
+    if (documentBusy || !deck) return
+    documentBusy = true
+    try {
+      await saveDocument(saveAs)
     } catch (error) {
       reportActionError('Could not save the presentation', error)
+    } finally {
+      documentBusy = false
+    }
+  }
+
+  async function requestClose(): Promise<void> {
+    if (documentBusy) return
+    documentBusy = true
+    try {
+      const decision = await confirmTransition('closing this presentation')
+      if (decision !== 'cancel') await invoke('complete_close', { discardChanges: decision === 'discard' })
+    } catch (error) {
+      reportActionError('Could not close the presentation safely', error)
+    } finally {
+      documentBusy = false
     }
   }
 
   /** Filename stem used as the default for export save dialogs. */
   function exportStem(): string {
-    return deck?.id || 'deck'
+    return documentStatus.path ? documentName.replace(/\.pptx$/i, '') : 'presentation'
   }
 
   /** Guards an export: disables the menu, surfaces errors, clears the busy flag. */
@@ -374,6 +531,7 @@
     exporting = kind
     exportError = ''
     try {
+      await flushEditorDrafts()
       await task()
     } catch (error) {
       exportError = error instanceof Error ? error.message : String(error)
@@ -424,8 +582,10 @@
 
   /** Undoes the last edit and refreshes from the returned snapshot. */
   async function onUndo(): Promise<void> {
+    const selectedSlideId = activeSlide?.id
+    await flushEditorDrafts()
     deck = await invoke<DeckSnapshot>('undo')
-    activeIndex = Math.min(activeIndex, (deck?.slides.length ?? 1) - 1)
+    retainSlideSelection(selectedSlideId)
   }
 
   /** Adopts a deck restored from version history (reversible via Undo). */
@@ -483,7 +643,7 @@
     commentDraft = null
   }
 
-  /** Runs the WCAG 2.2 AA accessibility check on the current deck. */
+  /** Runs the document accessibility checks on the current deck. */
   async function runAccessibility(): Promise<void> {
     checkingAccessibility = true
     try {
@@ -524,6 +684,7 @@
 
   /** Opens the presenter window. */
   async function onStartPresenter(): Promise<void> {
+    await flushEditorDrafts()
     await invoke('start_presenter')
   }
 
@@ -534,13 +695,16 @@
     paragraphs: ParagraphDto[]
   }): Promise<void> {
     try {
-      deck = await invoke<DeckSnapshot>('edit_text_box', {
-        slideId: detail.slideId,
-        shapeIndex: detail.shapeIndex,
-        paragraphs: detail.paragraphs,
+      await commitEditorDraft(async () => {
+        deck = await invoke<DeckSnapshot>('edit_text_box', {
+          slideId: detail.slideId,
+          shapeIndex: detail.shapeIndex,
+          paragraphs: detail.paragraphs,
+        })
       })
     } catch (error) {
       reportActionError('Could not save the text edit', error)
+      throw error
     }
   }
 
@@ -664,6 +828,7 @@
    *  toggles the active run; otherwise it applies to every run in the selected
    *  text box. */
   async function toggleRunFlag(flag: 'bold' | 'italic' | 'underline' | 'strikethrough' | 'code'): Promise<void> {
+    await flushEditorDrafts()
     const target = getTextTarget()
     if (target) {
       const value = !target.run[flag]
@@ -713,6 +878,7 @@
 
   /** Toggles superscript on the active run, or across the selected text box. */
   async function toggleSuperscript(): Promise<void> {
+    await flushEditorDrafts()
     const target = getTextTarget()
     if (target) {
       const value: VerticalAlignDto =
@@ -731,6 +897,7 @@
 
   /** Toggles subscript on the active run, or across the selected text box. */
   async function toggleSubscript(): Promise<void> {
+    await flushEditorDrafts()
     const target = getTextTarget()
     if (target) {
       const value: VerticalAlignDto =
@@ -762,8 +929,21 @@
   }
 
   /** Applies a heading level to the active paragraph. */
+  function getParagraphTarget() {
+    const focused = getTextTarget()
+    if (focused) return focused
+    if (!activeSlide || selectedShapeIndex === null) return null
+    const shape = activeSlide.shapes[selectedShapeIndex]
+    if (shape?.kind !== 'text_box') return null
+    const paragraphIndex = activeTextTarget?.shapeIndex === selectedShapeIndex
+      ? activeTextTarget.paragraphIndex : 0
+    const paragraph = (shape.value as TextBoxSnapshot).paragraphs[paragraphIndex]
+    return paragraph ? { slideId: activeSlide.id, shapeIndex: selectedShapeIndex, paragraphIndex, paragraph } : null
+  }
+
   async function setHeading(level: HeadingLevelDto | null): Promise<void> {
-    const target = getTextTarget()
+    await flushEditorDrafts()
+    const target = getParagraphTarget()
     if (!target) return
     const style = {
       ...target.paragraph.style,
@@ -779,7 +959,8 @@
 
   /** Toggles a paragraph-level boolean flag. */
   async function toggleParagraphFlag(flag: 'blockquote' | 'codeBlock'): Promise<void> {
-    const target = getTextTarget()
+    await flushEditorDrafts()
+    const target = getParagraphTarget()
     if (!target) return
     const style = {
       ...target.paragraph.style,
@@ -796,6 +977,7 @@
   /** Commits the typed stepped-code ranges (e.g. "1-3|4|5,7") to the active
    *  code-block paragraph. An empty value clears the ranges. */
   async function onCodeStepRangesChange(event: Event): Promise<void> {
+    await flushEditorDrafts()
     if (!activeTextTarget || !activeSlide) return
     const value = (event.target as HTMLInputElement).value
     const style: ParagraphStyleDto = {
@@ -1003,6 +1185,7 @@
 
   /** Deletes the currently selected shape. */
   async function deleteSelectedShape(): Promise<void> {
+    await flushEditorDrafts()
     if (selectedShapeIndex === null || !activeSlide) return
     deck = await invoke<DeckSnapshot>('delete_shape', {
       slideId: activeSlide.id,
@@ -1014,14 +1197,73 @@
 
   /** Re-applies the most recently undone edit. */
   async function onRedo(): Promise<void> {
+    const selectedSlideId = activeSlide?.id
+    await flushEditorDrafts()
     deck = await invoke<DeckSnapshot>('redo')
-    activeIndex = Math.min(activeIndex, (deck?.slides.length ?? 1) - 1)
+    retainSlideSelection(selectedSlideId)
+  }
+
+  /** Keep the same slide selected when undo or reordering changes its index. */
+  function retainSlideSelection(slideId?: string): void {
+    const index = deck?.slides.findIndex((slide) => slide.id === slideId) ?? -1
+    activeIndex = index >= 0 ? index : Math.max(0, Math.min(activeIndex, (deck?.slides.length ?? 1) - 1))
+    // Reordering across a collapsed section must not hide the active slide.
+    const starts = (deck?.sections ?? [])
+      .map((section) => ({ id: section.startSlideId, index: deck!.slides.findIndex((slide) => slide.id === section.startSlideId) }))
+      .filter((section) => section.index >= 0 && section.index <= activeIndex)
+      .sort((a, b) => b.index - a.index)
+    const section = starts[0]
+    if (section && collapsedSections.has(section.id)) {
+      const expanded = new Set(collapsedSections)
+      expanded.delete(section.id)
+      collapsedSections = expanded
+    }
+    activeCell = null
+    activeChart = null
+    a11ySelectedShapeIndex = null
+    if (!slideId || index < 0) {
+      selectedShapeIndex = null
+      editingShapeIndex = null
+    }
+  }
+
+  async function moveActiveSlide(direction: -1 | 1): Promise<void> {
+    if (documentBusy || !activeSlide || !deck) return
+    const slideId = activeSlide.id
+    const toIndex = activeIndex + direction
+    if (toIndex < 0 || toIndex >= deck.slides.length) return
+    documentBusy = true
+    try {
+      await flushEditorDrafts()
+      deck = await invoke<DeckSnapshot>('move_slide', { slideId, toIndex })
+      retainSlideSelection(slideId)
+    } catch (error) {
+      reportActionError('Could not move the slide', error)
+    } finally {
+      documentBusy = false
+    }
+  }
+
+  async function deleteActiveSlide(): Promise<void> {
+    if (documentBusy || !activeSlide || !deck || deck.slides.length <= 1) return
+    const slideId = activeSlide.id
+    documentBusy = true
+    try {
+      await flushEditorDrafts()
+      deck = await invoke<DeckSnapshot>('delete_slide', { slideId })
+      retainSlideSelection()
+    } catch (error) {
+      reportActionError('Could not delete the slide', error)
+    } finally {
+      documentBusy = false
+    }
   }
 
   /** Inserts a new blank slide after the active one and selects it. */
   async function onNewSlide(): Promise<void> {
     if (!deck) return
     try {
+      await flushEditorDrafts()
       deck = await invoke<DeckSnapshot>('new_slide', { afterIndex: activeIndex })
       activeIndex = Math.min(activeIndex + 1, (deck?.slides.length ?? 1) - 1)
       a11ySelectedShapeIndex = null
@@ -1099,6 +1341,7 @@
 
   /** Dispatches a native menu-event id to the matching editor action. */
   function handleMenuEvent(id: string): void {
+    if (documentBusy) return
     switch (id) {
       case 'menu_new':
         void openTemplatePicker()
@@ -1107,8 +1350,10 @@
         void onOpen()
         break
       case 'menu_save':
-      case 'menu_save_as':
         void onSave()
+        break
+      case 'menu_save_as':
+        void onSave(true)
         break
       case 'menu_undo':
         void onUndo()
@@ -1189,6 +1434,17 @@
     }
   })
 
+  $effect(() => {
+    if (isPresenter || isAudience) return
+    let disposed = false
+    let unlisten: (() => void) | undefined
+    void listen('document-close-requested', () => void requestClose()).then((stop) => {
+      if (disposed) stop()
+      else unlisten = stop
+    })
+    return () => { disposed = true; unlisten?.() }
+  })
+
   /** Appends a new `rows` x `cols` table to the active slide. */
   async function onAddTable(rows: number, cols: number): Promise<void> {
     if (!activeSlide) return
@@ -1208,13 +1464,14 @@
     col: number
     text: string
   }): Promise<void> {
-    deck = await invoke<DeckSnapshot>('set_cell_text', {
-      slideId: detail.slideId,
-      shapeIndex: detail.shapeIndex,
-      row: detail.row,
-      col: detail.col,
-      text: detail.text,
-    })
+    try {
+      await commitEditorDraft(async () => {
+        deck = await invoke<DeckSnapshot>('set_cell_text', detail)
+      })
+    } catch (error) {
+      reportActionError('Could not save the table edit', error)
+      throw error
+    }
   }
 
   /** Records the focused cell so the row/column toolbar can target it. */
@@ -1224,6 +1481,7 @@
 
   /** Inserts a row below the focused cell. */
   async function onInsertRow(): Promise<void> {
+    await flushEditorDrafts()
     if (!activeSlide || !activeCell) return
     deck = await invoke<DeckSnapshot>('insert_row', {
       slideId: activeSlide.id,
@@ -1234,6 +1492,7 @@
 
   /** Inserts a column to the right of the focused cell. */
   async function onInsertColumn(): Promise<void> {
+    await flushEditorDrafts()
     if (!activeSlide || !activeCell) return
     deck = await invoke<DeckSnapshot>('insert_column', {
       slideId: activeSlide.id,
@@ -1244,6 +1503,7 @@
 
   /** Deletes the focused cell's row. */
   async function onDeleteRow(): Promise<void> {
+    await flushEditorDrafts()
     if (!activeSlide || !activeCell) return
     deck = await invoke<DeckSnapshot>('delete_row', {
       slideId: activeSlide.id,
@@ -1254,6 +1514,7 @@
 
   /** Deletes the focused cell's column. */
   async function onDeleteColumn(): Promise<void> {
+    await flushEditorDrafts()
     if (!activeSlide || !activeCell) return
     deck = await invoke<DeckSnapshot>('delete_column', {
       slideId: activeSlide.id,
@@ -1339,7 +1600,11 @@
   }
 
   /** Selects a different slide in the thumbnail panel. */
-  function selectSlide(index: number): void {
+  async function selectSlide(index: number): Promise<void> {
+    try { await flushEditorDrafts() } catch (error) {
+      reportActionError('Could not save the current slide edits', error)
+      return
+    }
     activeIndex = index
     a11ySelectedShapeIndex = null
     selectedShapeIndex = null
@@ -1358,11 +1623,8 @@
 
   /** Restores a recovery snapshot as the current deck. */
   async function handleRestore(id: string): Promise<void> {
-    deck = await invoke<DeckSnapshot>('restore_recovery', { id })
-    activeIndex = 0
-    warnings = deck?.warnings ?? []
-    showWarnings = true
-    showRecovery = false
+    resetDocumentView(await invoke<DeckSnapshot>('restore_recovery', { id }))
+    await refreshDocumentStatus()
   }
 
   /** Discards a recovery snapshot and falls back to a new deck if none remain. */
@@ -1396,12 +1658,17 @@
   }
 
   /** Commits rich-text notes (or clears them with null) for the active slide. */
-  async function handleSetRichNotes(paragraphs: ParagraphDto[] | null): Promise<void> {
-    if (!activeSlide) return
-    deck = await invoke<DeckSnapshot>('set_rich_notes', {
-      slideId: activeSlide.id,
-      richNotes: paragraphs,
-    })
+  async function handleSetRichNotes(paragraphs: ParagraphDto[] | null, sourceSlideId?: string): Promise<void> {
+    const slideId = sourceSlideId ?? activeSlide?.id
+    if (!slideId) return
+    try {
+      await commitEditorDraft(async () => {
+        deck = await invoke<DeckSnapshot>('set_rich_notes', { slideId, richNotes: paragraphs })
+      })
+    } catch (error) {
+      reportActionError('Could not save the notes edit', error)
+      throw error
+    }
   }
 
   /** Enables rich-text notes, seeded from the slide's plain notes. */
@@ -1479,6 +1746,7 @@
 
   /** Global keyboard shortcuts for the editor window. */
   function handleGlobalKey(event: KeyboardEvent): void {
+    if (documentBusy) return
     const mod = event.metaKey || event.ctrlKey
     const target = event.target as HTMLElement | null
     const typing =
@@ -1495,9 +1763,9 @@
 
     if (mod && event.key.toLowerCase() === 'f') {
       event.preventDefault()
-      findReplaceMode = 'find'
+      findReplaceMode = event.altKey ? 'replace' : 'find'
       showFindReplace = true
-    } else if (mod && event.key.toLowerCase() === 'h') {
+    } else if (event.ctrlKey && !event.metaKey && event.key.toLowerCase() === 'h') {
       event.preventDefault()
       findReplaceMode = 'replace'
       showFindReplace = true
@@ -1537,7 +1805,20 @@
   <AudienceWindow />
 {:else}
   <div class="app">
-    <header class="toolbar" role="toolbar" aria-label="Editor toolbar">
+    <header class="document-header">
+      <span class="app-mark" aria-label="900Slides">900<span>Slides</span></span>
+      <div class="document-heading">
+        <strong title={documentStatus.path ?? documentName}>{documentName}</strong>
+        <span class:unsaved={hasUnsavedChanges} role="status">{documentBusy ? 'Working…' : hasUnsavedChanges ? 'Unsaved changes' : documentStatus.path ? 'Saved to this computer' : 'New presentation · not saved yet'}</span>
+      </div>
+      <nav class="document-actions" aria-label="Document actions">
+        <button type="button" onclick={openTemplatePicker} disabled={documentBusy}>New</button>
+        <button type="button" onclick={onOpen} disabled={documentBusy}>Open</button>
+        <button type="button" onclick={() => onSave(true)} disabled={documentBusy || !deck}>Save As</button>
+        <button class="present-action" type="button" onclick={onStartPresenter} disabled={documentBusy || !deck}>Present</button>
+      </nav>
+    </header>
+    <header class="toolbar" role="toolbar" aria-label="Editor toolbar" inert={documentBusy}>
       <!-- Left group: Undo | Redo | Save | separator | New Slide -->
       <span class="tb-group">
         <button class="tb-btn" onclick={onUndo} type="button" title="Undo (Cmd/Ctrl+Z)" aria-label="Undo">
@@ -1546,7 +1827,7 @@
         <button class="tb-btn" onclick={onRedo} type="button" title="Redo (Cmd/Ctrl+Shift+Z)" aria-label="Redo">
           <svg viewBox="0 0 24 24"><path d="M15 14l5-5-5-5"></path><path d="M20 9h-9a6 6 0 0 0 0 12h4"></path></svg>
         </button>
-        <button class="tb-btn" onclick={onSave} type="button" title="Save (Cmd/Ctrl+S)" aria-label="Save">
+        <button class="tb-btn" onclick={() => onSave()} type="button" disabled={!deck} title="Save (Cmd/Ctrl+S)" aria-label="Save">
           <svg viewBox="0 0 24 24"><path d="M6 3h9l4 4v14H6z"></path><path d="M9 3v5h6"></path><rect x="9" y="13" width="6" height="6"></rect></svg>
         </button>
         <span class="tb-sep"></span>
@@ -1746,7 +2027,7 @@
     </header>
 
     <!-- Secondary format bar: advanced text formatting, table ops, deck tools. -->
-    <div class="format-bar" role="toolbar" aria-label="Formatting">
+    <div class="format-bar" role="toolbar" aria-label="Formatting" inert={documentBusy}>
       <span class="tb-group">
         <button class="tb-btn tb-text" onclick={() => toggleRunFlag('strikethrough')} type="button" title="Strikethrough" aria-label="Strikethrough"><s>S</s></button>
         <button class="tb-btn tb-text" onclick={toggleSuperscript} type="button" title="Superscript" aria-label="Superscript">x<sup>2</sup></button>
@@ -1835,7 +2116,7 @@
         </button>
         <button
           class="tb-btn tb-text"
-          onclick={() => (showVersionHistory = true)}
+          onclick={openVersionHistory}
           type="button"
           disabled={!deck}
           title="Local version history"
@@ -1859,7 +2140,7 @@
           type="button"
           class:active={showAccessibility}
           disabled={!deck}
-          title="Accessibility checker (WCAG 2.2 AA score)"
+          title="Document accessibility checks"
           aria-pressed={showAccessibility}
         >
           A11y
@@ -1898,9 +2179,21 @@
       </div>
     {/if}
 
-    <div class="workspace">
+    <div class="workspace" inert={documentBusy}>
       <aside class="sidebar" aria-label="Slide thumbnails">
         {#if deck}
+          <div class="slide-navigation-heading">
+            <strong>Slides</strong>
+            <span>{deck.slides.length}</span>
+          </div>
+          <div class="slide-actions" role="group" aria-label="Organize selected slide">
+            <button type="button" onclick={() => moveActiveSlide(-1)} disabled={activeIndex === 0 || documentBusy}
+              aria-label="Move selected slide up" title="Move selected slide up">↑ Up</button>
+            <button type="button" onclick={() => moveActiveSlide(1)} disabled={activeIndex >= deck.slides.length - 1 || documentBusy}
+              aria-label="Move selected slide down" title="Move selected slide down">↓ Down</button>
+            <button class="delete-slide" type="button" onclick={deleteActiveSlide} disabled={deck.slides.length <= 1 || documentBusy}
+              aria-label="Delete selected slide" title={deck.slides.length <= 1 ? 'Keep at least one slide' : 'Delete selected slide (can be undone)'}>Delete</button>
+          </div>
           {#each sectionGroups as group (group.section?.startSlideId ?? '__nostart__')}
             {#if group.section}
               <div class="section-header">
@@ -1925,10 +2218,13 @@
               </div>
             {/if}
             {#if !group.section || !collapsedSections.has(group.section.startSlideId)}
-              {#each group.indices as index (index)}
+              {#each group.indices as index (deck.slides[index].id)}
                 {@const slide = deck.slides[index]}
+                <span class="slide-number" aria-hidden="true">{index + 1}</span>
                 <SlideThumbnail
                   {slide}
+                  deckRenderKey={thumbnailDeckKey}
+                  aspectRatio={thumbnailAspectRatio}
                   selected={index === activeIndex}
                   onClick={() => selectSlide(index)}
                 />
@@ -1973,8 +2269,12 @@
       >
         {#if activeSlide && deck}
           <SlideCanvas
+            bind:this={canvasEditor}
+            onDraftChange={(dirty) => (canvasDraftDirty = dirty)}
             slide={activeSlide}
             background={deck.theme.background}
+            bodyFont={deck.theme.bodyFont}
+            headingFont={deck.theme.headingFont}
             media={deck.media}
             slideSize={slideSize}
             scale={canvasScale}
@@ -1996,17 +2296,29 @@
             onShapeContextMenu={handleShapeContextMenu}
             onCommentOnSelection={handleCommentOnSelection}
           />
+          {#if activeSlide.shapes.length === 0 && !creatingTextBox && !creatingShapeKind}
+            <div class="slide-start">
+              <span class="start-eyebrow">Your next idea starts here</span>
+              <h2>Make this slide yours.</h2>
+              <p>Add a title, bring in an image, or start with a built-in theme.</p>
+              <div>
+                <button class="primary" type="button" onclick={addStarterTitle}>Add a title</button>
+                <button type="button" onclick={onInsertImage}>Insert image</button>
+                <button type="button" onclick={openTemplatePicker}>Choose a template</button>
+              </div>
+            </div>
+          {/if}
         {:else}
           <div class="empty-canvas">Open or create a deck to start editing.</div>
         {/if}
       </main>
 
-      <aside class="right-panel" aria-label="Inspector, notes and animation">
+      <aside class="right-panel" class:inspector-hidden={!showInspector} aria-label="Inspector, notes and animation">
         <div class="tab-bar" role="tablist">
           <button
             class="tab"
             class:active={rightPanelTab === 'style'}
-            onclick={() => (rightPanelTab = 'style')}
+            onclick={() => selectInspectorTab('style')}
             type="button"
             role="tab"
             aria-selected={rightPanelTab === 'style'}
@@ -2016,7 +2328,7 @@
           <button
             class="tab"
             class:active={rightPanelTab === 'text'}
-            onclick={() => (rightPanelTab = 'text')}
+            onclick={() => selectInspectorTab('text')}
             type="button"
             role="tab"
             aria-selected={rightPanelTab === 'text'}
@@ -2026,7 +2338,7 @@
           <button
             class="tab"
             class:active={rightPanelTab === 'arrange'}
-            onclick={() => (rightPanelTab = 'arrange')}
+            onclick={() => selectInspectorTab('arrange')}
             type="button"
             role="tab"
             aria-selected={rightPanelTab === 'arrange'}
@@ -2036,7 +2348,7 @@
           <button
             class="tab"
             class:active={rightPanelTab === 'notes'}
-            onclick={() => (rightPanelTab = 'notes')}
+            onclick={() => selectInspectorTab('notes')}
             type="button"
             role="tab"
             aria-selected={rightPanelTab === 'notes'}
@@ -2046,7 +2358,7 @@
           <button
             class="tab"
             class:active={rightPanelTab === 'animation'}
-            onclick={() => (rightPanelTab = 'animation')}
+            onclick={() => selectInspectorTab('animation')}
             type="button"
             role="tab"
             aria-selected={rightPanelTab === 'animation'}
@@ -2204,11 +2516,13 @@
           <div class="panel-content" role="tabpanel">
             {#if activeRichNotes}
               <RichNotesEditor
+                bind:this={notesEditor}
+                onDraftChange={(dirty) => (notesDraftDirty = dirty)}
                 slideId={activeSlide!.id}
                 richNotes={activeRichNotes}
                 onSetRichNotes={handleSetRichNotes}
               />
-              <button class="notes-toggle" type="button" onclick={() => handleSetRichNotes(null)}>
+              <button class="notes-toggle" type="button" onclick={usePlainNotes}>
                 Use plain notes
               </button>
             {:else}
@@ -2286,6 +2600,18 @@
       </aside>
     </div>
 
+    <footer class="status-bar">
+      <span>{deck ? `Slide ${activeIndex + 1} of ${deck.slides.length}` : 'No presentation open'}</span>
+      <span class="offline-status">Offline · No account needed</span>
+      <button type="button" aria-pressed={showInspector} onclick={() => (showInspector = !showInspector)} disabled={documentBusy}>
+        {showInspector ? 'Hide inspector' : 'Show inspector'}
+      </button>
+    </footer>
+
+    {#if savePrompt}
+      <SaveChangesDialog name={documentName} action={savePrompt.action} onChoose={chooseSaveAction} />
+    {/if}
+
     {#if showRecovery}
       <RecoveryPrompt
         snapshots={recoverySnapshots}
@@ -2325,6 +2651,7 @@
       <VersionHistory
         onClose={() => (showVersionHistory = false)}
         onRestore={onRestoreVersion}
+        onBeforeRestore={flushEditorDrafts}
       />
     {/if}
 
@@ -2391,9 +2718,29 @@
     display: flex;
     flex-direction: column;
     height: 100vh;
-    min-width: 860px;
+    min-width: 640px;
     background: #f7f8fb;
   }
+  .document-header { display: flex; align-items: center; gap: 1rem; padding: .75rem 1rem; background: #fff; border-bottom: 1px solid #dce3ed; flex-shrink: 0; }
+  .app-mark { display: flex; flex-direction: column; font-weight: 800; color: #245eb3; font-size: 1.05rem; line-height: 1; letter-spacing: -.04em; padding-right: 1rem; border-right: 1px solid #dce3ed; }
+  .app-mark span { margin-top: .2rem; color: #495a73; font-size: .65rem; font-weight: 600; letter-spacing: .02em; }
+  .document-heading { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: .25rem; }
+  .document-heading strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .92rem; font-weight: 650; }
+  .document-heading > span { font-size: .7rem; color: #64758b; }
+  .document-heading > .unsaved { color: #986000; }
+  .document-actions { display: flex; align-items: center; gap: .4rem; }
+  .document-actions button, .slide-start button { padding: .5rem .75rem; background: white; color: #2c415d; border: 1px solid #ced8e6; border-radius: 6px; font-size: .76rem; cursor: pointer; }
+  .document-actions .present-action, .slide-start .primary { background: #245eb3; color: white; border-color: #245eb3; }
+  .document-actions button:disabled { opacity: .5; cursor: default; }
+  .status-bar { display: flex; align-items: center; gap: 1rem; min-height: 31px; padding: 0 .8rem; border-top: 1px solid #d5deeb; color: #5b6c82; font-size: .7rem; background: #fff; flex-shrink: 0; }
+  .status-bar .offline-status { flex: 1; text-align: center; }
+  .status-bar button { font: inherit; border: none; color: #245eb3; background: transparent; padding: .35rem; cursor: pointer; margin-left: auto; }
+  .slide-start { position: absolute; max-width: calc(100% - 5rem); text-align: center; color: #344966; background: #ffffffee; border: 1px solid #dce4ee; border-radius: 12px; padding: 1.8rem; box-shadow: 0 10px 36px #1839600c; }
+  .start-eyebrow { font-size: .65rem; letter-spacing: .1em; color: #6a7e9b; text-transform: uppercase; font-weight: 700; }
+  .slide-start h2 { font-size: clamp(1rem, 1.6vw, 1.45rem); letter-spacing: -.035em; margin: .7rem 0; }
+  .slide-start p { font-size: .78rem; line-height: 1.5; color: #6d7b8f; max-width: 24rem; margin: 0 auto 1.1rem; }
+  .slide-start > div { display: flex; gap: .5rem; justify-content: center; flex-wrap: wrap; }
+  :global(button:focus-visible), :global(select:focus-visible), :global(input:focus-visible) { outline: 2px solid #3077d0; outline-offset: 2px; }
   .toolbar {
     display: flex;
     align-items: center;
@@ -2403,7 +2750,8 @@
     border-bottom: 1px solid #d7dce7;
     background: #ffffff;
     box-shadow: 0 1px 2px rgba(27, 39, 65, 0.05);
-    flex-wrap: nowrap;
+    flex-wrap: wrap;
+    flex-shrink: 0;
   }
   .tb-group {
     display: flex;
@@ -2483,6 +2831,7 @@
     border-bottom: 1px solid #d7dce7;
     background: #f7f8fb;
     flex-wrap: wrap;
+    flex-shrink: 0;
   }
   .shape-picker-wrap {
     position: relative;
@@ -2642,6 +2991,7 @@
     display: flex;
     flex: 1;
     overflow: hidden;
+    min-height: 0;
   }
   .sidebar {
     width: 196px;
@@ -2649,7 +2999,16 @@
     border-right: 1px solid #d7dce7;
     background: #f5f7fb;
     padding: 0.65rem;
+    flex-shrink: 0;
   }
+  .slide-navigation-heading { display: flex; align-items: center; justify-content: space-between; margin: .1rem .1rem .55rem; font-size: .76rem; color: #344966; }
+  .slide-navigation-heading span { font-variant-numeric: tabular-nums; font-size: .68rem; color: #76859a; }
+  .slide-actions { display: flex; flex-wrap: wrap; gap: .25rem; margin-bottom: .75rem; }
+  .slide-actions button { flex: 1; min-width: 44px; padding: .4rem .15rem; border: 1px solid #d3ddeb; border-radius: 4px; color: #385170; background: #fff; font-size: .65rem; cursor: pointer; white-space: nowrap; }
+  .slide-actions button:hover:not(:disabled) { background: #e7effb; border-color: #7da4d5; }
+  .slide-actions button:disabled { opacity: .4; cursor: default; }
+  .slide-actions .delete-slide { color: #974250; }
+  .slide-number { display: block; margin: .25rem .1rem; color: #72829a; font-size: .64rem; font-variant-numeric: tabular-nums; }
   .add-slide-btn {
     display: block;
     width: 100%;
@@ -2674,6 +3033,7 @@
     justify-content: center;
     background: linear-gradient(135deg, #e9edf5, #dce3ef);
     overflow: auto;
+    min-width: 0;
   }
   .canvas-area.text-box-mode,
   .canvas-area.shape-mode {
@@ -2689,6 +3049,23 @@
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    flex-shrink: 0;
+  }
+  .right-panel.inspector-hidden { display: none; }
+  @media (max-width: 1100px) {
+    .sidebar { width: 144px; padding: .5rem; }
+    .right-panel { width: 220px; }
+    .document-header { padding: .65rem .75rem; gap: .7rem; }
+    .slide-start { padding: 1.2rem; }
+  }
+  @media (max-width: 800px) {
+    .sidebar { width: 116px; }
+    .right-panel { width: 196px; }
+    .document-actions button { padding: .45rem .55rem; }
+    .document-heading strong { font-size: .8rem; }
+    .app-mark { padding-right: .7rem; }
+    .status-bar .offline-status { display: none; }
+    .slide-start { max-width: calc(100% - 3rem); padding: .8rem; }
   }
   .tab-bar {
     display: grid;
