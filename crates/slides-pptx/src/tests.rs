@@ -5,9 +5,9 @@ use std::io::{Read, Write};
 
 use slides_core::{
     AddShape, Animation, BuildEffect, BuildStep, Color, DashStyle, Deck, DeleteShape, EditText,
-    Fill, GeometricShape, Geometry, InsertImage, ListStyle, Master, MediaEntry, MediaStore,
-    MoveShape, Outline, Paragraph, PassthroughObject, Rect, Run, SetShapeStyle, Shape, Slide,
-    Style, TextBox, Theme, Transform, Transition, TransitionKind,
+    Fill, GeometricShape, Geometry, InsertImage, InsertSlide, ListStyle, Master, MediaEntry,
+    MediaStore, MoveShape, Outline, Paragraph, PassthroughObject, Rect, Run, SetShapeStyle, Shape,
+    Slide, Style, TextBox, Theme, Transform, Transition, TransitionKind,
 };
 use zip::write::{FileOptions, ZipWriter};
 
@@ -50,6 +50,16 @@ fn build_minimal_pptx() -> Vec<u8> {
         writer.start_file("ppt/slides/slide1.xml", options).unwrap();
         writer.write_all(slide1_xml().as_bytes()).unwrap();
 
+        writer
+            .start_file("ppt/slides/_rels/slide1.xml.rels", options)
+            .unwrap();
+        writer.write_all(base_slide1_rels_xml().as_bytes()).unwrap();
+
+        writer
+            .start_file("ppt/slideLayouts/slideLayout1.xml", options)
+            .unwrap();
+        writer.write_all(slide_layout_xml().as_bytes()).unwrap();
+
         writer.start_file("ppt/theme/theme1.xml", options).unwrap();
         writer.write_all(theme_xml().as_bytes()).unwrap();
 
@@ -69,6 +79,7 @@ fn content_types_xml() -> String {
   <Default Extension="xml" ContentType="application/xml"/>
   <Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>
   <Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>
+  <Override PartName="/ppt/slideLayouts/slideLayout1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml"/>
   <Override PartName="/ppt/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>
   <Override PartName="/customXml/item1.xml" ContentType="{CT_MANIFEST}"/>
 </Types>"#
@@ -157,6 +168,23 @@ fn slide1_xml() -> String {
     </p:spTree>
   </p:cSld>
 </p:sld>"#
+    )
+}
+
+fn base_slide1_rels_xml() -> String {
+    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>
+</Relationships>"#
+        .to_string()
+}
+
+fn slide_layout_xml() -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sldLayout xmlns:p="{P_NS}" xmlns:a="{A_NS}" xmlns:r="{R_NS}" type="blank" preserve="1">
+  <p:cSld name="Blank"><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/></p:spTree></p:cSld>
+</p:sldLayout>"#
     )
 }
 
@@ -534,7 +562,9 @@ fn save_clears_dirty_and_updates_original_bytes() {
     assert!(!session.dirty_slides().is_empty());
 
     let first_save = save(&session).expect("first save should succeed");
-    session.commit_save(first_save.clone());
+    session
+        .commit_save(first_save.clone())
+        .expect("commit should refresh metadata");
     assert!(session.dirty_slides().is_empty());
 
     session
@@ -558,6 +588,332 @@ fn save_clears_dirty_and_updates_original_bytes() {
         !second_slide.contains("First edit"),
         "first edit should be replaced by the second edit"
     );
+}
+
+#[test]
+fn inserted_slide_saves_reopens_in_order_and_remains_editable() {
+    let original = build_minimal_pptx();
+    let mut session = load(&original).expect("load should succeed");
+    let inserted_id = "inserted-slide".to_string();
+
+    session
+        .execute(Box::new(InsertSlide::new(
+            1,
+            Slide {
+                id: inserted_id.clone(),
+                ..Default::default()
+            },
+        )))
+        .expect("slide insertion should apply");
+    assert_eq!(session.deck().slides.len(), 2);
+    assert!(session.undo(), "slide insertion should be undoable");
+    assert_eq!(session.deck().slides.len(), 1);
+    assert!(session.redo(), "slide insertion should be redoable");
+
+    session
+        .execute(Box::new(AddShape::new(
+            inserted_id.clone(),
+            Shape::TextBox(TextBox {
+                id: "inserted-text".to_string(),
+                frame: Rect::new(914_400.0, 457_200.0, 3_657_600.0, 762_000.0),
+                paragraphs: vec![Paragraph {
+                    runs: vec![Run::new("Created on the inserted slide").bold()],
+                    ..Default::default()
+                }],
+            }),
+        )))
+        .expect("text on inserted slide should apply");
+
+    let saved = save(&session).expect("save should emit inserted slide");
+    let entries = zip_entries(&saved);
+    assert!(entries.contains("ppt/slides/slide2.xml"));
+    let content_types = String::from_utf8(entry_bytes(&saved, "[Content_Types].xml")).unwrap();
+    assert!(content_types.contains("/ppt/slides/slide2.xml"));
+    let presentation = String::from_utf8(entry_bytes(&saved, "ppt/presentation.xml")).unwrap();
+    assert_eq!(presentation.matches("<p:sldId ").count(), 2);
+    let presentation_rels =
+        String::from_utf8(entry_bytes(&saved, "ppt/_rels/presentation.xml.rels")).unwrap();
+    assert!(presentation_rels.contains("Target=\"slides/slide2.xml\""));
+    let new_slide_rels =
+        String::from_utf8(entry_bytes(&saved, "ppt/slides/_rels/slide2.xml.rels")).unwrap();
+    assert!(new_slide_rels.contains("relationships/slideLayout"));
+    assert!(new_slide_rels.contains("Target=\"../slideLayouts/slideLayout1.xml\""));
+
+    let reopened = load(&saved).expect("saved deck should reopen");
+    assert_eq!(reopened.deck().slides.len(), 2);
+    assert_eq!(reopened.deck().slides[0].id, "ppt/slides/slide1.xml");
+    assert_eq!(reopened.deck().slides[1].id, "ppt/slides/slide2.xml");
+    let Shape::TextBox(text_box) = &reopened.deck().slides[1].shapes[0] else {
+        panic!("inserted slide text box should reopen as editable text");
+    };
+    assert_eq!(
+        text_box.paragraphs[0].runs[0].text,
+        "Created on the inserted slide"
+    );
+    assert!(text_box.paragraphs[0].runs[0].bold);
+
+    // Saving a recovery snapshot does not commit the session. A normal save
+    // does; prove that the resulting new path is retained for later edits.
+    session
+        .commit_save(saved)
+        .expect("commit should refresh inserted slide metadata");
+    session
+        .execute(Box::new(AddShape::new(
+            inserted_id,
+            Shape::TextBox(TextBox {
+                id: "second-inserted-text".to_string(),
+                frame: Rect::new(914_400.0, 1_371_600.0, 3_657_600.0, 762_000.0),
+                paragraphs: vec![Paragraph {
+                    runs: vec![Run::new("Persists after commit")],
+                    ..Default::default()
+                }],
+            }),
+        )))
+        .expect("post-save edit should apply");
+    let saved_again = save(&session).expect("post-save edit should persist");
+    let reopened_again = load(&saved_again).expect("second save should reopen");
+    assert_eq!(reopened_again.deck().slides[1].shapes.len(), 2);
+    let Shape::TextBox(text_box) = &reopened_again.deck().slides[1].shapes[1] else {
+        panic!("post-save text box should reopen as editable text");
+    };
+    assert_eq!(text_box.paragraphs[0].runs[0].text, "Persists after commit");
+}
+
+#[test]
+fn undoing_a_persisted_slide_insertion_removes_package_structure() {
+    let original = build_minimal_pptx();
+    let mut session = load(&original).expect("load should succeed");
+    session
+        .execute(Box::new(InsertSlide::new(
+            1,
+            Slide {
+                id: "temporary-slide".to_string(),
+                ..Default::default()
+            },
+        )))
+        .expect("insert should apply");
+    let inserted = save(&session).expect("inserted slide should save");
+    session
+        .commit_save(inserted)
+        .expect("commit should refresh the inserted slide path");
+
+    assert!(session.undo(), "persisted insertion should undo");
+    let removed = save(&session).expect("undo should remove package structure");
+    assert_eq!(
+        load(&removed)
+            .expect("undo save should reopen")
+            .deck()
+            .slides
+            .len(),
+        1
+    );
+    let entries = zip_entries(&removed);
+    assert!(!entries.contains("ppt/slides/slide2.xml"));
+    assert!(!entries.contains("ppt/slides/_rels/slide2.xml.rels"));
+    let content_types = String::from_utf8(entry_bytes(&removed, "[Content_Types].xml")).unwrap();
+    assert!(!content_types.contains("/ppt/slides/slide2.xml"));
+    let presentation = String::from_utf8(entry_bytes(&removed, "ppt/presentation.xml")).unwrap();
+    assert_eq!(presentation.matches("<p:sldId ").count(), 1);
+    let rels = String::from_utf8(entry_bytes(&removed, "ppt/_rels/presentation.xml.rels")).unwrap();
+    assert!(!rels.contains("slides/slide2.xml"));
+
+    session
+        .commit_save(removed)
+        .expect("commit after undo should refresh the remaining structure");
+    assert!(session.redo(), "persisted insertion should redo");
+    let redone = save(&session).expect("redo should save a replacement slide part");
+    assert_eq!(
+        load(&redone)
+            .expect("redo save should reopen")
+            .deck()
+            .slides
+            .len(),
+        2
+    );
+    assert!(zip_entries(&redone).contains("ppt/slides/slide2.xml"));
+}
+
+#[test]
+fn numeric_package_shape_ids_preserve_model_identity_and_animation_targets() {
+    let slide_xml = slide1_xml().replace("</p:spTree>", r#"<p:grpSp><p:nvGrpSpPr><p:cNvPr id="100000" name="Opaque group"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/><p:sp><p:nvSpPr><p:cNvPr id="4" name="Nested reserved ID"/></p:nvSpPr><p:spPr/></p:sp></p:grpSp></p:spTree>"#);
+    let mut session = load(&build_pptx(&slide_xml, Some(&base_slide1_rels_xml()), &[])).unwrap();
+    let slide_id = session.deck().slides[0].id.clone();
+    let start = session.deck().slides[0].shapes.len();
+    let text_id = "ab102030405060708090aabbccddeeff0";
+    let table_id = "table-model-uuid";
+    let chart_id = "chart-model-uuid";
+    let mut table = slides_core::TableShape::default_grid(1, 1, Rect::new(0.0, 0.0, 300.0, 200.0));
+    table.id = table_id.into();
+    let mut chart = slides_core::ChartShape::new(
+        Transform::default(),
+        slides_core::ChartType::Column,
+        slides_core::ChartData::Category {
+            categories: vec!["A".into()],
+            series: vec![slides_core::CategorySeries {
+                name: "Series".into(),
+                values: vec![1.0],
+            }],
+        },
+        Some("Chart".into()),
+    )
+    .unwrap();
+    chart.id = chart_id.into();
+    let shapes = [
+        Shape::TextBox(TextBox {
+            id: text_id.into(),
+            frame: Rect::new(0.0, 0.0, 300.0, 100.0),
+            paragraphs: vec![Paragraph {
+                runs: vec![Run::new("New text")],
+                ..Default::default()
+            }],
+        }),
+        Shape::Geometric(GeometricShape {
+            id: "4".into(),
+            transform: Transform::default(),
+            geometry: Geometry::Rectangle,
+            style: Style::default(),
+        }),
+        Shape::Table(table),
+        Shape::Chart(chart),
+    ];
+    for shape in shapes {
+        session
+            .execute(Box::new(AddShape::new(slide_id.clone(), shape)))
+            .unwrap();
+    }
+    session.deck_mut().slides[0].animation = Some(Animation::new(
+        (start..start + 4)
+            .map(|index| BuildStep::new(index, BuildEffect::Fade, 300))
+            .collect(),
+    ));
+    session
+        .deck_mut()
+        .comments
+        .push(slides_core::CommentThread {
+            id: "comment".into(),
+            anchor: slides_core::CommentAnchor::Shape {
+                slide_id: slide_id.clone(),
+                shape_id: text_id.into(),
+            },
+            comments: vec![],
+            assigned_to: None,
+            resolved: false,
+        });
+    let saved = save(&session).unwrap();
+    let check_ids = |bytes: &[u8]| {
+        let xml = String::from_utf8(entry_bytes(bytes, "ppt/slides/slide1.xml")).unwrap();
+        let mut reader = quick_xml::Reader::from_str(&xml);
+        let mut buf = Vec::new();
+        let mut ids = Vec::new();
+        let mut targets = Vec::new();
+        loop {
+            match reader.read_event_into(&mut buf).unwrap() {
+                quick_xml::events::Event::Start(e) | quick_xml::events::Event::Empty(e) => {
+                    let local = crate::load::qname_str(e.name());
+                    if local == "cNvPr" {
+                        ids.push(
+                            crate::load::attr_by_local_name(&e, "id")
+                                .unwrap()
+                                .parse::<u32>()
+                                .unwrap(),
+                        );
+                    }
+                    if local == "spTgt" {
+                        targets.push(
+                            crate::load::attr_by_local_name(&e, "spid")
+                                .unwrap()
+                                .parse::<u32>()
+                                .unwrap(),
+                        );
+                    }
+                }
+                quick_xml::events::Event::Eof => break,
+                _ => {}
+            }
+            buf.clear();
+        }
+        let unique: HashSet<_> = ids.iter().copied().collect();
+        assert_eq!(ids.len(), unique.len());
+        for id in [0, 2, 3, 4, 100000] {
+            assert!(unique.contains(&id));
+        }
+        assert_eq!(targets.len(), 4);
+        assert!(targets.iter().all(|id| unique.contains(id)));
+        ids
+    };
+    let original_ids = check_ids(&saved);
+    let reloaded = load(&saved).unwrap();
+    assert_eq!(reloaded.deck().slides[0].shapes[start].id(), text_id);
+    assert_eq!(reloaded.deck().slides[0].shapes[start + 1].id(), "4");
+    assert_eq!(reloaded.deck().slides[0].shapes[start + 2].id(), table_id);
+    assert_eq!(reloaded.deck().slides[0].shapes[start + 3].id(), chart_id);
+    assert_eq!(
+        reloaded.deck().slides[0]
+            .animation
+            .as_ref()
+            .unwrap()
+            .steps
+            .iter()
+            .map(|step| step.shape_index)
+            .collect::<Vec<_>>(),
+        (start..start + 4).collect::<Vec<_>>()
+    );
+    assert_eq!(reloaded.deck().comments, session.deck().comments);
+    session.commit_save(saved).unwrap();
+    session
+        .execute(Box::new(EditText::new(
+            slide_id,
+            start,
+            0,
+            vec![Run::new("Edited again")],
+        )))
+        .unwrap();
+    let second = save(&session).unwrap();
+    assert_eq!(check_ids(&second), original_ids);
+    assert_eq!(
+        load(&second).unwrap().deck().slides[0].shapes[start].id(),
+        text_id
+    );
+}
+
+#[test]
+fn new_slide_reserves_nested_passthrough_ids_before_allocating() {
+    let mut session = load(&crate::create_blank_pptx()).unwrap();
+    let raw = br#"<p:grpSp><p:nvGrpSpPr><p:cNvPr id="2" name="Group"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/><p:sp><p:nvSpPr><p:cNvPr id="3" name="Child"/></p:nvSpPr><p:spPr/></p:sp></p:grpSp>"#;
+    session
+        .execute(Box::new(InsertSlide::new(
+            1,
+            Slide {
+                id: "new-slide".into(),
+                shapes: vec![
+                    Shape::TextBox(TextBox {
+                        id: "new-text-uuid".into(),
+                        frame: Rect::new(0.0, 0.0, 100.0, 100.0),
+                        paragraphs: vec![Paragraph {
+                            runs: vec![Run::new("New")],
+                            ..Default::default()
+                        }],
+                    }),
+                    Shape::Passthrough(PassthroughObject {
+                        id: "opaque-model-id".into(),
+                        label: "grpSp".into(),
+                        source_part: "new-slide".into(),
+                        raw_bytes: raw.to_vec(),
+                        frame: None,
+                    }),
+                ],
+                ..Default::default()
+            },
+        )))
+        .unwrap();
+    let saved = save(&session).unwrap();
+    let xml = String::from_utf8(entry_bytes(&saved, "ppt/slides/slide2.xml")).unwrap();
+    assert!(xml.contains(r#"id="4" name="TextBox 1""#));
+    assert_eq!(xml.matches(r#"id="2""#).count(), 1);
+    assert_eq!(xml.matches(r#"id="3""#).count(), 1);
+    let reloaded = load(&saved).unwrap();
+    assert_eq!(reloaded.deck().slides[1].shapes[0].id(), "new-text-uuid");
+    assert_eq!(reloaded.deck().slides[1].shapes[1].id(), "opaque-model-id");
 }
 
 #[test]
@@ -1267,6 +1623,51 @@ fn insert_geometric_then_save_round_trips() {
         .expect("inserted geometric should reload");
     assert_eq!(g.geometry, Geometry::Ellipse);
     assert_eq!(g.transform.frame.width, 914_400.0);
+}
+
+#[test]
+fn inserted_rotated_line_saves_and_reopens_with_its_direction() {
+    let blank = crate::create_blank_pptx();
+    let mut session = load(&blank).expect("load blank");
+    let slide_id = "ppt/slides/slide1.xml".to_string();
+    let line = GeometricShape {
+        id: String::new(),
+        transform: Transform {
+            frame: Rect::new(300_000.0, 400_000.0, 1_200_000.0, 76_200.0),
+            rotation: 37.5,
+        },
+        geometry: Geometry::Line,
+        style: Style {
+            fill: None,
+            outline: Some(Outline {
+                color: Color::black(),
+                width_emu: 9_525.0,
+                dash: DashStyle::Solid,
+            }),
+            shadow: None,
+        },
+    };
+    session
+        .execute(Box::new(AddShape::new(slide_id, Shape::Geometric(line))))
+        .expect("add rotated line");
+
+    let saved = save(&session).expect("save");
+    let slide_xml = String::from_utf8(entry_bytes(&saved, "ppt/slides/slide1.xml")).unwrap();
+    assert!(slide_xml.contains("prst=\"line\""));
+    assert!(slide_xml.contains("rot=\"2250000\""));
+
+    let reopened = load(&saved).expect("reload");
+    let line = reopened.deck().slides[0]
+        .shapes
+        .iter()
+        .find_map(|shape| match shape {
+            Shape::Geometric(geometric) if geometric.geometry == Geometry::Line => Some(geometric),
+            _ => None,
+        })
+        .expect("rotated line should reopen");
+    assert!((line.transform.rotation - 37.5).abs() < f64::EPSILON);
+    assert_eq!(line.transform.frame.width, 1_200_000.0);
+    assert_eq!(line.transform.frame.height, 76_200.0);
 }
 
 #[test]

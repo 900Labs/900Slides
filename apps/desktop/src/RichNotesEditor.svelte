@@ -1,5 +1,8 @@
 <script lang="ts">
   import type { ParagraphDto, ParagraphStyleDto, RunDto } from './lib/types'
+  import { onDestroy } from 'svelte'
+  import { createDraftQueue } from './lib/draftQueue.js'
+  import { sameRunFormatting } from './lib/preserveTextRuns.js'
 
   /** Paragraph list style kind. */
   type ListStyle = 'none' | 'ordered' | 'unordered'
@@ -16,10 +19,12 @@
     /** Current rich notes (always defined when this editor is shown). */
     richNotes: ParagraphDto[]
     /** Commits the (possibly null) rich notes to the backend. */
-    onSetRichNotes: (paragraphs: ParagraphDto[] | null) => void
+    onSetRichNotes: (paragraphs: ParagraphDto[] | null, sourceSlideId: string) => void | Promise<void>
+    /** Reports drafts not yet committed to the document. */
+    onDraftChange?: (dirty: boolean) => void
   }
 
-  let { slideId, richNotes, onSetRichNotes }: Props = $props()
+  let { slideId, richNotes, onSetRichNotes, onDraftChange }: Props = $props()
 
   /** Default plain run formatting. */
   function defaultRun(text = ''): RunDto {
@@ -143,7 +148,8 @@
         last &&
         last.kind === 'run' &&
         runsEqual(last.run, token.run) &&
-        last.listStyle === token.listStyle
+        last.listStyle === token.listStyle &&
+        JSON.stringify(last.style) === JSON.stringify(token.style)
       ) {
         last.run = { ...last.run, text: last.run.text + token.run.text }
       } else {
@@ -155,24 +161,19 @@
 
   /** Whether two runs have identical formatting (text ignored). */
   function runsEqual(a: RunDto, b: RunDto): boolean {
-    return (
-      a.bold === b.bold &&
-      a.italic === b.italic &&
-      a.underline === b.underline &&
-      a.strikethrough === b.strikethrough &&
-      a.verticalAlign === b.verticalAlign &&
-      a.code === b.code &&
-      a.fontFamily === b.fontFamily
-    )
+    return sameRunFormatting(a, b)
   }
 
-  /** The last run token before a position, used to inherit formatting on insert. */
-  function inheritRun(left: Token[]): RunDto {
+  /** Inherit the adjacent run and paragraph style, including at offset zero. */
+  function inheritFormatting(left: Token[], right: Token[]): Extract<Token, { kind: 'run' }> {
     for (let i = left.length - 1; i >= 0; i -= 1) {
       const token = left[i]
-      if (token.kind === 'run') return { ...token.run }
+      if (token.kind === 'run') return token
     }
-    return defaultRun()
+    for (const token of right) {
+      if (token.kind === 'run') return token
+    }
+    return { kind: 'run', run: defaultRun(), style: defaultStyle, listStyle: 'none' }
   }
 
   /** Editable token model (source of truth for run styling). */
@@ -183,21 +184,41 @@
   let prevText = ''
   /** The textarea element, for selection access. */
   let textareaEl = $state<HTMLTextAreaElement | null>(null)
-  /** Whether unsaved changes are pending a commit. */
-  let dirty = $state(false)
+  let modelSlideId = ''
+  const drafts = createDraftQueue<{ slideId: string; paragraphs: ParagraphDto[] }>({
+    commit: async (draft) => { await onSetRichNotes(draft.paragraphs, draft.slideId) },
+    onChange: (dirty) => onDraftChange?.(dirty),
+  })
+  onDestroy(() => drafts.dispose())
 
-  /** Resyncs the editor from the backend whenever the slide or its notes change. */
+  /** Await before document commands and slide navigation. Failures retain drafts. */
+  export async function flushEdits(): Promise<void> {
+    await drafts.flush()
+  }
+
+  function queueNotes(): void {
+    const paragraphs = tokensToParagraphs(tokens)
+    const original = drafts.peek(slideId)?.paragraphs ?? richNotes
+    if (!richNotesEqual(paragraphs, original)) drafts.set(slideId, { slideId, paragraphs })
+  }
+
+  /** Snapshot acknowledgements must never overwrite a newer local draft or
+   *  reset the active textarea selection. Undo and external edits still sync. */
   $effect.pre(() => {
-    void slideId
-    const next = paragraphsToTokens(richNotes)
+    const incoming = richNotes
+    const sourceSlideId = slideId
+    if (sourceSlideId === modelSlideId && drafts.peek(sourceSlideId)) return
+    const next = paragraphsToTokens(incoming)
+    modelSlideId = sourceSlideId
     tokens = next
     text = joinTokens(next)
     prevText = text
-    dirty = false
   })
 
   /** Patches the token model for a typed change via a minimal prefix/suffix diff. */
-  function handleInput(): void {
+  function handleInput(event: Event): void {
+    // Read the DOM value: custom input listeners can run before bind:value.
+    text = (event.currentTarget as HTMLTextAreaElement).value
     const a = prevText
     const b = text
     const minLen = Math.min(a.length, b.length)
@@ -222,16 +243,16 @@
     const { left: mid, right } = splitAtOffset(midRight, delEnd - delStart)
     void mid
 
-    const formatting = inheritRun(left)
+    const formatting = inheritFormatting(left, midRight)
     const insertedTokens: Token[] = []
     if (inserted !== '') {
       const parts = inserted.split('\n')
       parts.forEach((part, index) => {
         insertedTokens.push({
           kind: 'run',
-          run: { ...formatting, text: part },
-          style: { ...defaultStyle },
-          listStyle: 'none',
+          run: { ...formatting.run, text: part },
+          style: { ...formatting.style },
+          listStyle: formatting.listStyle,
         })
         if (index < parts.length - 1) {
           insertedTokens.push({ kind: 'break' })
@@ -241,7 +262,7 @@
 
     tokens = mergeAdjacentRuns([...left, ...insertedTokens, ...right])
     prevText = b
-    dirty = true
+    queueNotes()
   }
 
   /** Toggles a boolean run flag across the current textarea selection. */
@@ -260,22 +281,16 @@
     tokens = mergeAdjacentRuns([...left, ...styledMid, ...right])
     text = joinTokens(tokens)
     prevText = text
-    dirty = true
+    queueNotes()
     queueMicrotask(() => {
       textareaEl?.focus()
       textareaEl?.setSelectionRange(selStart, selEnd)
     })
   }
 
-  /** Commits the current rich notes to the backend. */
+  /** Blur starts an immediate commit; explicit document actions await it. */
   function commit(): void {
-    if (!dirty) return
-    const paragraphs = tokensToParagraphs(tokens)
-    const changed = !richNotesEqual(paragraphs, richNotes)
-    if (changed) {
-      onSetRichNotes(paragraphs)
-    }
-    dirty = false
+    void flushEdits().catch(() => {})
   }
 
   /** Shallow structural equality check for two rich-notes paragraph lists. */
@@ -295,10 +310,10 @@
 
 <div class="rich-notes">
   <div class="toolbar" role="toolbar" aria-label="Rich notes formatting">
-    <button type="button" title="Bold" onclick={() => toggleFlag('bold')}><strong>B</strong></button>
-    <button type="button" title="Italic" onclick={() => toggleFlag('italic')}><em>I</em></button>
-    <button type="button" title="Underline" onclick={() => toggleFlag('underline')}><u>U</u></button>
-    <button type="button" title="Strikethrough" onclick={() => toggleFlag('strikethrough')}>
+    <button type="button" onpointerdown={(event) => event.preventDefault()} title="Bold" onclick={() => toggleFlag('bold')}><strong>B</strong></button>
+    <button type="button" onpointerdown={(event) => event.preventDefault()} title="Italic" onclick={() => toggleFlag('italic')}><em>I</em></button>
+    <button type="button" onpointerdown={(event) => event.preventDefault()} title="Underline" onclick={() => toggleFlag('underline')}><u>U</u></button>
+    <button type="button" onpointerdown={(event) => event.preventDefault()} title="Strikethrough" onclick={() => toggleFlag('strikethrough')}>
       <s>S</s>
     </button>
   </div>

@@ -1,4 +1,4 @@
-# Wave 18 — v0.4.0 accessibility checker + WCAG 2.2 AA
+# Wave 18 — v0.4.0 document accessibility checker
 
 Status: Proposed
 Owner: 900 Labs
@@ -9,7 +9,7 @@ score per deck.")
 Last updated: 2026-07-29
 
 Wave 18 adds an **accessibility checker** that audits a deck for common a11y
-issues and reports a **WCAG 2.2 AA conformance score**. The checker runs
+issues and reports a **heuristic document check score**. The checker runs
 offline against the deck model — no network, no browser engine.
 
 ## What this wave delivers
@@ -82,7 +82,7 @@ pub enum IssueCategory {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AccessibilityReport {
     pub issues: Vec<AccessibilityIssue>,
-    /// WCAG 2.2 AA conformance score (0-100). 100 = no errors or warnings.
+    /// heuristic document check score (0-100). 100 = no errors or warnings.
     pub score: u32,
     pub total_slides: usize,
     pub slides_with_issues: usize,
@@ -117,7 +117,7 @@ pub fn check_accessibility(deck: &Deck) -> AccessibilityReport;
 
 6. **Empty slide**: a slide with no shapes → Warning.
 
-### WCAG 2.2 AA score
+### document check score
 
 Score = 100 minus penalties:
 - Each Error: -10 points (minimum score 0).
@@ -129,7 +129,7 @@ Score = 100 minus penalties:
 
 - An **Accessibility panel** accessible from the toolbar (or a menu item).
   Shows:
-  - The WCAG 2.2 AA score as a number + colored badge (green ≥90, yellow
+  - The document check score as a number + colored badge (green ≥90, yellow
     ≥70, red <70).
   - A list of issues, grouped by category, each showing severity icon,
     slide number, message, and fix hint.
@@ -148,7 +148,7 @@ Score = 100 minus penalties:
 1. An image without alt text is flagged as an Error.
 2. Low-contrast text (e.g. light gray on white) is flagged as a Warning.
 3. A slide without a title is flagged.
-4. The WCAG score is a number 0-100 that decreases with issues.
+4. The document check score is a number 0-100 that decreases with issues.
 5. The desktop panel shows issues with click-to-navigate.
 6. Old decks (no alt_text field) deserialize unchanged.
 7. Quality gate green. Privacy gate passes. No telemetry.

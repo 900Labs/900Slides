@@ -10,6 +10,8 @@ description = "PPTX load and save (native format)"
 slides-core = { path = "../slides-core" }
 slides-media = { path = "../slides-media" }
 zip = { workspace = true }
+# zip 2 delegates selection of the pure-Rust DEFLATE backend to consumers.
+flate2 = { workspace = true }
 quick-xml = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

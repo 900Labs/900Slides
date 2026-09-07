@@ -3,7 +3,10 @@
 use std::collections::HashSet;
 use std::io::Write;
 
-use slides_core::{ChartData, ChartShape, ChartType, Rect, SetChartData, Shape, Transform};
+use slides_core::{
+    AddChart, ChartData, ChartShape, ChartType, DeleteShape, MoveShape, Rect, SetChartData,
+    SetChartTitle, SetChartType, Shape, Transform,
+};
 use zip::write::{FileOptions, ZipWriter};
 
 use crate::{load, save};
@@ -313,6 +316,463 @@ fn entry_bytes(bytes: &[u8], name: &str) -> Vec<u8> {
     out
 }
 
+fn build_two_chart_pptx() -> Vec<u8> {
+    let first = build_chart_pptx(&sample_bar_chart_xml());
+    let mut parts: Vec<(String, Vec<u8>)> = zip_entries(&first)
+        .into_iter()
+        .map(|name| {
+            let bytes = entry_bytes(&first, &name);
+            (name, bytes)
+        })
+        .collect();
+    for (name, bytes) in &mut parts {
+        let xml = String::from_utf8(bytes.clone()).unwrap();
+        let xml = match name.as_str() {
+            "ppt/slides/slide1.xml" => {
+                let start = xml.find("<p:graphicFrame>").unwrap();
+                let end = xml.find("</p:graphicFrame>").unwrap() + "</p:graphicFrame>".len();
+                let second_frame = xml[start..end]
+                    .replace("id=\"7\"", "id=\"8\"")
+                    .replace("Chart 1", "Chart 2")
+                    .replace("rIdChart1", "rIdChart2");
+                xml.replace("</p:spTree>", &format!("{second_frame}</p:spTree>"))
+            }
+            "ppt/slides/_rels/slide1.xml.rels" => xml.replace(
+                "</Relationships>",
+                &format!(
+                    r#"<Relationship Id="rIdChart2" Type="{REL_TYPE_CHART}" Target="../charts/chart2.xml"/></Relationships>"#
+                ),
+            ),
+            "[Content_Types].xml" => xml.replace(
+                "</Types>",
+                &format!(
+                    r#"<Override PartName="/ppt/charts/chart2.xml" ContentType="{CT_CHART}"/></Types>"#
+                ),
+            ),
+            _ => xml,
+        };
+        *bytes = xml.into_bytes();
+    }
+    let second_chart = sample_bar_chart_xml()
+        .replace("Quarterly Sales", "Regional Revenue")
+        .replace("</c:chartSpace>", r#"<c:extLst><c:ext uri="preserved-second-chart"><custom:marker xmlns:custom="urn:chart-test">opaque second chart metadata</custom:marker></c:ext></c:extLst></c:chartSpace>"#);
+    parts.push((
+        "ppt/charts/chart2.xml".to_string(),
+        second_chart.into_bytes(),
+    ));
+    let mut writer = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for (name, bytes) in parts {
+        writer
+            .start_file(name, FileOptions::<()>::default())
+            .unwrap();
+        writer.write_all(&bytes).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+fn slide_organization_session() -> crate::Session {
+    let original = build_two_chart_pptx();
+    let mut writer = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for name in zip_entries(&original) {
+        let bytes = entry_bytes(&original, &name);
+        let xml = String::from_utf8(bytes).unwrap();
+        let xml = match name.as_str() {
+            "ppt/slides/slide1.xml" => xml.replace("</p:cSld>", r#"<p:extLst><p:ext uri="opaque-slide-payload"><custom:data xmlns:custom="urn:900slides:test">Keep this source payload</custom:data></p:ext></p:extLst></p:cSld>"#),
+            "ppt/slides/_rels/slide1.xml.rels" => xml.replace("</Relationships>", r#"<Relationship Id="rIdNotes" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide1.xml"/><Relationship Id="rIdLayout" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/></Relationships>"#),
+            "[Content_Types].xml" => xml.replace("</Types>", r#"<Override PartName="/ppt/notesSlides/notesSlide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.notesSlide+xml"/><Override PartName="/ppt/slideLayouts/slideLayout1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml"/></Types>"#),
+            _ => xml,
+        };
+        writer
+            .start_file(name, FileOptions::<()>::default())
+            .unwrap();
+        writer.write_all(xml.as_bytes()).unwrap();
+    }
+    writer
+        .start_file(
+            "ppt/notesSlides/notesSlide1.xml",
+            FileOptions::<()>::default(),
+        )
+        .unwrap();
+    writer.write_all(format!(r#"<p:notes xmlns:p="{P_NS}" xmlns:a="{A_NS}"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Speaker notes must survive deletion undo.</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:notes>"#).as_bytes()).unwrap();
+    writer
+        .start_file(
+            "ppt/slideLayouts/slideLayout1.xml",
+            FileOptions::<()>::default(),
+        )
+        .unwrap();
+    writer
+        .write_all(
+            format!(r#"<p:sldLayout xmlns:p="{P_NS}"><p:cSld><p:spTree/></p:cSld></p:sldLayout>"#)
+                .as_bytes(),
+        )
+        .unwrap();
+    let bytes = writer.finish().unwrap().into_inner();
+    let mut session = load(&bytes).unwrap();
+    let first = session.deck().slides[0].id.clone();
+    session
+        .execute(Box::new(slides_core::InsertSlide::new(
+            1,
+            slides_core::Slide {
+                id: "second-slide".into(),
+                ..Default::default()
+            },
+        )))
+        .unwrap();
+    session.deck_mut().sections = vec![
+        slides_core::SlideSection {
+            name: "First ]]> section".into(),
+            start_slide_id: first.clone(),
+        },
+        slides_core::SlideSection {
+            name: "Second".into(),
+            start_slide_id: "second-slide".into(),
+        },
+    ];
+    for (id, slide_id) in [
+        ("first-comment", first),
+        ("second-comment", "second-slide".into()),
+    ] {
+        session
+            .deck_mut()
+            .comments
+            .push(slides_core::CommentThread {
+                id: id.into(),
+                anchor: slides_core::CommentAnchor::Slide { slide_id },
+                comments: vec![],
+                assigned_to: None,
+                resolved: false,
+            });
+    }
+    session
+}
+
+#[test]
+fn moving_slides_round_trips_order_and_preserves_slide_parts() {
+    let mut session = slide_organization_session();
+    let original = save(&session).unwrap();
+    session.commit_save(original.clone()).unwrap();
+    let first_id = session.deck().slides[0].id.clone();
+    session
+        .execute(Box::new(slides_core::MoveSlide::new(first_id, 1)))
+        .unwrap();
+    assert!(session.dirty_slides().is_empty());
+    let moved = save(&session).unwrap();
+    let reloaded = load(&moved).unwrap();
+    assert_eq!(reloaded.deck().slides[0].id, "ppt/slides/slide2.xml");
+    assert_eq!(reloaded.deck().slides[1].id, "ppt/slides/slide1.xml");
+    assert_eq!(reloaded.deck().sections[0].name, "Second");
+    for name in [
+        "ppt/slides/slide1.xml",
+        "ppt/slides/slide2.xml",
+        "ppt/charts/chart1.xml",
+        "ppt/charts/chart2.xml",
+        "ppt/notesSlides/notesSlide1.xml",
+    ] {
+        assert_eq!(
+            entry_bytes(&original, name),
+            entry_bytes(&moved, name),
+            "reordering changed {name}"
+        );
+    }
+    session.commit_save(moved).unwrap();
+    assert!(session.undo());
+    assert!(session.dirty_slides().is_empty());
+    let undone = load(&save(&session).unwrap()).unwrap();
+    assert_eq!(undone.deck().slides[0].id, "ppt/slides/slide1.xml");
+    assert_eq!(undone.deck().sections[0].name, "First ]]> section");
+    assert!(session.redo());
+    let redone = load(&save(&session).unwrap()).unwrap();
+    assert_eq!(redone.deck().slides[0].id, "ppt/slides/slide2.xml");
+}
+
+#[test]
+fn saved_slide_deletion_undo_restores_source_notes_charts_and_metadata() {
+    let mut session = slide_organization_session();
+    let original = save(&session).unwrap();
+    session.commit_save(original.clone()).unwrap();
+    let first_id = session.deck().slides[0].id.clone();
+    session
+        .execute(Box::new(slides_core::DeleteSlide::new(first_id)))
+        .unwrap();
+    assert_eq!(session.deck().comments.len(), 1);
+    assert_eq!(session.deck().sections.len(), 1);
+    let deleted = save(&session).unwrap();
+    assert!(!zip_entries(&deleted).contains("ppt/slides/slide1.xml"));
+    assert!(!zip_entries(&deleted).contains("ppt/slides/_rels/slide1.xml.rels"));
+    let reloaded = load(&deleted).unwrap();
+    assert_eq!(reloaded.deck().slides.len(), 1);
+    assert_eq!(
+        reloaded.deck().comments[0].anchor.slide_id(),
+        "ppt/slides/slide2.xml"
+    );
+    assert_eq!(
+        reloaded.deck().sections[0].start_slide_id,
+        "ppt/slides/slide2.xml"
+    );
+    session.commit_save(deleted).unwrap();
+    session.commit_save(save(&session).unwrap()).unwrap();
+    assert!(session.undo());
+    let restored = save(&session).unwrap();
+    let reloaded = load(&restored).unwrap();
+    assert_eq!(reloaded.deck().slides.len(), 2);
+    assert_eq!(reloaded.deck().slides[0].id, "ppt/slides/slide1.xml");
+    assert!(reloaded.deck().slides[0]
+        .notes
+        .contains("Speaker notes must survive"));
+    assert_eq!(
+        chart_at(&reloaded, 0).title.as_deref(),
+        Some("Quarterly Sales")
+    );
+    assert_eq!(
+        chart_at(&reloaded, 1).title.as_deref(),
+        Some("Regional Revenue")
+    );
+    assert_eq!(reloaded.deck().comments.len(), 2);
+    assert_eq!(reloaded.deck().sections.len(), 2);
+    assert!(
+        String::from_utf8(entry_bytes(&restored, "ppt/slides/slide1.xml"))
+            .unwrap()
+            .contains("Keep this source payload")
+    );
+    for name in [
+        "ppt/slides/_rels/slide1.xml.rels",
+        "ppt/charts/chart1.xml",
+        "ppt/charts/chart2.xml",
+        "ppt/notesSlides/notesSlide1.xml",
+    ] {
+        assert_eq!(
+            entry_bytes(&original, name),
+            entry_bytes(&restored, name),
+            "restoring changed {name}"
+        );
+    }
+    session.commit_save(restored).unwrap();
+    assert!(session.redo());
+    assert_eq!(
+        load(&save(&session).unwrap()).unwrap().deck().slides.len(),
+        1
+    );
+}
+
+fn chart_at(session: &crate::Session, index: usize) -> &ChartShape {
+    match &session.deck().slides[0].shapes[index] {
+        Shape::Chart(chart) => chart,
+        other => panic!("expected chart, got {other:?}"),
+    }
+}
+
+fn assert_saved_chart_content(session: &crate::Session, bytes: &[u8]) {
+    let reloaded = load(bytes).expect("reload saved chart");
+    let expected = chart_at(session, 0);
+    let actual = chart_at(&reloaded, 0);
+    assert_eq!(actual.chart_type, expected.chart_type);
+    assert_eq!(actual.data, expected.data);
+    assert_eq!(actual.title, expected.title);
+}
+
+#[test]
+fn chart_edits_round_trip_after_committed_undo_and_redo() {
+    let original = build_chart_pptx(&sample_bar_chart_xml());
+    let mut session = load(&original).unwrap();
+    let slide_id = session.deck().slides[0].id.clone();
+    let mut data = chart_at(&session, 0).data.clone();
+    if let ChartData::Category { series, .. } = &mut data {
+        series[0].values[0] = 123.0;
+    }
+    let commands: Vec<Box<dyn slides_core::Command>> = vec![
+        Box::new(SetChartData::new(slide_id.clone(), 0, data)),
+        Box::new(SetChartTitle::new(
+            slide_id.clone(),
+            0,
+            Some("Updated title".into()),
+        )),
+        Box::new(SetChartTitle::new(slide_id.clone(), 0, None)),
+        Box::new(SetChartTitle::new(
+            slide_id.clone(),
+            0,
+            Some("Sales & <Revenue>".into()),
+        )),
+        Box::new(SetChartType::new(slide_id.clone(), 0, ChartType::Column)),
+        Box::new(SetChartType::new(slide_id, 0, ChartType::Line)),
+    ];
+    let command_count = commands.len();
+    for command in commands {
+        session.execute(command).unwrap();
+        let bytes = save(&session).unwrap();
+        assert_saved_chart_content(&session, &bytes);
+        session.commit_save(bytes).unwrap();
+    }
+    for redo in [false, true] {
+        for _ in 0..command_count {
+            assert!(if redo { session.redo() } else { session.undo() });
+            let bytes = save(&session).unwrap();
+            assert_saved_chart_content(&session, &bytes);
+            for name in ["ppt/theme/theme1.xml", "ppt/slides/_rels/slide1.xml.rels"] {
+                assert_eq!(entry_bytes(&original, name), entry_bytes(&bytes, name));
+            }
+            session.commit_save(bytes).unwrap();
+        }
+    }
+}
+
+#[test]
+fn deleting_first_chart_preserves_surviving_chart_source_part() {
+    let original = build_two_chart_pptx();
+    let mut session = load(&original).unwrap();
+    let slide_id = session.deck().slides[0].id.clone();
+    session
+        .execute(Box::new(DeleteShape::new(slide_id.clone(), 0)))
+        .unwrap();
+    let bytes = save(&session).unwrap();
+    let reloaded = load(&bytes).unwrap();
+    assert_eq!(reloaded.deck().slides[0].shapes.len(), 1);
+    assert_eq!(
+        chart_at(&reloaded, 0).title.as_deref(),
+        Some("Regional Revenue")
+    );
+    assert_eq!(chart_at(&reloaded, 0).id, "8");
+    for name in ["ppt/charts/chart1.xml", "ppt/charts/chart2.xml"] {
+        assert_eq!(entry_bytes(&original, name), entry_bytes(&bytes, name));
+    }
+    session.commit_save(bytes).unwrap();
+    session
+        .execute(Box::new(SetChartTitle::new(
+            slide_id,
+            0,
+            Some("Updated survivor".into()),
+        )))
+        .unwrap();
+    let bytes = save(&session).unwrap();
+    assert_saved_chart_content(&session, &bytes);
+    assert_eq!(
+        entry_bytes(&original, "ppt/charts/chart1.xml"),
+        entry_bytes(&bytes, "ppt/charts/chart1.xml")
+    );
+    let chart_xml = String::from_utf8(entry_bytes(&bytes, "ppt/charts/chart2.xml")).unwrap();
+    assert!(chart_xml.contains("opaque second chart metadata"));
+}
+
+#[test]
+fn undo_chart_deletion_after_save_restores_original_parts_and_ids() {
+    let original = build_two_chart_pptx();
+    let mut session = load(&original).unwrap();
+    let slide_id = session.deck().slides[0].id.clone();
+    session
+        .execute(Box::new(DeleteShape::new(slide_id, 0)))
+        .unwrap();
+    session.commit_save(save(&session).unwrap()).unwrap();
+    assert!(session.undo());
+    let bytes = save(&session).unwrap();
+    let reloaded = load(&bytes).unwrap();
+    assert_eq!(reloaded.deck().slides[0].shapes.len(), 2);
+    assert_eq!(
+        chart_at(&reloaded, 0).title.as_deref(),
+        Some("Quarterly Sales")
+    );
+    assert_eq!(
+        chart_at(&reloaded, 1).title.as_deref(),
+        Some("Regional Revenue")
+    );
+    assert_eq!(chart_at(&reloaded, 0).id, "7");
+    assert_eq!(chart_at(&reloaded, 1).id, "8");
+    for name in ["ppt/charts/chart1.xml", "ppt/charts/chart2.xml"] {
+        assert_eq!(entry_bytes(&original, name), entry_bytes(&bytes, name));
+    }
+    session.commit_save(bytes).unwrap();
+    assert!(session.redo());
+    let bytes = save(&session).unwrap();
+    assert_eq!(load(&bytes).unwrap().deck().slides[0].shapes.len(), 1);
+    assert_saved_chart_content(&session, &bytes);
+}
+
+#[test]
+fn chart_move_and_undo_preserve_chart_xml_byte_for_byte() {
+    let original = build_chart_pptx(&sample_bar_chart_xml());
+    let mut session = load(&original).unwrap();
+    let slide_id = session.deck().slides[0].id.clone();
+    let mut transform = chart_at(&session, 0).transform;
+    transform.frame.x += 50_000.0;
+    session
+        .execute(Box::new(MoveShape::new(slide_id, 0, transform)))
+        .unwrap();
+    let moved = save(&session).unwrap();
+    session.commit_save(moved.clone()).unwrap();
+    assert!(session.undo());
+    let undone = save(&session).unwrap();
+    for bytes in [&moved, &undone] {
+        assert_eq!(
+            entry_bytes(&original, "ppt/charts/chart1.xml"),
+            entry_bytes(bytes, "ppt/charts/chart1.xml")
+        );
+    }
+}
+
+#[test]
+fn inserted_charts_keep_distinct_parts_after_save_and_edit() {
+    let mut session = load(&crate::create_blank_pptx()).unwrap();
+    let slide_id = session.deck().slides[0].id.clone();
+    let first_index = session.deck().slides[0].shapes.len();
+    for title in ["First chart", "Second chart"] {
+        let chart = ChartShape::new(
+            Transform::default(),
+            ChartType::Column,
+            ChartData::Category {
+                categories: vec!["A".into()],
+                series: vec![slides_core::CategorySeries {
+                    name: "Sales".into(),
+                    values: vec![1.0],
+                }],
+            },
+            Some(title.into()),
+        )
+        .unwrap();
+        session
+            .execute(Box::new(AddChart::new(slide_id.clone(), chart)))
+            .unwrap();
+    }
+    let original = save(&session).unwrap();
+    session.commit_save(original.clone()).unwrap();
+    session
+        .execute(Box::new(SetChartTitle::new(
+            slide_id,
+            first_index + 1,
+            Some("Edited second chart".into()),
+        )))
+        .unwrap();
+    let bytes = save(&session).unwrap();
+    let reloaded = load(&bytes).unwrap();
+    assert_eq!(
+        chart_at(&reloaded, first_index).title.as_deref(),
+        Some("First chart")
+    );
+    assert_eq!(
+        chart_at(&reloaded, first_index + 1).title.as_deref(),
+        Some("Edited second chart")
+    );
+    assert_ne!(
+        chart_at(&reloaded, first_index).id,
+        chart_at(&reloaded, first_index + 1).id
+    );
+    for index in [first_index, first_index + 1] {
+        assert!(chart_at(&reloaded, index).id.parse::<u32>().unwrap() > 0);
+    }
+    assert_eq!(
+        entry_bytes(&original, "ppt/charts/chart1.xml"),
+        entry_bytes(&bytes, "ppt/charts/chart1.xml")
+    );
+}
+
+#[test]
+fn adding_chart_with_duplicate_shape_id_is_rejected() {
+    let mut session = load(&build_chart_pptx(&sample_bar_chart_xml())).unwrap();
+    let slide_id = session.deck().slides[0].id.clone();
+    let duplicate = chart_at(&session, 0).clone();
+    assert!(session
+        .execute(Box::new(AddChart::new(slide_id, duplicate)))
+        .is_err());
+    assert_eq!(session.deck().slides[0].shapes.len(), 1);
+}
+
 #[test]
 fn load_extracts_chart_shape() {
     let original = build_chart_pptx(&sample_bar_chart_xml());
@@ -348,7 +808,7 @@ fn load_extracts_chart_shape() {
         session
             .chart_source_parts
             .get("ppt/slides/slide1.xml")
-            .and_then(|m| m.get(&0)),
+            .and_then(|m| m.get("7")),
         Some(&"ppt/charts/chart1.xml".to_string())
     );
 }

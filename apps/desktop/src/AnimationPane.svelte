@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { invoke } from '@tauri-apps/api/core'
+  import { invokeApp as invoke } from './lib/invokeDeckSnapshot'
   import MotionPathEditor from './MotionPathEditor.svelte'
   import type {
     BuildEffectDto,
@@ -65,8 +65,8 @@
   /** Sets the trigger of a build step. */
   async function onTrigger(stepIndex: number, trigger: TriggerDto): Promise<void> {
     const deck = await invoke<DeckSnapshot>('set_build_step_trigger', {
-      slide_id: slide.id,
-      step_index: stepIndex,
+      slideId: slide.id,
+      stepIndex: stepIndex,
       trigger,
     })
     onApplied(deck)
@@ -75,9 +75,9 @@
   /** Sets the delay of a build step. */
   async function onDelay(stepIndex: number, delayMs: number): Promise<void> {
     const deck = await invoke<DeckSnapshot>('set_build_step_delay', {
-      slide_id: slide.id,
-      step_index: stepIndex,
-      delay_ms: delayMs,
+      slideId: slide.id,
+      stepIndex: stepIndex,
+      delayMs,
     })
     onApplied(deck)
   }
@@ -91,7 +91,7 @@
       i === stepIndex ? { ...step, durationMs } : step,
     )
     const deck = await invoke<DeckSnapshot>('set_slide_animation', {
-      slide_id: slide.id,
+      slideId: slide.id,
       steps: next,
     })
     onApplied(deck)
@@ -100,8 +100,8 @@
   /** Removes a build step by index. */
   async function onRemove(stepIndex: number): Promise<void> {
     const deck = await invoke<DeckSnapshot>('remove_build_step', {
-      slide_id: slide.id,
-      step_index: stepIndex,
+      slideId: slide.id,
+      stepIndex: stepIndex,
     })
     onApplied(deck)
   }
@@ -110,7 +110,7 @@
   async function onMove(from: number, to: number): Promise<void> {
     if (to < 0 || to >= steps.length) return
     const deck = await invoke<DeckSnapshot>('move_build_step', {
-      slide_id: slide.id,
+      slideId: slide.id,
       from,
       to,
     })
@@ -120,10 +120,10 @@
   /** Appends a build step to the slide's animation sequence. */
   async function onAdd(): Promise<void> {
     const deck = await invoke<DeckSnapshot>('add_build_step', {
-      slide_id: slide.id,
-      shape_index: selectedShapeIndex,
+      slideId: slide.id,
+      shapeIndex: selectedShapeIndex,
       effect: selectedBuildEffect,
-      duration_ms: selectedBuildDuration,
+      durationMs: selectedBuildDuration,
     })
     onApplied(deck)
   }
@@ -131,8 +131,8 @@
   /** Toggles the per-slide reduce-motion override. */
   async function onToggleReduceMotion(next: boolean): Promise<void> {
     const deck = await invoke<DeckSnapshot>('set_slide_reduce_motion', {
-      slide_id: slide.id,
-      reduce_motion: next ? true : null,
+      slideId: slide.id,
+      reduceMotion: next ? true : null,
     })
     onApplied(deck)
   }
@@ -140,8 +140,8 @@
   /** Saves a motion path for a step. */
   async function onMotionPath(stepIndex: number, path: RectDto[] | null): Promise<void> {
     const deck = await invoke<DeckSnapshot>('set_build_step_motion_path', {
-      slide_id: slide.id,
-      step_index: stepIndex,
+      slideId: slide.id,
+      stepIndex: stepIndex,
       path,
     })
     onApplied(deck)

@@ -1,8 +1,8 @@
 # 900Slides — Product Specification
 
-Status: Draft v0.2 (desliced)
+Status: Development specification; acceptance gates distinguish targets from verification
 Owner: 900 Labs
-Last updated: 2026-07-24
+Last updated: 2026-09-07
 
 This document defines what 900Slides is, who it is for, what it ships in its
 first release track, what it deliberately does not ship, and how it is built.
@@ -11,10 +11,11 @@ back to the claims here.
 
 The forward-looking feature plan lives in [`docs/ROADMAP.md`](docs/ROADMAP.md),
 informed by [`docs/COMPETITIVE_ANALYSIS.md`](docs/COMPETITIVE_ANALYSIS.md),
-which surveys twelve presentation products (PowerPoint, Keynote, Google Slides,
-LibreOffice Impress, Reveal.js, Slidev, Marp, Pitch, Canva, Beautiful.ai,
-Figma Slides). Anything not in this document or in the roadmap is not a
-product claim.
+which compares commercial and open-source alternatives against offline use,
+interoperability, and modest hardware. The current release acceptance matrix is
+[`docs/LOW_RESOURCE_REQUIREMENTS.md`](docs/LOW_RESOURCE_REQUIREMENTS.md). Historical
+version scopes below describe design intent; implemented behavior and unresolved
+gaps are summarized in the README and current roadmap.
 
 ## 1. Mission
 
@@ -25,10 +26,9 @@ account, no subscription, no telemetry, and no constant internet connection.
 
 It exists because presentation software is basic working infrastructure for
 classrooms, small businesses, community organizers, faith groups, public
-services, researchers, journalists, and developers. Where PowerPoint and
-Google Slides require subscriptions, accounts, cloud sync, or constant
-connectivity, 900Slides must remain useful on a laptop with intermittent Wi-Fi
-and an outdated OS.
+services, researchers, journalists, and developers. Licensing and online setup can limit access even where competing applications
+support offline use. 900Slides must remain useful with intermittent Wi-Fi and
+modest hardware running a maintained, supported operating system.
 
 ## 2. Position in the 900 Labs family
 
@@ -39,7 +39,7 @@ distribution posture:
 - Rust workspace for the application logic
 - Tauri v2 desktop shell
 - Svelte 5 frontend
-- Local-first storage, offline-first behavior, no telemetry by default
+- Local-first storage, offline-first behavior, no telemetry
 - Apache-2.0 license
 - Conservative, evidence-backed public claims
 - Public release evidence captured from generated or sanitized fixtures only
@@ -95,11 +95,10 @@ scope for v0.1.0.
 
 ## 4. Product principles
 
-1. **Local-first, offline-first.** Every primary action must work without a
-   network. Network is an export convenience, never a prerequisite.
-2. **No telemetry by default.** No analytics, no crash reporting, no remote
-   calls unless the user opts in to a specific feature that requires it (and
-   none ship in v0.1.0).
+1. **Local-first, offline-first.** Every primary action, including creation,
+   saving, presenting and exporting, must work without a network.
+2. **No telemetry or remote calls.** No analytics, crash reporting, network
+   clients, or remotely loaded assets are permitted in application code.
 3. **No account, no subscription.** The app runs the first time it is opened.
 4. **Conservative public claims.** Compatibility with PowerPoint, Keynote, and
    Google Slides is described only against evidence captured from generated or
@@ -315,12 +314,19 @@ migrator per minor bump.
 
 Mirroring 900Sheets and 900Word:
 
-- All mutations go through a command bus that takes a transaction id.
+- Editing commands run transactionally through the command bus.
 - Each transaction produces an inverse transaction.
-- Undo history is bounded: 100 transactions, 64 MiB aggregate, 32 MiB per
-  transaction, 200,000 changed shape or text deltas per transaction.
-- A transaction that exceeds a per-transaction limit is rejected without
+- Undo and redo history together retain at most 100 transactions and 64 MiB
+  of serialized command data. Each command and its inverse must fit the
+  32 MiB per-transaction limit.
+- New edits evict the oldest undo entries when history count or aggregate
+  serialized size reaches its bound; reaching 100 edits must never lock the editor.
+- A command or inverse that exceeds a per-transaction limit is rejected without
   partially mutating the live deck.
+
+These limits do not cap process memory. Original slide XML and relationships
+retained for undo after a saved deletion are separate from serialized commands;
+they are released when no live slide or undo/redo entry references them.
 
 ### 6.4 Recovery
 
@@ -344,17 +350,20 @@ Mirroring 900Sheets and 900Word:
 
 ### 6.6 Edit loop and model ownership
 
-`slides-core` is the canonical source of truth; the desktop webview is a
-read-and-command projection, never the owner.
+`slides-core` owns the authoritative committed document. The desktop webview
+keeps temporary drafts for text boxes, table cells, and notes while edits await
+commit.
 
 - Load reads PPTX into a Rust `Deck`. A serializable snapshot of the deck is
   sent to the Svelte frontend over a Tauri command.
-- The frontend never holds local state as truth. Each edit is issued as a
-  command object via `invoke`; the Rust command bus applies it
-  transactionally, produces an inverse for undo, and returns the new snapshot
-  plus an undo token. The frontend re-renders from the returned snapshot.
-- Save serializes the in-memory `Deck` plus the carried passthrough parts
-  back to PPTX. Nothing in the frontend must be reconciled on save.
+- Drafts commit through a serialized queue after idle or maximum-wait bounds.
+  The Rust command bus applies edits transactionally, records inverses for
+  undo, and returns a snapshot. A newer local draft takes priority over an
+  older snapshot; failed commits retain the draft and surface an error.
+- Save, slide changes, and document replacement first await a draft flush.
+  After a successful flush, Save serializes the committed `Deck` and carried
+  passthrough parts to PPTX. Uncommitted drafts remain in memory; recovery
+  snapshots protect edits that have reached the backend.
 
 ## 7. Format strategy
 
@@ -373,12 +382,13 @@ lives in a custom XML part registered the standard OOXML way:
 
 - The 900Slides manifest lives under `/customXml/` with an entry in
   `[Content_Types].xml` and a package relationship. It carries app version,
-  schema version, deck id, animation timing offsets that do not map to the
-  OOXML animation model, theme overrides, and recovery breadcrumbs.
+  schema version, deck id, local comments, sections, and mappings between
+  stable editor shape IDs and numeric PPTX shape IDs.
 
-PowerPoint and other PPTX readers ignore this part. 900Slides reads and
-preserves it on every save. Removing the part is treated as "this deck is
-not a 900Slides deck" for recovery purposes only — editing still works.
+Other PPTX readers can ignore this custom part. 900Slides reads the supported
+collections and writes the manifest on save. Removing it loses the stored
+comments, sections, and editor identity mappings; the base presentation remains
+readable. Recovery snapshots are stored separately in the app data directory.
 
 ### 7.2 Import and conversion boundaries
 
@@ -420,29 +430,35 @@ PowerPoint compatibility is the default, not a special case.
 - No account, no login, no token storage.
 - The app data directory is the only place where recovery snapshots and
   settings live. The user can open it from the Settings view.
-- Network is used only when the user explicitly exports to a service that
-  requires it. No such service ships in v0.1.0.
+- Application exports write local files. Connected services are outside the
+  current application scope.
 
-The threat model and privacy model are documented in `docs/THREAT_MODEL.md`
-and `docs/PRIVACY_MODEL.md`, mirroring 900Word and 900Sheets.
+Security reporting is documented in [`SECURITY.md`](SECURITY.md);
+`scripts/verify-public-release.sh` checks source for prohibited data and APIs.
 
-## 9. Platform support
+## 9. Platform support and constrained hardware
 
-| Platform | v0.1.0 status                                       |
-| -------- | --------------------------------------------------- |
-| macOS    | Source builds. No notarized package in v0.1.0.      |
-| Windows  | Source builds. No installer published in v0.1.0.    |
-| Linux    | Source builds. CI compiles the desktop target.      |
+The release configuration targets macOS `.app`, Linux `.deb` / `.AppImage`,
+and a Windows NSIS installer with offline WebView2 installation. Build availability,
+verified installs, and runtime compatibility are separate claims. See
+[`docs/RELEASES.md`](docs/RELEASES.md) for the exact current posture.
 
-The v0.2.0 track will publish an ad-hoc signed macOS `.app` and a CI-verified
-Windows and Linux compile, matching 900Sheets' v0.4.0 posture.
+The primary evaluation tier is a 64-bit dual-core computer with 4 GB RAM;
+2 GB is a constrained evaluation tier. Both 1366×768 and 1024×768 must keep
+essential controls reachable. These are **targets**, not certified minimums.
+The measurable workloads, budgets, OS baselines and device checklist are in
+[`docs/LOW_RESOURCE_REQUIREMENTS.md`](docs/LOW_RESOURCE_REQUIREMENTS.md).
+
+Windows 7/8.1 and obsolete browser engines are not support promises. Offline
+installation must account for system webviews, fonts, and Linux dependencies;
+a small Rust executable alone does not satisfy this requirement.
 
 ## 10. Release evidence and public claims
 
 - Public claims about PPTX, ODP, and PDF compatibility are limited to
   evidence captured from generated or sanitized placeholder fixtures.
-- Evidence is stored under `crates/slides-fixtures/` and surfaced in
-  `docs/COMPATIBILITY.md`.
+- Generated compatibility tests live alongside the format crates. The fixtures
+  crate remains a scaffold; there is no broad external-suite certification.
 - A release cannot claim a feature as "supported" without a passing test that
   exercises the feature through the public import or export boundary.
 

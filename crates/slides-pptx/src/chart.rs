@@ -16,7 +16,7 @@ use slides_core::{
 };
 
 use crate::error::{Error, Result};
-use crate::load::{parse_attr_f64, qname_str, rel_attribute};
+use crate::load::{copy_element, parse_attr_f64, qname_str, rel_attribute};
 
 /// URI carried by `<a:graphicData>` for chart frames.
 pub const CHART_GRAPHIC_URI: &str = "http://schemas.openxmlformats.org/drawingml/2006/chart";
@@ -538,6 +538,9 @@ pub fn patch_chart_xml(original: &str, chart: &ChartShape) -> Result<Vec<u8>> {
     let mut writer = Writer::new(&mut out);
 
     let mut st = ChartPatchState::new(chart);
+    let title_changed =
+        parse_chart_xml(original, chart.transform).is_none_or(|saved| saved.title != chart.title);
+    let mut title_written = false;
 
     loop {
         let ev = reader.read_event_into(&mut buf)?;
@@ -549,6 +552,28 @@ pub fn patch_chart_xml(original: &str, chart: &ChartShape) -> Result<Vec<u8>> {
                     st.skip_depth += 1;
                     buf.clear();
                     continue;
+                }
+
+                if local == "title" && title_changed {
+                    writer
+                        .get_mut()
+                        .write_all(chart_title_xml(chart.title.as_deref()).as_bytes())?;
+                    title_written = true;
+                    let start = e.clone().into_owned();
+                    copy_element(
+                        &mut reader,
+                        &start,
+                        &mut Writer::new(std::io::sink()),
+                        &mut buf,
+                    )?;
+                    buf.clear();
+                    continue;
+                }
+                if local == "plotArea" && title_changed && !title_written {
+                    writer
+                        .get_mut()
+                        .write_all(chart_title_xml(chart.title.as_deref()).as_bytes())?;
+                    title_written = true;
                 }
 
                 if local == "title" {
@@ -563,8 +588,9 @@ pub fn patch_chart_xml(original: &str, chart: &ChartShape) -> Result<Vec<u8>> {
                     st.in_plot_area = true;
                 } else if is_chart_type_element(&local) && st.in_plot_area && !st.chart_type_seen {
                     st.chart_type_seen = true;
-                    st.rewritten_start = Some(local.clone());
-                    let new_tag = chart_type_tag(&local, st.chart_type, e);
+                    let qualified = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                    st.rewritten_start = Some(qualified.clone());
+                    let new_tag = chart_type_tag(&qualified, st.chart_type, e);
                     writer.get_mut().write_all(new_tag.as_bytes())?;
                     buf.clear();
                     continue;
@@ -628,7 +654,7 @@ pub fn patch_chart_xml(original: &str, chart: &ChartShape) -> Result<Vec<u8>> {
                 }
 
                 if let Some(start) = st.rewritten_start.as_ref() {
-                    if qname_str(e.name()) == *start {
+                    if local == start.rsplit(':').next().unwrap_or(start) {
                         let end_name = chart_type_end_name(start, st.chart_type);
                         writer.write_event(Event::End(BytesEnd::new(end_name)))?;
                         st.rewritten_start = None;
@@ -675,9 +701,35 @@ pub fn patch_chart_xml(original: &str, chart: &ChartShape) -> Result<Vec<u8>> {
                     continue;
                 }
 
+                if local == "title" && title_changed {
+                    writer
+                        .get_mut()
+                        .write_all(chart_title_xml(chart.title.as_deref()).as_bytes())?;
+                    title_written = true;
+                    buf.clear();
+                    continue;
+                }
+                if local == "barDir" && matches!(st.chart_type, ChartType::Bar | ChartType::Column)
+                {
+                    let mut direction = e.clone();
+                    direction.clear_attributes();
+                    direction.push_attribute((
+                        "val",
+                        if st.chart_type == ChartType::Bar {
+                            "bar"
+                        } else {
+                            "col"
+                        },
+                    ));
+                    writer.write_event(Event::Empty(direction))?;
+                    buf.clear();
+                    continue;
+                }
+
                 if is_chart_type_element(&local) && st.in_plot_area && !st.chart_type_seen {
                     st.chart_type_seen = true;
-                    let new_tag = chart_type_tag(&local, st.chart_type, e);
+                    let qualified = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                    let new_tag = chart_type_tag(&qualified, st.chart_type, e);
                     writer.get_mut().write_all(new_tag.as_bytes())?;
                     buf.clear();
                     continue;
@@ -764,6 +816,13 @@ fn write_title_paragraph<W: Write>(writer: &mut Writer<W>, title: Option<&str>) 
         .as_bytes(),
     )?;
     Ok(())
+}
+
+fn chart_title_xml(title: Option<&str>) -> String {
+    title.map(|title| format!(
+        r#"<c:title xmlns:c="{C_NS}"><c:tx><c:rich><a:bodyPr xmlns:a="{A_NS}"/><a:lstStyle xmlns:a="{A_NS}"/><a:p xmlns:a="{A_NS}"><a:r><a:rPr/><a:t xml:space="preserve">{}</a:t></a:r></a:p></c:rich></c:tx><c:overlay val="0"/></c:title>"#,
+        escape_xml(title)
+    )).unwrap_or_default()
 }
 
 fn write_replacement_str_cache<W: Write>(

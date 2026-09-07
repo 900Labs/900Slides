@@ -27,14 +27,22 @@ Run the full local gate before opening a pull request. Every check must pass:
 ./scripts/verify-local.sh
 ```
 
-This runs, in order:
+The automated gate checks the 11-crate workspace (formatting, clippy, tests),
+then the frontend (typecheck, unit tests, production build), then the separate
+Tauri crate (formatting, clippy, tests), and finally the public-release gate.
+Install dependencies with `npm ci --prefix apps/desktop` before running it.
 
-1. `cargo fmt --all -- --check`
-2. `cargo clippy --workspace --all-targets -- -D warnings`
-3. `cargo build --workspace`
-4. `cargo test --workspace`
-5. `npm ci --prefix apps/desktop`
-6. `npm run check --prefix apps/desktop`
+Complete the required native smoke test after the automated gate:
+
+```bash
+npm run tauri:dev --prefix apps/desktop
+```
+
+Follow [`docs/LOW_RESOURCE_REQUIREMENTS.md`](docs/LOW_RESOURCE_REQUIREMENTS.md)
+for small-screen, offline, recovery, and constrained-device acceptance checks.
+A fast development machine or a small executable does not establish the minimum
+hardware requirement. CI builds the production desktop protocol on all three
+platforms; package installation still requires a platform smoke test.
 
 If a command fails, fix the issue and re-run from the top. Do not open a pull
 request with a failing gate.

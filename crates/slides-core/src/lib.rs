@@ -2,10 +2,11 @@
 
 pub mod accessibility;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 
 /// Current deck model schema version.
@@ -321,48 +322,117 @@ pub struct MediaEntry {
 /// Images reference bytes by key rather than inlining them, so the deck model
 /// stays diffable and undo history stays bounded. The underlying map is a
 /// [`BTreeMap`] so iteration order is stable across runs.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-pub struct MediaStore(BTreeMap<String, MediaEntry>);
+#[derive(Debug)]
+pub struct MediaStore {
+    entries: BTreeMap<String, MediaEntry>,
+    generation: u64,
+}
+
+static NEXT_MEDIA_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_media_generation() -> u64 {
+    NEXT_MEDIA_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
+impl Clone for MediaStore {
+    fn clone(&self) -> Self {
+        Self {
+            entries: self.entries.clone(),
+            generation: self.generation,
+        }
+    }
+}
+
+impl PartialEq for MediaStore {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
+    }
+}
+
+impl Default for MediaStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Serialize for MediaStore {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.entries.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for MediaStore {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(Self {
+            entries: BTreeMap::deserialize(deserializer)?,
+            generation: next_media_generation(),
+        })
+    }
+}
 
 impl MediaStore {
     /// Creates an empty media store.
     pub fn new() -> Self {
-        Self(BTreeMap::new())
+        Self {
+            entries: BTreeMap::new(),
+            generation: next_media_generation(),
+        }
+    }
+
+    /// Returns the cheap in-process identity of this exact media content.
+    /// Clones share a generation until one is effectively mutated.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Returns the entry stored under `key`, if any.
     pub fn get(&self, key: &str) -> Option<&MediaEntry> {
-        self.0.get(key)
+        self.entries.get(key)
     }
 
     /// Returns `true` if an entry is stored under `key`.
     pub fn contains_key(&self, key: &str) -> bool {
-        self.0.contains_key(key)
+        self.entries.contains_key(key)
     }
 
     /// Inserts `entry` under `key`, replacing any existing entry.
     pub fn insert(&mut self, key: impl Into<String>, entry: MediaEntry) {
-        self.0.insert(key.into(), entry);
+        let key = key.into();
+        if self.entries.get(&key) == Some(&entry) {
+            return;
+        }
+        self.entries.insert(key, entry);
+        self.generation = next_media_generation();
     }
 
     /// Removes and returns the entry stored under `key`, if any.
     pub fn remove(&mut self, key: &str) -> Option<MediaEntry> {
-        self.0.remove(key)
+        let removed = self.entries.remove(key);
+        if removed.is_some() {
+            self.generation = next_media_generation();
+        }
+        removed
     }
 
     /// Returns the number of stored entries.
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.entries.len()
     }
 
     /// Returns `true` if no entries are stored.
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.entries.is_empty()
     }
 
     /// Returns an iterator over the stored entries by key.
     pub fn iter(&self) -> std::collections::btree_map::Iter<'_, String, MediaEntry> {
-        self.0.iter()
+        self.entries.iter()
     }
 }
 
@@ -2022,6 +2092,12 @@ pub trait Command: std::fmt::Debug + Send {
         Vec::new()
     }
 
+    /// Whether affected slide content needs regeneration. Pure reordering can
+    /// update the presentation list while preserving slide XML byte-for-byte.
+    fn affects_slide_content(&self) -> bool {
+        true
+    }
+
     /// Validates that the command can be applied to the given deck.
     ///
     /// The default implementation accepts every command; specific commands
@@ -2059,7 +2135,7 @@ pub struct CommandBus {
 impl CommandBus {
     /// Maximum number of transactions in the undo history.
     pub const MAX_TRANSACTIONS: usize = 100;
-    /// Maximum total size of all stored inverse transactions, in bytes.
+    /// Maximum total size of stored undo and redo transactions, in bytes.
     pub const MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
     /// Maximum size of any single transaction, in bytes.
     pub const MAX_PER_TRANSACTION: usize = 32 * 1024 * 1024;
@@ -2068,9 +2144,9 @@ impl CommandBus {
     /// onto the undo stack. Clears the redo stack (standard semantics — a new
     /// action invalidates redo history).
     ///
-    /// If a bound is exceeded, the deck is left unchanged and an error is
-    /// returned. If the command fails validation, it is rejected without
-    /// modifying the deck or the history.
+    /// Oldest history is evicted to keep count and aggregate memory bounded.
+    /// An invalid or individually oversized command (including its inverse)
+    /// is rejected without modifying the deck or the history.
     pub fn apply(
         &mut self,
         command: Box<dyn Command>,
@@ -2084,21 +2160,39 @@ impl CommandBus {
         let inv_size = inverse.serialized_size();
         let cmd_size = command.serialized_size();
 
-        if cmd_size > Self::MAX_PER_TRANSACTION {
+        if cmd_size > Self::MAX_PER_TRANSACTION || inv_size > Self::MAX_PER_TRANSACTION {
             return Err(CommandError::TransactionTooLarge);
         }
-        if self.undo_stack.len() >= Self::MAX_TRANSACTIONS {
-            return Err(CommandError::HistoryFull);
-        }
-        if self.total_size + inv_size > Self::MAX_TOTAL_BYTES {
-            return Err(CommandError::HistoryFull);
-        }
+
+        self.total_size = self.total_size.saturating_sub(
+            self.redo_stack
+                .iter()
+                .map(|command| command.serialized_size())
+                .sum::<usize>(),
+        );
+        self.redo_stack.clear();
+        self.make_room_for(inv_size);
 
         command.apply(deck);
         self.undo_stack.push(inverse);
         self.total_size += inv_size;
-        self.redo_stack.clear();
         Ok(())
+    }
+
+    fn make_room_for(&mut self, incoming_size: usize) {
+        while self.undo_stack.len() + self.redo_stack.len() >= Self::MAX_TRANSACTIONS
+            || self.total_size.saturating_add(incoming_size) > Self::MAX_TOTAL_BYTES
+        {
+            let removed = if !self.undo_stack.is_empty() {
+                self.undo_stack.remove(0)
+            } else if !self.redo_stack.is_empty() {
+                // Keep the next redo; discard the farthest future operation.
+                self.redo_stack.remove(0)
+            } else {
+                break;
+            };
+            self.total_size = self.total_size.saturating_sub(removed.serialized_size());
+        }
     }
 
     /// Pops the most recent transaction and applies its inverse, pushing the
@@ -2107,13 +2201,20 @@ impl CommandBus {
     /// Returns the affected slide ids if a command was undone, or `None` if the
     /// history was empty.
     pub fn undo(&mut self, deck: &mut Deck) -> Option<Vec<String>> {
+        let inverse = self.undo_stack.last()?;
+        let redo_cmd = inverse.inverse(deck);
+        let redo_size = redo_cmd.serialized_size();
+        if redo_size > Self::MAX_PER_TRANSACTION {
+            return None;
+        }
         let inverse = self.undo_stack.pop()?;
         let affected = inverse.affected_slide_ids();
         self.total_size = self.total_size.saturating_sub(inverse.serialized_size());
         // Recover the forward command for redo BEFORE applying the inverse.
-        let redo_cmd = inverse.inverse(deck);
+        self.make_room_for(redo_size);
         inverse.apply(deck);
         self.redo_stack.push(redo_cmd);
+        self.total_size += redo_size;
         Some(affected)
     }
 
@@ -2123,10 +2224,16 @@ impl CommandBus {
     /// Returns the affected slide ids if a command was redone, or `None` if the
     /// redo stack was empty.
     pub fn redo(&mut self, deck: &mut Deck) -> Option<Vec<String>> {
-        let forward = self.redo_stack.pop()?;
-        let affected = forward.affected_slide_ids();
+        let forward = self.redo_stack.last()?;
         let undo_inv = forward.inverse(deck);
         let inv_size = undo_inv.serialized_size();
+        if inv_size > Self::MAX_PER_TRANSACTION {
+            return None;
+        }
+        let forward = self.redo_stack.pop()?;
+        let affected = forward.affected_slide_ids();
+        self.total_size = self.total_size.saturating_sub(forward.serialized_size());
+        self.make_room_for(inv_size);
         forward.apply(deck);
         self.undo_stack.push(undo_inv);
         self.total_size += inv_size;
@@ -2146,6 +2253,285 @@ impl CommandBus {
     /// Returns the total serialized size of all stored transactions.
     pub fn total_size(&self) -> usize {
         self.total_size
+    }
+
+    /// Slide IDs still referenced by an undoable or redoable operation.
+    pub fn history_slide_ids(&self) -> BTreeSet<String> {
+        self.undo_stack
+            .iter()
+            .chain(&self.redo_stack)
+            .flat_map(|command| command.affected_slide_ids())
+            .collect()
+    }
+
+    /// Whether the next undo can change slide content.
+    pub fn undo_affects_slide_content(&self) -> bool {
+        self.undo_stack
+            .last()
+            .is_some_and(|command| command.affects_slide_content())
+    }
+
+    /// Whether the next redo can change slide content.
+    pub fn redo_affects_slide_content(&self) -> bool {
+        self.redo_stack
+            .last()
+            .is_some_and(|command| command.affects_slide_content())
+    }
+}
+
+/// Moves a slide to its final zero-based position. Section headings remain
+/// attached to their starting slide and follow its new position.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MoveSlide {
+    slide_id: String,
+    to_index: usize,
+}
+
+impl MoveSlide {
+    /// Creates a move to `to_index`, which must be inside the current deck.
+    pub fn new(slide_id: impl Into<String>, to_index: usize) -> Self {
+        Self {
+            slide_id: slide_id.into(),
+            to_index,
+        }
+    }
+}
+
+impl Command for MoveSlide {
+    fn apply(&self, deck: &mut Deck) {
+        if let Some(index) = deck
+            .slides
+            .iter()
+            .position(|slide| slide.id == self.slide_id)
+        {
+            let slide = deck.slides.remove(index);
+            deck.slides.insert(self.to_index, slide);
+            deck.sections.sort_by_key(|section| {
+                deck.slides
+                    .iter()
+                    .position(|slide| slide.id == section.start_slide_id)
+            });
+        }
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        Box::new(Self::new(
+            self.slide_id.clone(),
+            deck.slides
+                .iter()
+                .position(|slide| slide.id == self.slide_id)
+                .unwrap_or(0),
+        ))
+    }
+
+    fn serialized_size(&self) -> usize {
+        self.slide_id.len() + 16
+    }
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+    fn affects_slide_content(&self) -> bool {
+        false
+    }
+    fn validate(&self, deck: &Deck) -> bool {
+        self.to_index < deck.slides.len() && deck.slide(&self.slide_id).is_some()
+    }
+}
+
+/// Deletes a slide while retaining at least one slide. Anchored comments are
+/// removed; a section starting here advances to its next slide, or disappears
+/// when the deleted slide was its only member. Undo restores all of this state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeleteSlide {
+    slide_id: String,
+}
+
+impl DeleteSlide {
+    /// Creates a delete command; deleting the last slide is invalid.
+    pub fn new(slide_id: impl Into<String>) -> Self {
+        Self {
+            slide_id: slide_id.into(),
+        }
+    }
+}
+
+impl Command for DeleteSlide {
+    fn apply(&self, deck: &mut Deck) {
+        let Some(index) = deck
+            .slides
+            .iter()
+            .position(|slide| slide.id == self.slide_id)
+        else {
+            return;
+        };
+        let next_id = deck.slides.get(index + 1).map(|slide| slide.id.clone());
+        let next_starts_section = next_id.as_ref().is_some_and(|next| {
+            deck.sections
+                .iter()
+                .any(|section| &section.start_slide_id == next)
+        });
+        deck.sections.retain_mut(|section| {
+            if section.start_slide_id != self.slide_id {
+                return true;
+            }
+            if let Some(next) = &next_id {
+                if !next_starts_section {
+                    section.start_slide_id = next.clone();
+                    return true;
+                }
+            }
+            false
+        });
+        deck.comments
+            .retain(|thread| thread.anchor.slide_id() != self.slide_id);
+        deck.slides.remove(index);
+    }
+
+    fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+        let index = deck
+            .slides
+            .iter()
+            .position(|slide| slide.id == self.slide_id)
+            .unwrap_or(0);
+        Box::new(RestoreDeletedSlide {
+            index,
+            slide: deck.slides.get(index).cloned().unwrap_or_default(),
+            sections: deck.sections.clone(),
+            comments: deck
+                .comments
+                .iter()
+                .enumerate()
+                .filter(|(_, thread)| thread.anchor.slide_id() == self.slide_id)
+                .map(|(index, thread)| (index, thread.clone()))
+                .collect(),
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        self.slide_id.len() + 16
+    }
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide_id.clone()]
+    }
+    fn affects_slide_content(&self) -> bool {
+        false
+    }
+    fn validate(&self, deck: &Deck) -> bool {
+        deck.slides.len() > 1 && deck.slide(&self.slide_id).is_some()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct RestoreDeletedSlide {
+    index: usize,
+    slide: Slide,
+    sections: Vec<SlideSection>,
+    comments: Vec<(usize, CommentThread)>,
+}
+
+impl Command for RestoreDeletedSlide {
+    fn apply(&self, deck: &mut Deck) {
+        deck.slides.insert(self.index, self.slide.clone());
+        deck.sections = self.sections.clone();
+        for (index, thread) in &self.comments {
+            deck.comments.insert(*index, thread.clone());
+        }
+    }
+    fn inverse(&self, _deck: &Deck) -> Box<dyn Command> {
+        Box::new(DeleteSlide::new(self.slide.id.clone()))
+    }
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |json| json.len())
+    }
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide.id.clone()]
+    }
+}
+
+/// Inserts a slide at a stable position in the deck.
+///
+/// Keeping slide insertion in the command bus is important: presentation
+/// structure is user-visible state just like a shape edit, so it must
+/// participate in undo/redo and give the package saver a concrete affected
+/// slide id to persist.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InsertSlide {
+    index: usize,
+    slide: Slide,
+}
+
+impl InsertSlide {
+    /// Creates an insertion command for `slide` at `index`.
+    pub fn new(index: usize, slide: Slide) -> Self {
+        Self { index, slide }
+    }
+}
+
+impl Command for InsertSlide {
+    fn apply(&self, deck: &mut Deck) {
+        deck.slides.insert(self.index, self.slide.clone());
+    }
+
+    fn inverse(&self, _deck: &Deck) -> Box<dyn Command> {
+        Box::new(RemoveInsertedSlide {
+            index: self.index,
+            slide: self.slide.clone(),
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |serialized| serialized.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide.id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        self.index <= deck.slides.len()
+            && !self.slide.id.is_empty()
+            && !deck.slides.iter().any(|slide| slide.id == self.slide.id)
+    }
+}
+
+/// Inverse of [`InsertSlide`]. This deliberately validates both the position
+/// and id so undo never removes a different slide after an invalid mutation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct RemoveInsertedSlide {
+    index: usize,
+    slide: Slide,
+}
+
+impl Command for RemoveInsertedSlide {
+    fn apply(&self, deck: &mut Deck) {
+        if deck
+            .slides
+            .get(self.index)
+            .is_some_and(|slide| slide.id == self.slide.id)
+        {
+            deck.slides.remove(self.index);
+        }
+    }
+
+    fn inverse(&self, _deck: &Deck) -> Box<dyn Command> {
+        Box::new(InsertSlide {
+            index: self.index,
+            slide: self.slide.clone(),
+        })
+    }
+
+    fn serialized_size(&self) -> usize {
+        serde_json::to_string(self).map_or(0, |serialized| serialized.len())
+    }
+
+    fn affected_slide_ids(&self) -> Vec<String> {
+        vec![self.slide.id.clone()]
+    }
+
+    fn validate(&self, deck: &Deck) -> bool {
+        deck.slides
+            .get(self.index)
+            .is_some_and(|slide| slide.id == self.slide.id)
     }
 }
 
@@ -3817,7 +4203,12 @@ pub struct AddChart {
 
 impl AddChart {
     /// Creates a new add-chart command.
-    pub fn new(slide_id: impl Into<String>, chart: ChartShape) -> Self {
+    pub fn new(slide_id: impl Into<String>, mut chart: ChartShape) -> Self {
+        // Allocate once on the command so undo/redo restores the same identity.
+        if chart.id.is_empty() {
+            // PPTX shape identifiers are unsigned 32-bit integers.
+            chart.id = (Uuid::new_v4().as_u128() as u32).max(1).to_string();
+        }
         Self {
             slide_id: slide_id.into(),
             chart,
@@ -3848,7 +4239,9 @@ impl Command for AddChart {
     }
 
     fn validate(&self, deck: &Deck) -> bool {
-        deck.slide(&self.slide_id).is_some() && self.chart.validate()
+        deck.slide(&self.slide_id)
+            .is_some_and(|slide| !slide.shapes.iter().any(|shape| shape.id() == self.chart.id))
+            && self.chart.validate()
     }
 }
 
@@ -5593,6 +5986,131 @@ mod tests {
     }
 
     #[test]
+    fn slide_organization_is_undoable_and_rejects_invalid_targets() {
+        let mut deck = Deck::new();
+        deck.slides = ["first", "middle", "last"]
+            .into_iter()
+            .map(|id| Slide {
+                id: id.into(),
+                ..Default::default()
+            })
+            .collect();
+        deck.sections = vec![
+            SlideSection {
+                name: "Opening".into(),
+                start_slide_id: "first".into(),
+            },
+            SlideSection {
+                name: "Closing".into(),
+                start_slide_id: "last".into(),
+            },
+        ];
+        deck.comments = vec![CommentThread {
+            id: "comment".into(),
+            anchor: CommentAnchor::Shape {
+                slide_id: "first".into(),
+                shape_id: "shape".into(),
+            },
+            comments: vec![],
+            assigned_to: None,
+            resolved: false,
+        }];
+        let original = deck.clone();
+        let mut bus = CommandBus::default();
+        for command in [
+            Box::new(MoveSlide::new("first", 3)) as Box<dyn Command>,
+            Box::new(MoveSlide::new("missing", 0)),
+            Box::new(DeleteSlide::new("missing")),
+        ] {
+            assert_eq!(
+                bus.apply(command, &mut deck),
+                Err(CommandError::InvalidCommand)
+            );
+        }
+        assert_eq!(deck, original);
+        bus.apply(Box::new(MoveSlide::new("first", 2)), &mut deck)
+            .unwrap();
+        assert_eq!(
+            deck.slides
+                .iter()
+                .map(|slide| slide.id.as_str())
+                .collect::<Vec<_>>(),
+            ["middle", "last", "first"]
+        );
+        assert_eq!(deck.sections[0].start_slide_id, "last");
+        assert!(!bus.undo_affects_slide_content());
+        bus.undo(&mut deck).unwrap();
+        assert_eq!(deck, original);
+        bus.apply(Box::new(DeleteSlide::new("first")), &mut deck)
+            .unwrap();
+        assert_eq!(deck.sections[0].start_slide_id, "middle");
+        assert!(deck.comments.is_empty());
+        bus.undo(&mut deck).unwrap();
+        assert_eq!(deck, original);
+        bus.redo(&mut deck).unwrap();
+        bus.apply(Box::new(DeleteSlide::new("middle")), &mut deck)
+            .unwrap();
+        assert_eq!(deck.sections.len(), 1);
+        assert_eq!(deck.sections[0].start_slide_id, "last");
+        assert_eq!(
+            bus.apply(Box::new(DeleteSlide::new("last")), &mut deck),
+            Err(CommandError::InvalidCommand)
+        );
+        assert_eq!(deck.slides.len(), 1);
+    }
+
+    #[test]
+    fn insert_slide_is_ordered_and_undoable() {
+        let mut deck = Deck::new();
+        deck.slides.push(Slide {
+            id: "first".to_string(),
+            ..Default::default()
+        });
+        deck.slides.push(Slide {
+            id: "third".to_string(),
+            ..Default::default()
+        });
+        let mut bus = CommandBus::default();
+
+        bus.apply(
+            Box::new(InsertSlide::new(
+                1,
+                Slide {
+                    id: "second".to_string(),
+                    ..Default::default()
+                },
+            )),
+            &mut deck,
+        )
+        .expect("slide insertion should apply");
+        assert_eq!(
+            deck.slides
+                .iter()
+                .map(|slide| slide.id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second", "third"]
+        );
+
+        assert!(bus.undo(&mut deck).is_some());
+        assert_eq!(
+            deck.slides
+                .iter()
+                .map(|slide| slide.id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "third"]
+        );
+
+        assert!(bus.redo(&mut deck).is_some());
+        assert_eq!(
+            deck.slides
+                .iter()
+                .map(|slide| slide.id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second", "third"]
+        );
+    }
+
+    #[test]
     fn command_bus_undo_then_redo_restores() {
         let mut deck = Deck::new();
         deck.slides.push(Slide {
@@ -5646,6 +6164,115 @@ mod tests {
         )
         .expect("apply");
         assert_eq!(bus.redo_len(), 0);
+    }
+
+    #[derive(Debug)]
+    struct BudgetedEdit {
+        value: String,
+        size: usize,
+        inverse_size: usize,
+    }
+    impl Command for BudgetedEdit {
+        fn apply(&self, deck: &mut Deck) {
+            deck.id = self.value.clone();
+        }
+        fn inverse(&self, deck: &Deck) -> Box<dyn Command> {
+            Box::new(Self {
+                value: deck.id.clone(),
+                size: self.inverse_size,
+                inverse_size: self.size,
+            })
+        }
+        fn serialized_size(&self) -> usize {
+            self.size
+        }
+    }
+
+    #[test]
+    fn history_evicts_oldest_edits_without_locking_editor() {
+        let mut deck = Deck::default();
+        let mut bus = CommandBus::default();
+        for index in 1..=125 {
+            bus.apply(
+                Box::new(BudgetedEdit {
+                    value: index.to_string(),
+                    size: 16,
+                    inverse_size: 16,
+                }),
+                &mut deck,
+            )
+            .unwrap();
+        }
+        assert_eq!(deck.id, "125");
+        assert_eq!(bus.undo_len(), CommandBus::MAX_TRANSACTIONS);
+        for expected in (25..125).rev() {
+            bus.undo(&mut deck).unwrap();
+            assert_eq!(deck.id, expected.to_string());
+        }
+        assert!(bus.undo(&mut deck).is_none());
+        assert_eq!(bus.redo_len(), CommandBus::MAX_TRANSACTIONS);
+        assert_eq!(bus.total_size(), 100 * 16);
+        for expected in 26..=125 {
+            bus.redo(&mut deck).unwrap();
+            assert_eq!(deck.id, expected.to_string());
+        }
+        assert!(bus.redo(&mut deck).is_none());
+    }
+
+    #[test]
+    fn history_memory_eviction_and_oversized_failures_preserve_recent_state() {
+        let mut deck = Deck::default();
+        let mut bus = CommandBus::default();
+        let record_size = 24 * 1024 * 1024;
+        for value in ["first", "second", "third"] {
+            bus.apply(
+                Box::new(BudgetedEdit {
+                    value: value.into(),
+                    size: record_size,
+                    inverse_size: record_size,
+                }),
+                &mut deck,
+            )
+            .unwrap();
+        }
+        assert_eq!(bus.undo_len(), 2);
+        assert_eq!(bus.total_size(), 2 * record_size);
+        bus.undo(&mut deck).unwrap();
+        assert_eq!(deck.id, "second");
+        let previous = (
+            deck.clone(),
+            bus.undo_len(),
+            bus.redo_len(),
+            bus.total_size(),
+        );
+        for (size, inverse_size) in [
+            (CommandBus::MAX_PER_TRANSACTION + 1, 1),
+            (1, CommandBus::MAX_PER_TRANSACTION + 1),
+        ] {
+            assert_eq!(
+                bus.apply(
+                    Box::new(BudgetedEdit {
+                        value: "must not apply".into(),
+                        size,
+                        inverse_size
+                    }),
+                    &mut deck
+                ),
+                Err(CommandError::TransactionTooLarge)
+            );
+            assert_eq!(
+                (
+                    deck.clone(),
+                    bus.undo_len(),
+                    bus.redo_len(),
+                    bus.total_size()
+                ),
+                previous
+            );
+        }
+        bus.redo(&mut deck).unwrap();
+        assert_eq!(deck.id, "third");
+        assert!(bus.total_size() <= CommandBus::MAX_TOTAL_BYTES);
     }
 
     #[test]
@@ -5851,6 +6478,61 @@ mod tests {
         assert!(!store.contains_key("a"));
         let keys: Vec<&str> = store.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, vec!["b"]);
+    }
+
+    #[test]
+    fn media_store_generation_tracks_effective_insert_replace_and_remove() {
+        let mut store = MediaStore::new();
+        let empty_generation = store.generation();
+        let first = sample_media_entry();
+
+        store.insert("same-key", first.clone());
+        let inserted_generation = store.generation();
+        assert_ne!(inserted_generation, empty_generation);
+
+        store.insert("same-key", first.clone());
+        assert_eq!(store.generation(), inserted_generation);
+
+        let mut replacement = first;
+        replacement.bytes = vec![0x89, 0x50, 0x4e, 0x48];
+        store.insert("same-key", replacement.clone());
+        let replaced_generation = store.generation();
+        assert_ne!(replaced_generation, inserted_generation);
+        assert_eq!(store.get("same-key"), Some(&replacement));
+
+        assert!(store.remove("missing").is_none());
+        assert_eq!(store.generation(), replaced_generation);
+        assert!(store.remove("same-key").is_some());
+        assert_ne!(store.generation(), replaced_generation);
+    }
+
+    #[test]
+    fn media_store_clone_shares_generation_until_content_mutates() {
+        let mut original = MediaStore::new();
+        original.insert("a", sample_media_entry());
+        let mut cloned = original.clone();
+
+        assert_eq!(cloned, original);
+        assert_eq!(cloned.generation(), original.generation());
+        cloned.insert("b", sample_media_entry());
+        assert_ne!(cloned, original);
+        assert_ne!(cloned.generation(), original.generation());
+    }
+
+    #[test]
+    fn media_store_serialization_stays_a_transparent_map() {
+        let mut store = MediaStore::new();
+        store.insert("img", sample_media_entry());
+        let value = serde_json::to_value(&store).expect("serialize media store");
+        let object = value.as_object().expect("media store remains a JSON map");
+        assert_eq!(object.len(), 1);
+        assert!(object.contains_key("img"));
+        assert!(!object.contains_key("generation"));
+        assert!(!object.contains_key("entries"));
+
+        let restored: MediaStore = serde_json::from_value(value).expect("deserialize media map");
+        assert_eq!(restored, store);
+        assert_ne!(restored.generation(), store.generation());
     }
 
     #[test]

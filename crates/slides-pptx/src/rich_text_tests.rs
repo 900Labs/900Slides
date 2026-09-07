@@ -362,6 +362,68 @@ fn round_trip_rich_text() {
 }
 
 #[test]
+fn imported_run_size_and_color_survive_text_edit_save_reload() {
+    let original = build_rich_text_pptx();
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(original)).unwrap();
+    let mut writer = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for index in 0..archive.len() {
+        let mut part = archive.by_index(index).unwrap();
+        let name = part.name().to_string();
+        let mut bytes = Vec::new();
+        std::io::copy(&mut part, &mut bytes).unwrap();
+        if name == "ppt/slides/slide1.xml" {
+            bytes = String::from_utf8(bytes).unwrap().replace(
+                r#"<a:rPr b="1" i="1" u="sng" strike="sngStrike" baseline="30000">"#,
+                r#"<a:rPr sz="3200" b="1" i="1" u="sng" strike="sngStrike" baseline="30000"><a:solidFill><a:srgbClr val="1464C8"><a:alpha val="50196"/></a:srgbClr></a:solidFill>"#,
+            ).into_bytes();
+        }
+        writer
+            .start_file(name, FileOptions::<()>::default())
+            .unwrap();
+        writer.write_all(&bytes).unwrap();
+    }
+    let bytes = writer.finish().unwrap().into_inner();
+    let mut session = load(&bytes).unwrap();
+    let slide_id = session.deck().slides[0].id.clone();
+    let Shape::TextBox(text_box) = &session.deck().slides[0].shapes[0] else {
+        panic!("text box");
+    };
+    let original_run = &text_box.paragraphs[0].runs[0];
+    assert_eq!(original_run.font_size, Some(32.0 * 12_700.0));
+    assert_eq!(
+        original_run.color,
+        Some(slides_core::Color {
+            r: 20,
+            g: 100,
+            b: 200,
+            a: 128
+        })
+    );
+    let mut paragraphs = text_box.paragraphs.clone();
+    paragraphs[0].runs[0].text = "Edited styled text".into();
+    session
+        .execute(Box::new(EditTextBox::new(slide_id, 0, paragraphs)))
+        .unwrap();
+    let saved = save(&session).unwrap();
+    let reloaded = load(&saved).unwrap();
+    let Shape::TextBox(text_box) = &reloaded.deck().slides[0].shapes[0] else {
+        panic!("reloaded text box");
+    };
+    let run = &text_box.paragraphs[0].runs[0];
+    assert_eq!(run.text, "Edited styled text");
+    assert_eq!(run.font_size, Some(32.0 * 12_700.0));
+    assert_eq!(
+        run.color,
+        Some(slides_core::Color {
+            r: 20,
+            g: 100,
+            b: 200,
+            a: 128
+        })
+    );
+}
+
+#[test]
 fn round_trip_unsafe_hyperlink_is_preserved() {
     let original = build_rich_text_pptx();
     let mut session = load(&original).expect("load should succeed");

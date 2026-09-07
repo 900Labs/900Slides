@@ -9,5 +9,7 @@ description = "ODP import / export conversion boundary"
 [dependencies]
 slides-core = { workspace = true }
 zip = { workspace = true }
+# zip 2 delegates selection of the pure-Rust DEFLATE backend to consumers.
+flate2 = { workspace = true }
 quick-xml = { workspace = true }
 thiserror = { workspace = true }

@@ -1,338 +1,94 @@
-# 900Slides — Competitive Analysis
+# Presentation software: competitive research
 
-Status: Research input to the roadmap. Drawn from vendor docs, support
-pages, and recent reviews for twelve presentation products as of July 2026.
+Reviewed: 2026-09-07. Scope: presentation authoring for people using older
+computers, unreliable connections, shared devices, and limited budgets.
 
-This document is the raw research. The synthesis and the forward-looking plan
-live in [`ROADMAP.md`](./ROADMAP.md).
+900Slides should compete on a dependable complete workflow: install, create a
+readable deck, save it safely, present it, and hand over a usable file. Offline
+editing alone is not unique. Established desktop products offer it, and several
+cloud products offer a prepared offline mode. Installation, file safety,
+resource use, and good default layouts deserve priority over feature count.
 
-## Products surveyed
+This is a review of primary vendor/project documentation, not a hands-on
+benchmark. Vendor minimum-hardware and compatibility statements are not evidence
+of usable-deck performance or 900Slides fidelity. Sources were consulted on the
+review date. Exact prices are omitted because editions, regions, and plans
+vary. Product implications below are recommendations, not implemented-feature
+claims. See the [product specification](../PRODUCT_SPEC.md),
+[roadmap](ROADMAP.md), and [low-resource requirements](LOW_RESOURCE_REQUIREMENTS.md).
 
-| Product | Category | License / cost |
+## Desktop and mainstream alternatives
+
+| Product | Verified access and behavior | Product implication |
 | --- | --- | --- |
-| Microsoft PowerPoint | Legacy heavyweight | Microsoft 365 subscription |
-| Apple Keynote | Legacy heavyweight | Free on Apple devices; advanced features behind Creator Studio (2026) |
-| Google Slides | Free / cloud heavyweight | Free with Google account; Gemini features require paid Workspace / AI plan |
-| LibreOffice Impress | Open-source desktop | MPL-2.0, free |
-| Reveal.js | Developer HTML framework | MIT, free; commercial GUI on Slides.com |
-| Slidev | Developer Markdown + Vue framework | MIT, free |
-| Marp | Developer Markdown framework | MIT, free |
-| Pitch | Modern web challenger | Freemium SaaS |
-| Canva Presentations | Modern web challenger | Freemium SaaS |
-| Beautiful.ai | Modern web challenger | Freemium SaaS |
-| Figma Slides | Modern web challenger | Freemium SaaS |
+| **PowerPoint desktop** | Commercial: Microsoft 365 subscriptions, one-time Office 2024, and standalone purchases exist. Installed, activated apps edit local files offline. Microsoft 365 and retail Office 2024 require periodic activation connectivity; LTSC serves disconnected organizational deployments. [Purchase/offline comparison](https://support.microsoft.com/en-us/office/what-s-the-difference-between-microsoft-365-and-office-2024-ed447ebf-6060-46f9-9e90-a239bd27eb96), [Office/LTSC FAQ](https://support.microsoft.com/en-us/office/lifecycle/office-2024-and-office-ltsc-2024-faq). | Familiar formatting, slide navigation, positioning, and notes are baseline expectations. No activation/account is a meaningful difference; do not describe all PowerPoint use as subscription-only or continuously online. |
+| **PowerPoint for the web** | Free web access is available with a Microsoft account. Microsoft documents feature differences by platform; desktop Presenter View is not listed for the web version. [Free web access](https://support.microsoft.com/en-us/office/what-s-the-difference-between-microsoft-365-and-office-2024-ed447ebf-6060-46f9-9e90-a239bd27eb96), [platform comparison](https://support.microsoft.com/en-us/powerpoint/compare-powerpoint-features-on-different-platforms). | Compare the installed desktop and web offerings separately. State exactly which local editor/presenter functions 900Slides implements. |
+| **Google Slides** | Account-based browser editor supports offline creation, viewing, and editing after online setup in Chrome or Edge with Google Docs Offline. Private browsing is excluded; files need local storage. [Offline instructions](https://support.google.com/docs/answer/6388102?hl=en-gb). | First use on a disconnected computer differs from prepared offline access. All local decks and bundled templates should remain available without advance selection. |
+| **Apple Keynote** | Opens local Mac files as well as cloud files; some theme assets download on demand. Opens PowerPoint and exports PPTX/PDF. Its current Mac App Store listing requires macOS 15.6+ and includes in-app purchases. [Local files/themes](https://support.apple.com/guide/keynote/open-or-close-a-presentation-tan72232b56/mac), [exports](https://support.apple.com/guide/keynote/export-to-powerpoint-or-another-file-format-tana0d19882a/mac), [current listing](https://apps.apple.com/fi/app/keynote-design-presentations/id361285480?platform=mac). | Prioritize typography, spacing, and locally available layouts. A polished modern Mac experience does not represent the intended hardware population. |
+| **LibreOffice Impress** | Free open-source desktop suite, MPL-2.0, with established local file workflows and community localization. Supports presentation formats including PPTX. [LibreOffice](https://www.libreoffice.org/), [format support](https://help.libreoffice.org/latest/en-US/text/shared/guide/import_ms.html). | A direct alternative for the target audience. Compare task completion and generated PPTX fixtures. Do not publish untested blanket lists of competitor fidelity failures. |
+| **ONLYOFFICE Desktop Editors** | Free AGPL-3.0 suite for Windows, Linux, and macOS; explicitly supports local creation/editing without internet. Presenter mode and localization/RTL support are documented. Cloud connections are additional capabilities. [Project/license](https://github.com/ONLYOFFICE/DesktopEditors), [desktop product](https://www.onlyoffice.com/desktop). | Familiar UI, OOXML support, and offline use already coexist. 900Slides needs demonstrably simple operation and resource discipline; vendor full-compatibility claims still require fixture testing. |
+| **WPS Presentation** | Proprietary suite with a free desktop offering; documents offline slideshow, editing, and PDF export alongside online products. [Offline presentation offering](https://www.wps.com/feature/the-free-online-ppt-viewer/), [requirements](https://help.wps.com/articles/system-requirements-for-wps-office/). | Free core workflows and predictable local operation matter. Verify edition entitlements and old-OS listings rather than assuming proprietary means online-only. |
 
-## Per-product synthesis
+## Design-led and developer alternatives
 
-Each entry below is the synthesis the roadmap depends on, not a verbatim
-copy of vendor marketing. Long sections are condensed to the points that
-change a product decision.
+| Product | Verified behavior | Useful lesson and boundary |
+| --- | --- | --- |
+| **Pitch** | Supports preloaded offline editing and presenting; offline limitations include PDF/PPTX export, speaker view, and version history. [Offline guide](https://help.pitch.com/en/articles/5671537-work-offline-in-pitch). | Finish local export and recovery before expanding review or analytics features. Do not call Pitch online-only. |
+| **Canva Presentations** | Supports offline editing of designs prepared online. New designs and exports require internet. Its setup page says up to 14 days offline while its storage page says 7: the duration is unresolved in vendor documentation. Offline presenting is also documented. [Offline setup](https://www.canva.com/help/set-up-offline-access/), [storage limits](https://www.canva.com/help/manage-offline-designs/), [presenting announcement](https://www.canva.com/en_in/newsroom/news/whats-new-february/). | Reusable layouts help users produce coherent work. Distinguish prepared offline editing/presenting from unrestricted local creation and export. |
+| **reveal.js** | Basic HTML package runs in a browser without a build toolchain. Speaker view requires a local server. Auto-Animate matches objects across adjacent slides. [Installation](https://revealjs.com/installation/), [speaker view](https://revealjs.com/speaker-view/), [Auto-Animate](https://revealjs.com/auto-animate/). | Self-contained presentation assets and keyboard delivery are useful. HTML authoring serves a different audience; remote fonts/plugins can defeat offline packaging. |
+| **Slidev** | Markdown/Vue authoring uses a local Node.js toolchain. PDF/PNG/PPTX export uses a browser through Playwright; PPTX slides are images, with notes carried separately. [Getting started](https://sli.dev/guide/), [exporting](https://sli.dev/guide/exporting). | Technical-talk features do not establish low-resource GUI suitability. Image-only PPTX is not editable interoperability. |
+| **Marp** | Markdown converter with HTML/PDF/PPTX output. Ordinary PPTX export uses rendered backgrounds. Experimental editable PPTX needs both a browser and LibreOffice and documents fidelity limitations. [Marp CLI](https://github.com/marp-team/marp-cli). | Content-first templates can simplify authoring. Count the entire export toolchain in installation comparisons and label rendered versus editable output. |
 
-### Microsoft PowerPoint
+## Published requirements are not benchmarks
 
-- **Strongest asset**: PPTX is the de facto interchange format. Every other
-  product either imports or exports it.
-- **Animation model**: the most expressive in the category. ~50 build-ins,
-  ~50 transitions, Morph, motion paths with editable points, an Animation
-  Pane with explicit timing, triggers, and rewind. The cost is complexity.
-- **Collaboration**: real-time co-authoring through OneDrive and SharePoint
-  with version history, threaded comments, presence avatars, and sensitivity
-  labels.
-- **AI layer**: Copilot, Designer, Presenter Coach, Speaker Coach with
-  rehearsal feedback, image generation through Bing / DALL-E, and live
-  captions with translation during presenting. All require a paid tier and
-  send content to Microsoft servers.
-- **Presenter mode**: notes, timer, next-slide preview, laser pointer / pen,
-  Rehearse Timings, Record Slide Show with audio + ink, PowerPoint Live for
-  web presenting with attendee pacing, Quizzes / Forms for live polling.
-- **Weaknesses for our audience**: subscription-locked AI, cloud-first
-  posture, heavy weight, animation lock-in that round-trips badly, and
-  aggressive telemetry.
-- **For 900Slides**: borrow the structure of an Animation Pane and the
-  concept of motion paths. Avoid the cloud dependency and the paid AI wall.
+These values are vendor requirements, not RAM consumed by an open deck.
+Disk-space requirements are not download sizes. No equal-workload performance
+comparison was run for this research.
 
-### Apple Keynote
+| Product/source | Published requirement relevant to older computers | Interpretation |
+| --- | --- | --- |
+| [Office 2024 suites](https://support.microsoft.com/en-US/office/system-requirements/office-suites-for-individuals-and-families) | Windows: 4 GB RAM, 4 GB disk, 1280×768 display; current table lists Windows 11. | An older Office version running successfully does not establish current-version support. |
+| [LibreOffice](https://www.libreoffice.org/system-requirements/) | Windows/Linux: 256 MB RAM, 512 MB recommended; 1280×800. TDF Linux builds list x86-64-v2 CPU, kernel 4.18+, and glibc 2.27+. | Low published RAM is not a usable-deck benchmark. CPU instructions and package variants can exclude old hardware independently of RAM. |
+| [ONLYOFFICE Windows](https://helpcenter.onlyoffice.com/desktop/installation/desktop-sys-reqs-windows.aspx) | Dual-core 2 GHz CPU, 2 GB RAM, 2 GB free disk; explicitly applies to the simplest files. | Include 2 GB and 4 GB test tiers without implying complex decks run well in 2 GB. |
+| [WPS](https://help.wps.com/articles/system-requirements-for-wps-office/) | Windows/Linux list 2 GB RAM; disk guidance is 4 GB on Windows and 2 GB on Linux. Older Windows versions remain listed. | Confirm exact downloadable version and maintenance status before recommending an old OS. |
+| [Keynote](https://apps.apple.com/fi/app/keynote-design-presentations/id361285480?platform=mac) | Current Mac compatibility: macOS 15.6+. | Historical versions and the current downloadable app are different support cases. |
 
-- **Strongest asset**: typography and rendering quality. Ligatures, fractions,
-  vertical text, OpenType features, and CJK handling are best in class.
-- **Magic Move** (since 5.0, 2009): object-level morph by matching identity
-  across consecutive slides. Closer to a "design intent" primitive than
-  PowerPoint's Morph.
-- **3D transitions**: OpenGL transitions (Cube, Flip, Twist, Droplet, Grid,
-  Reflection, Revolving Door, Swoosh) that feel premium and effortless.
-- **Collaboration**: real-time co-authoring through iCloud Drive since 2016,
-  threaded comments, activity view, multi-platform Mac / iPad / iPhone / web.
-- **Apple Creator Studio (2026)**: outline-to-deck, auto-generated presenter
-  notes, Slide Clean Up, image generation through Image Playground, Super
-  Resolution, Auto Crop, Generate Custom Shapes, Edit in Pixelmator round-trip.
-  Most advanced features sit behind a paid tier.
-- **Recording and remote**: Record Presentation exports a narrated `.m4v` or
-  `.mov`, Remote control from Apple Watch and iPhone, multi-presenter
-  slideshows, FaceTime presenting, password-protected kiosk mode.
-- **Accessibility**: VoiceOver authoring guide, system accessibility hooks,
-  honors Reduce Motion. Notably **no live captions during presentation** and
-  no formal Accessibility Checker.
-- **Weaknesses**: Apple-only platforms, lossy PowerPoint round-trip, no
-  SmartArt equivalent, no live captions, frequent feature removals across
-  major versions (6.0 in 2013 and 15.x in 2026).
-- **For 900Slides**: borrow the Magic Move concept (object-identity morph).
-  Adopt an additive-only feature policy to avoid Keynote's removal churn.
-  Borrow Slide Clean Up as a local rule-based layout engine.
+For 900Slides, publish separate measurements for the executable, installed app,
+download archive, and complete offline installation including runtimes/fonts.
+A shared system webview can reduce the application payload; that architecture
+does not establish a RAM advantage or make an absent runtime free. The
+[low-resource requirements](LOW_RESOURCE_REQUIREMENTS.md) distinguish targets
+from measured results.
 
-### Google Slides
+## Product priorities
 
-- **Strongest asset**: the easiest path to a shared deck. Real-time collab,
-  presence, link sharing, version history, comments with assignment.
-- **AI**: Gemini can generate a slide from a prompt, generate and edit
-  images, rewrite and adjust tone of slide text. Gated by paid Workspace /
-  Google AI plans. Some "generated slides" come back as rasterized images and
-  are not editable as real slides.
-- **Presenter mode**: notes, timer, laser pointer, live captions, Q&A
-  through a link, Meet integration for presenting into meetings.
-- **Accessibility**: alt text, screen reader support, keyboard navigation,
-  braille display support, live captions. The Accessibility Checker is
-  shallower than PowerPoint's.
-- **Export**: PPTX, ODP, PDF, TXT, JPEG, PNG, SVG, and a Google-hosted
-  embeddable HTML. Export fidelity is reasonable for common content but
-  drifts on masters, animations, and theme inheritance.
-- **For 900Slides**: borrow the review / comments model (anchored to objects
-  and ranges). Avoid the cloud dependency and the conversion-first storage
-  pattern.
+1. **Trust the file workflow.** New/open/save/save-as, cancellation, failure
+   messages, undo, and power-loss recovery must work together. Preserve
+   supported content and explain unsupported content before destructive actions.
+2. **Make everyday decks look intentional.** Offer a small set of local
+   layouts with disciplined typography, margins, contrast, and image placement.
+   Make text, images, alignment, duplication, ordering, and notes easy to find.
+3. **Fit small screens.** Essential actions and dialogs must stay reachable
+   at 1366×768 and 1024×768. Use collapsible panels/overflow controls instead
+   of shrinking text and pointer targets until they are unreadable.
+4. **Deliver and hand over reliably.** Test keyboard presentation, notes
+   privacy, projector disconnects, readable PDFs, and editable PPTX. Warn about
+   actual limitations rather than claiming untested fidelity.
+5. **Measure modest hardware and language support.** Qualify packaged apps
+   on named 2 GB/4 GB configurations, integrated graphics, local fonts,
+   multiple writing systems, screen readers, and an unavailable network.
 
-### LibreOffice Impress
+Advanced morphing, batch generation, recording, and expanded exports should
+follow these gates. On-device AI/live transcription has memory, download, and
+power costs; it is not automatically suitable for this mission. No competitor
+feature authorizes network access in 900Slides: application code must remain
+free of telemetry, analytics, and remote calls.
 
-- **Strongest asset**: offline-first desktop authoring with no account.
-  Broad object model: equations, charts, 3D, curves, connectors, freeform,
-  Fontwork, OLE.
-- **PPTX round-trip (the critical context for 900Slides)**: Impress can
-  open, edit, and save PPTX, but round-trip is imperfect. What generally
-  works: ordinary text, basic shapes, common images, basic tables, basic
-  charts, simple masters, hyperlinks, simple animations. What degrades:
-  theme fonts and inheritance, placeholder geometry, autofit, SmartArt,
-  complex charts, gradients / shadows / glow / bevels / 3D / soft edges,
-  connectors and glue points, image masks, grouped object z-order,
-  animation ordering and timing, theme background behavior, notes and
-  comments. What breaks: complex animations and triggers, Morph-like
-  transitions, SmartArt editability, VBA macros, embedded OLE, Excel-linked
-  charts, unsupported codecs, missing fonts.
-- **Collaboration**: no real-time collab. Sharing is filesystem-based or
-  through external services (Nextcloud, ownCloud, Git). Version history is
-  whatever the filesystem provides.
-- **Accessibility**: alt text, keyboard access, screen reader, PDF export
-  preserves structure, but Accessibility Checker is less presentation-
-  specific than PowerPoint's.
-- **For 900Slides**: lesson is to **avoid the "open, convert to internal
-  model, regenerate PPTX" pattern**. Preserve unknown OOXML parts and
-  relationships, patch only changed structures, surface a loss ledger for
-  unsupported content, and render fallback previews for objects that
-  cannot be edited.
+## Maintaining the comparison
 
-### Reveal.js
-
-- **Editing model**: HTML-first. One `index.html` of `<section>` elements.
-  Markdown is opt-in via a plugin. No GUI editor in the OSS project.
-- **Standout mechanics**: **fragments** as a first-class stepped reveal
-  primitive, **Auto-Animate** (morph between adjacent slides by element
-  identity), nested slides, overview mode, jump-to-slide, programmable
-  themes, `data-*` extension surface.
-- **Code**: syntax highlighting via highlight.js, LaTeX via MathJax plugin.
-  No Monaco, no Sandpack, no in-slide code runner.
-- **Presenter**: speaker view with notes, timer, pacing timer, overview.
-  No built-in drawing, camera, or recording.
-- **Export**: PDF via the print stylesheet and a browser. PPTX is not
-  first-class — Decktape is the community CLI.
-- **For 900Slides**: borrow Auto-Animate's identity-matching pattern for a
-  Magic Move / Morph equivalent. Adopt fragments as a first-class concept.
-
-### Slidev
-
-- **Editing model**: Markdown-first with Vue components inside Markdown and
-  a CLI-driven dev workflow. Heavy toolchain (Node, Vite, Vue).
-- **Code**: best-in-class. Shiki + TwoSlash + Monaco + Shiki Magic Move +
-  code runners (code-runner / WebContainers / iframes). Code groups, line
-  ranges, stepped highlighting.
-- **Presenter**: presenter mode with three layouts, screen mirror for live
-  coding demos, notes editor, drawing, recording. **CSS filter panel** in
-  the projector view (invert, brightness, contrast, saturation, sepia, hue)
-  persisted per device.
-- **Export**: PDF, PPTX (image-per-slide), PNG, MD, static SPA build.
-  PPTX export is image-based, so text is not selectable.
-- **For 900Slides**: borrow the projector CSS filter panel (cheap, high
-  value for community speakers). Do **not** ship image-only PPTX export.
-  Stepped code highlighting belongs in the developer persona track.
-
-### Marp
-
-- **Editing model**: pure CommonMark with `---` slide separators, optional
-  YAML front-matter, and HTML-comment directives. One file, Git-friendly,
-  no GUI.
-- **Engine / converter plugin architecture**: `--engine` accepts an npm
-  module, a class, or a JS function. This is a clean extension surface.
-- **Standout feature**: zero-friction source model. A Marp deck is one
-  Markdown file with directives for metadata.
-- **Weaknesses**: animation is essentially absent beyond fragmented lists
-  and View Transitions. PPTX export is image-based by default; the
-  experimental `--pptx-editable` requires LibreOffice and is lower fidelity.
-- **For 900Slides**: lesson is to keep the source model (PPTX) portable and
-  inspectable, adopt a directive-style metadata layer for non-visual
-  intent, and avoid treating PPTX export as a "render and stamp" afterthought.
-
-### Pitch
-
-- **Editing model**: freeform canvas with a slide grid timeline, ready-made
-  layouts (~200+), real-time co-editing, slide assignments, contextual
-  comments, co-presenting.
-- **Differentiators**: **slide variables + batch deck generation** (fill
-  text and image variables from a CSV or JSON), **Pitch Rooms** (branded
-  deal rooms combining decks + files + links), per-slide assignments,
-  viewer analytics, **brand library** shared across teams.
-- **AI**: Pitch Agent (May 2026) generates on-brand decks from prompts and
-  refines them through chat. 25+ AI actions including image generation,
-  tone rewrite, slide summaries, and shareable messages.
-- **Export**: PDF (including mobile), PPTX (round-tripped), share link,
-  embed link. PPTX export breaks complex animations.
-- **For 900Slides**: borrow slide variables + batch deck generation
-  ("generate 30 personalized onboarding decks from a CSV"), model brand
-  assets as a portable file (`brand.toml` or similar), and slide
-  assignments as local metadata.
-
-### Canva Presentations
-
-- **Editing model**: drag-and-drop freeform canvas with multi-format
-  publishing (decks, docs, sheets, whiteboards, sites).
-- **Differentiators**: **Magic Animate** (one-click "animate the deck"),
-  **Brand Kits** + **Brand Templates** (locked layouts), **Magic Write**,
-  **Magic Resize**, **Magic Layers**, **Magic Image/Video Generator**,
-  brand-trained AI.
-- **Export**: broadest matrix in the category — PDF, PPTX, MP4, GIF, HTML
-  (via Canva Sites), PNG / JPG, animated Web export, social publishing.
-- **Accessibility**: alt text, focus order, color contrast warnings, reduce-
-  motion support, an accessibility checker (WCAG-oriented).
-- **Weaknesses**: cloud-only, increasingly heavy, freeform canvas is
-  constrained, recognizably "Canva" output.
-- **For 900Slides**: borrow the multi-format export posture (we have PDF,
-  ODP, PNG, SVG; expand to MP4 via offscreen render and HTML5). Adopt
-  reduce-motion as a system-preference override on animations. Borrow the
-  a11y checker model.
-
-### Beautiful.ai
-
-- **Editing model**: **Smart Slides** (auto-aligning layout blocks). 300+
-  smart layouts that reflow as you edit. Constrained by design.
-- **Differentiators**: locked customizable themes, shared slide libraries,
-  **Create with AI** (outline-first guided workflow), AI image generation
-  with style presets, embedded voice-overs per slide, spreadsheet-linked
-  charts.
-- **Export**: PDF, PPTX (one-way only), share link. No video / GIF / HTML.
-- **For 900Slides**: borrow Smart Slide auto-reflow as an **opt-in** mode
-  (not the default) so power users keep freeform. Adopt the outline-first
-  content workflow as a UX primitive even without AI. Spreadsheet-linked
-  charts are a natural fit for the data-driven deck use case.
-
-### Figma Slides
-
-- **Editing model**: **toggle between Slide view and Design view**. Slide
-  view is a presentation grid with notes and polls; Design view is the
-  full Figma canvas (auto layout, layers, components). Real-time
-  multiplayer, chat, audio, comments, Spotlight.
-- **Animation**: **Smart Animate** matches objects between adjacent slides
-  and tweens position / scale / rotation / opacity with easing curves and
-  spring presets. Object-level animation tracks inherited from Figma
-  Motion. Transitions include Dissolve, Push, Slide, Move with direction.
-- **Media**: live embeddable Figma prototypes (clickable UI in a slide),
-  live polls and voting widgets, alignment scale for audience engagement,
-  video with "Dress your videos" overlay controls.
-- **Accessibility**: the model to study. Public commitment to **WCAG 2.2 AA**,
-  documented screen reader support, keyboard navigation (F6, Cmd-K actions
-  menu), focus navigation, contrast, presenter notes accessible via
-  keyboard.
-- **Weaknesses**: browser-first Chromium app, no usable offline path, PPTX
-  import has severe limitations (videos, tables, diagrams, animations
-  dropped), no clean PPTX export.
-- **For 900Slides**: borrow Smart Animate transitions (pure client-side
-  motion, no server). Adopt WCAG 2.2 AA as a first-class accessibility
-  claim. The Slide ↔ Design view toggle is interesting but adds UI
-  complexity; defer to a usability study.
-
-## Cross-cutting patterns
-
-### Patterns worth borrowing
-
-- **Identity-matched object morph** (Magic Move, Morph, Auto-Animate,
-  Smart Animate). The single highest-leverage animation feature in the
-  category and pure client-side.
-- **First-class fragments / click steps** (Reveal.js, Slidev). A clean
-  abstraction for stepped reveals that maps cleanly to PowerPoint
-  animation triggers and to a timeline panel in the GUI.
-- **Projector CSS filter panel in presenter mode** (Slidev). Cheap,
-  high-value, solves a real embarrassing problem for community speakers.
-- **Slide variables + batch deck generation** (Pitch). Transforms the
-  "generate 30 personalized decks from a CSV" workflow and is naturally
-  local-first.
-- **Brand kit as a portable file** (Pitch, Canva). Git-friendly, diffable,
-  no server.
-- **Local version history with named versions and diff** (PowerPoint,
-  Keynote, Google Slides). Easy to do with a content-addressed store,
-  hard for any cloud product to match for offline users.
-- **Local comments anchored to slides, objects, and ranges** (Google
-  Slides, Keynote). Review workflow without a server.
-- **On-device live captioning** (PowerPoint, Google Slides). Whisper.cpp
-  fits naturally in the Tauri / Rust stack and sidesteps the privacy
-  downsides of Microsoft or Google.
-- **WCAG 2.2 AA accessibility posture** (Figma Slides). A real moat in
-  OSS and rare in the slide category.
-- **Multi-format export matrix** (Canva). PDF, PPTX, ODP, PNG, SVG, MP4,
-  HTML, GIF — spread across a small toolchain.
-
-### Patterns to avoid
-
-- **Subscription-locking core editing features** (Microsoft 365, Apple
-  Creator Studio). Directly conflicts with the audience.
-- **Removing features across major versions** (Keynote 6.0, Keynote 15.x,
-  PowerPoint Ribbon reshuffles). Adopt an additive-only policy.
-- **Treating the file format as a walled garden** (Microsoft's Morph data
-  extensions, Apple's `.key` schema drift). 900Slides commits to in-place
-  PPTX editing and preservation of unknown parts.
-- **Conversion-first storage** (LibreOffice Impress with PPTX, Google
-  Slides with PPTX). Patch only changed structures, preserve unknown
-  parts, surface a loss ledger.
-- **Cloud-only architecture** (Google Slides, Pitch, Canva, Beautiful.ai,
-  Figma Slides). Direct mission conflict.
-- **Massive template marketplace as value proposition** (Canva, Pitch).
-  Biases toward low-quality derivative design and creates lock-in.
-- **Engagement analytics as gating feature** (Pitch, Beautiful.ai).
-  Wrong economics for free / local-first.
-- **Image-only PPTX export** (Slidev, Marp default, Reveal.js + Decktape).
-  Defeats the in-place PPTX editing differentiator.
-- **One-way PPTX export** (Beautiful.ai, Figma Slides). Contradicts the
-  core thesis.
-- **Auto-applied animations that cannot be disabled per slide** (Beautiful.ai).
-  Accessibility problem.
-- **AI features that are gated, metered, or rely on external models**
-  (all four modern challengers). Inference cost is incompatible with
-  the audience.
-
-## Sources
-
-Per-product source URLs were collected by the research subagents and
-recorded in their individual reports. The full list is preserved in the
-research artifacts at `/docs/research/` and can be regenerated on demand.
-
-Representative URLs (used during synthesis):
-
-- Apple Keynote User Guide: https://support.apple.com/guide/keynote/welcome/mac
-- Apple Creator Studio features in Keynote: https://support.apple.com/guide/keynote/apple-creator-studio-features-in-keynote-tancda0441cd/mac
-- Microsoft PowerPoint product page: https://www.microsoft.com/en-us/microsoft-365/powerpoint
-- Microsoft 365 Copilot in PowerPoint: https://www.microsoft.com/en-us/microsoft-365/microsoft-copilot
-- Google Slides help: https://support.google.com/docs/answer/2763168
-- Generate a slide with Gemini in Google Slides: https://support.google.com/docs/answer/16961475
-- LibreOffice Impress Help: https://help.libreoffice.org/latest/en-US/text/simpress/main0000.html
-- LibreOffice PPTX round-trip guidance: https://help.libreoffice.org/latest/en-US/text/shared/guide/import_ms.html
-- Reveal.js docs: https://revealjs.com/
-- Slidev docs: https://sli.dev/
-- Marp docs: https://marp.app/
-- Pitch: https://pitch.com
-- Canva Presentations: https://www.canva.com/presentations/
-- Beautiful.ai: https://www.beautiful.ai/
-- Figma Slides: https://www.figma.com/slides/
-- Figma Slides accessibility: https://help.figma.com/hc/en-us/articles/35063862380311
+Refresh platform requirements and offline restrictions before a public release
+or positioning change. Add benchmark claims only with a version, fixture,
+hardware profile, method, and reproducible result. Keep visual similarity,
+editability, package preservation, and successful reopening as separate
+compatibility dimensions. Accessibility commitments need tested evidence before
+becoming conformance claims.

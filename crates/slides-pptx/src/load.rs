@@ -7,10 +7,10 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::QName;
 use quick_xml::{Reader, Writer};
 use slides_core::{
-    BorderEdge, CellAlign, Color, CommentThread, Crop, DashStyle, Deck, Fill, GeometricShape,
-    ImageShape, Link, ListStyle, MediaEntry, MediaStore, Outline, Paragraph, ParagraphStyle,
-    PassthroughObject, Rect, Run, Shadow, Shape, Slide, Style, TableBorders, TableCell, TableError,
-    TableRow, TableShape, TextBox, Theme, Transform, VerticalAlign, MAX_TABLE_COLS, MAX_TABLE_ROWS,
+    BorderEdge, CellAlign, Color, Crop, DashStyle, Deck, Fill, GeometricShape, ImageShape, Link,
+    ListStyle, MediaEntry, MediaStore, Outline, Paragraph, ParagraphStyle, PassthroughObject, Rect,
+    Run, Shadow, Shape, Slide, Style, TableBorders, TableCell, TableError, TableRow, TableShape,
+    TextBox, Theme, Transform, VerticalAlign, MAX_TABLE_COLS, MAX_TABLE_ROWS,
 };
 
 use crate::chart::{is_chart_frame, parse_chart_frame};
@@ -202,6 +202,7 @@ pub(crate) struct LoadResult {
     pub deck: Deck,
     pub package_rels: Vec<Rel>,
     pub slide_paths: HashMap<String, String>,
+    pub shape_package_ids: HashMap<String, HashMap<String, String>>,
     pub manifest_path: Option<String>,
     pub loss_ledger: LossLedger,
     /// For each slide (keyed by its part path), a map from a media content key
@@ -291,7 +292,14 @@ pub fn load(bytes: &[u8]) -> Result<LoadResult> {
         }
         slide_paths.insert(slide_path.to_string(), slide_path.to_string());
         slide_media_rids.insert(slide_path.to_string(), slide_rels.rid_by_media);
-        slide_chart_rids.insert(slide_path.to_string(), slide_rels.chart_by_rid);
+        slide_chart_rids.insert(
+            slide_path.to_string(),
+            slide_rels
+                .chart_by_rid
+                .into_iter()
+                .map(|(rid, part)| (part, rid))
+                .collect(),
+        );
         deck.slides.push(slide);
     }
 
@@ -302,9 +310,37 @@ pub fn load(bytes: &[u8]) -> Result<LoadResult> {
 
     // Read the 900Slides manifest (if present) and parse any embedded comments.
     // Decks without a manifest or a <comments> section load with empty comments.
+    let mut shape_package_ids: HashMap<String, HashMap<String, String>> = HashMap::new();
     if let Some(path) = &manifest_path {
         if let Ok(xml) = read_entry_to_string(&mut archive, path) {
-            deck.comments = parse_manifest_comments(&xml);
+            deck.comments = parse_manifest_collection(&xml, "comments");
+            deck.sections = parse_manifest_collection(&xml, "sections");
+            let mappings: Vec<crate::session::ShapeIdMapping> =
+                parse_manifest_collection(&xml, "shapeIds");
+            let mut by_path: HashMap<String, HashMap<String, String>> = HashMap::new();
+            for mapping in mappings {
+                if !mapping.model_id.is_empty()
+                    && mapping.package_id.parse::<u32>().is_ok_and(|id| id > 0)
+                {
+                    by_path
+                        .entry(mapping.slide_path)
+                        .or_default()
+                        .insert(mapping.package_id, mapping.model_id);
+                }
+            }
+            for slide in &mut deck.slides {
+                if let Some(ids) = by_path.get(&slide.id) {
+                    for shape in &mut slide.shapes {
+                        if let Some(model_id) = ids.get(shape.id()) {
+                            shape_package_ids
+                                .entry(slide.id.clone())
+                                .or_default()
+                                .insert(model_id.clone(), shape.id().to_string());
+                            shape.set_id(model_id.clone());
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -312,6 +348,7 @@ pub fn load(bytes: &[u8]) -> Result<LoadResult> {
         deck,
         package_rels,
         slide_paths,
+        shape_package_ids,
         manifest_path,
         loss_ledger: ledger,
         slide_media_rids,
@@ -638,6 +675,9 @@ fn parse_text_box(
     let mut current_run_hlink_rid: Option<String> = None;
     let mut current_run_font: Option<String> = None;
     let mut current_run_code = false;
+    let mut current_run_size = None;
+    let mut current_run_color: Option<Color> = None;
+    let mut in_run_properties = false;
 
     let mut in_xfrm = false;
     let mut in_ppr = false;
@@ -696,13 +736,23 @@ fn parse_text_box(
                         current_run_hlink_rid = None;
                         current_run_font = None;
                         current_run_code = false;
+                        current_run_size = None;
+                        current_run_color = None;
                     }
                     "rPr" => {
+                        in_run_properties = true;
+                        current_run_size = parse_attr_f64(&e, "sz")
+                            .filter(|size| size.is_finite() && *size > 0.0)
+                            .map(|size| size * 127.0);
                         current_run_bold = parse_bool_attr(&e, "b").unwrap_or(false);
                         current_run_italic = parse_bool_attr(&e, "i").unwrap_or(false);
                         current_run_underline = parse_underline_attr(&e);
                         current_run_strikethrough = parse_strikethrough_attr(&e);
                         current_run_vertical_align = parse_vertical_align_attr(&e);
+                    }
+                    "srgbClr" if in_run_properties => {
+                        current_run_color =
+                            attr_by_local_name(&e, "val").and_then(|hex| parse_hex_color(&hex));
                     }
                     "hlinkClick" => {
                         if let Some(rid) = rel_attribute(&e, "id") {
@@ -771,11 +821,26 @@ fn parse_text_box(
                         }
                     }
                     "rPr" => {
+                        current_run_size = parse_attr_f64(&e, "sz")
+                            .filter(|size| size.is_finite() && *size > 0.0)
+                            .map(|size| size * 127.0);
                         current_run_bold = parse_bool_attr(&e, "b").unwrap_or(false);
                         current_run_italic = parse_bool_attr(&e, "i").unwrap_or(false);
                         current_run_underline = parse_underline_attr(&e);
                         current_run_strikethrough = parse_strikethrough_attr(&e);
                         current_run_vertical_align = parse_vertical_align_attr(&e);
+                    }
+                    "srgbClr" if in_run_properties => {
+                        current_run_color =
+                            attr_by_local_name(&e, "val").and_then(|hex| parse_hex_color(&hex));
+                    }
+                    "alpha" if in_run_properties => {
+                        if let (Some(color), Some(alpha)) =
+                            (&mut current_run_color, parse_attr_f64(&e, "val"))
+                        {
+                            color.a =
+                                (alpha.clamp(0.0, 100_000.0) * 255.0 / 100_000.0).round() as u8;
+                        }
                     }
                     "hlinkClick" => {
                         if let Some(rid) = rel_attribute(&e, "id") {
@@ -824,6 +889,7 @@ fn parse_text_box(
                         }
                     }
                     "pPr" => in_ppr = false,
+                    "rPr" => in_run_properties = false,
                     "r" => {
                         if let Some(ref mut para) = current_paragraph {
                             let text = std::mem::take(&mut current_run_text);
@@ -843,7 +909,8 @@ fn parse_text_box(
                                 link,
                                 code: current_run_code,
                                 font_family: current_run_font.take(),
-                                ..Default::default()
+                                color: current_run_color.take(),
+                                font_size: current_run_size.take(),
                             });
                             current_run_bold = false;
                             current_run_italic = false;
@@ -1829,13 +1896,12 @@ pub(crate) fn qname_str(q: QName) -> String {
     String::from_utf8_lossy(q.local_name().as_ref()).into_owned()
 }
 
-/// Extracts the `<comments>` payload from a 900Slides manifest and deserializes
-/// it back into [`CommentThread`]s. Returns an empty vec when the section is
-/// absent or cannot be parsed, so that old decks load with no comments.
+/// Extracts a JSON collection from a 900Slides manifest. Returns an empty vec
+/// when the section is absent or cannot be parsed, preserving legacy defaults.
 ///
 /// The payload is a JSON array serialized by the saver and embedded either as a
 /// CDATA section or as escaped element text; both forms are handled here.
-fn parse_manifest_comments(xml: &str) -> Vec<CommentThread> {
+fn parse_manifest_collection<T: serde::de::DeserializeOwned>(xml: &str, element: &str) -> Vec<T> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
@@ -1846,7 +1912,7 @@ fn parse_manifest_comments(xml: &str) -> Vec<CommentThread> {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
                 let local = qname_str(e.name());
-                if !in_comments && local == "comments" {
+                if !in_comments && local == element {
                     in_comments = true;
                     content.clear();
                     comments_depth = 1;
@@ -1858,12 +1924,12 @@ fn parse_manifest_comments(xml: &str) -> Vec<CommentThread> {
                 if in_comments {
                     comments_depth -= 1;
                     if comments_depth == 0 {
-                        return deserialize_comment_threads(&content);
+                        return serde_json::from_str(content.trim()).unwrap_or_default();
                     }
                 }
             }
             Ok(Event::Empty(e)) => {
-                if !in_comments && qname_str(e.name()) == "comments" {
+                if !in_comments && qname_str(e.name()) == element {
                     return Vec::new();
                 }
             }
@@ -1879,14 +1945,6 @@ fn parse_manifest_comments(xml: &str) -> Vec<CommentThread> {
         buf.clear();
     }
     Vec::new()
-}
-
-fn deserialize_comment_threads(content: &str) -> Vec<CommentThread> {
-    let trimmed = content.trim();
-    if trimmed.is_empty() {
-        return Vec::new();
-    }
-    serde_json::from_str(trimmed).unwrap_or_default()
 }
 
 pub(crate) fn attr_by_local_name(e: &BytesStart<'_>, name: &str) -> Option<String> {

@@ -15,11 +15,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
-zip = "2"
+zip = { version = "2", default-features = false, features = ["deflate-flate2", "flate2"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 quick-xml = "0.36"
 base64 = "0.22"
 twox-hash = "1"
-image = "0.25"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 resvg = "0.42"
 usvg = "0.42"
 tiny-skia = "0.11"

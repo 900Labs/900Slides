@@ -274,8 +274,8 @@
     for (const [slideId, durationMs] of finalTimings) {
       try {
         await invoke('set_slide_rehearsed_duration', {
-          slide_id: slideId,
-          duration_ms: Math.round(durationMs),
+          slideId: slideId,
+          durationMs: Math.round(durationMs),
         })
       } catch {
         // A failed commit for one slide should not abort the rest.
@@ -613,7 +613,7 @@
 
   /** Returns a readable background color for a slide, or white. */
   function backgroundColor(): ColorDto {
-    return { r: 255, g: 255, b: 255, a: 255 }
+    return presenterState?.background ?? { r: 255, g: 255, b: 255, a: 255 }
   }
 
   /** CSS class for the transition kind of the current slide. */
@@ -660,6 +660,8 @@
           <SlideCanvas
             slide={presenterState.currentSlide}
             background={backgroundColor()}
+            bodyFont={presenterState.bodyFont}
+            headingFont={presenterState.headingFont}
             media={presenterState.media}
             slideSize={presenterState.slideSize}
             highContrast={presenterState.highContrast}
@@ -675,6 +677,8 @@
           <SlideCanvas
             slide={morph.prev}
             background={{ r: 255, g: 255, b: 255, a: 0 }}
+            bodyFont={presenterState.bodyFont}
+            headingFont={presenterState.headingFont}
             media={presenterState.media}
             slideSize={presenterState.slideSize}
             highContrast={presenterState.highContrast}
@@ -883,9 +887,12 @@
           <SlideCanvas
             slide={presenterState.nextSlide}
             background={backgroundColor()}
+            bodyFont={presenterState.bodyFont}
+            headingFont={presenterState.headingFont}
             media={presenterState.media}
             slideSize={presenterState.slideSize}
             highContrast={presenterState.highContrast}
+            scale={0.25}
             readonly
           />
         {:else}
@@ -1126,10 +1133,6 @@
     padding: 0.75rem;
     overflow-y: auto;
     white-space: pre-wrap;
-  }
-  :global(.hud .canvas) {
-    width: 320px !important;
-    height: 180px !important;
   }
   .stage-content {
     width: 100%;
